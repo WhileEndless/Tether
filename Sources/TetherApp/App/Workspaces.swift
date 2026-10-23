@@ -54,6 +54,18 @@ final class WorkspaceStore {
         save()
     }
 
+    /// Moves a tab within its window to where `target` is now (live reordering while dragging).
+    /// Returns false when either tab is not in this window.
+    @discardableResult
+    func move(_ session: UUID, to target: UUID, in id: UUID) -> Bool {
+        guard var w = all[id], let from = w.tabs.firstIndex(of: session), let to = w.tabs.firstIndex(of: target) else { return false }
+        guard from != to else { return true }
+        w.tabs.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        all[id] = w
+        save()
+        return true
+    }
+
     /// Removes a session from whatever window shows it. Returns that window's id.
     @discardableResult
     func detach(_ session: UUID) -> UUID? {

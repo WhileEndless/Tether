@@ -42,6 +42,9 @@ private struct GeneralSettings: View {
                 Toggle("Open new sessions in a separate window", isOn: $store.settings.openNewSessionsInWindow)
                 Toggle("Ask before closing an online session", isOn: $store.settings.confirmCloseOnlineSessions)
                 Toggle("Show archive in sidebar", isOn: $store.settings.showSidebarArchive)
+                Picker("Sort sessions under a host", selection: $store.settings.sessionSortOrder) {
+                    ForEach(SessionSortOrder.allCases) { Text($0.title).tag($0) }
+                }
             }
             Section {
                 Button("Restore All Settings to Defaults…", role: .destructive) { store.resetToDefaults() }

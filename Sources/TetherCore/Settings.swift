@@ -151,6 +151,28 @@ public enum TransferArchiveMode: String, Codable, CaseIterable, Identifiable, Se
     }
 }
 
+/// How the open sessions under a host are ordered in the sidebar.
+public enum SessionSortOrder: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// Online first, then connecting, suspended; each in the manual order.
+    case status
+    case name
+    case newest
+    case oldest
+    /// Exactly the order the user dragged them into.
+    case manual
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .status: "Active First"
+        case .name: "Name"
+        case .newest: "Newest First"
+        case .oldest: "Oldest First"
+        case .manual: "Manual (Drag to Reorder)"
+        }
+    }
+}
+
 /// All user preferences. Persisted as JSON in UserDefaults.
 public struct AppSettings: Codable, Equatable, Sendable {
     // General
@@ -158,6 +180,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var confirmCloseOnlineSessions = true
     public var openNewSessionsInWindow = false
     public var showSidebarArchive = false
+    public var sessionSortOrder: SessionSortOrder = .status
     /// Closing the last window keeps Tether (and every session) running in the menu bar.
     public var keepRunningInMenuBar = true
 
@@ -274,6 +297,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.confirmCloseOnlineSessions, &confirmCloseOnlineSessions)
         d(.openNewSessionsInWindow, &openNewSessionsInWindow)
         d(.showSidebarArchive, &showSidebarArchive)
+        d(.sessionSortOrder, &sessionSortOrder)
         d(.keepRunningInMenuBar, &keepRunningInMenuBar)
         d(.fontName, &fontName)
         d(.fontSize, &fontSize)

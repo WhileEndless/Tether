@@ -162,6 +162,16 @@ public final class SessionManager {
         saveOpenSessions()
     }
 
+    /// Puts the given sessions (all of one host) in this order. They keep the places they had in the
+    /// overall list, so other hosts' sessions do not move. The order is saved with the open sessions.
+    public func reorder(_ ids: [UUID]) {
+        let wanted = ids.compactMap { id in sessions.first { $0.id == id } }
+        let slots = sessions.indices.filter { i in ids.contains(sessions[i].id) }
+        guard wanted.count == slots.count, !slots.isEmpty else { return }
+        for (slot, session) in zip(slots, wanted) { sessions[slot] = session }
+        saveOpenSessions()
+    }
+
     public func rename(_ id: UUID, to title: String) {
         guard let s = session(id) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)

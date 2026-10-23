@@ -47,6 +47,63 @@ enum SelfTest {
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
 
+        // Sidebar follows the selected tab, and sessions sort / reorder under their host. TETHER_SELFTEST_SIDEBAR=1.
+        if env["TETHER_SELFTEST_SIDEBAR"] != nil {
+            Task { @MainActor in
+                state.window?.setFrame(NSRect(x: 80, y: 80, width: 1100, height: 700), display: true)
+                let a = state.connect(.local), b = state.connect(.local), c = state.connect(.local)
+                model.sessions.rename(a.id, to: "charlie"); model.sessions.rename(b.id, to: "alpha"); model.sessions.rename(c.id, to: "bravo")
+                try? await Task.sleep(for: .seconds(1))
+                @MainActor func check(_ s: TerminalSession, _ label: String) {
+                    say(state.sidebarSelection == .session(s.id) ? "PASS \(label)" : "FAIL \(label): \(String(describing: state.sidebarSelection))")
+                }
+                check(c, "newest tab selected in sidebar")
+                state.sidebarSelection = .host("local")          // e.g. the user clicked a host
+                SidebarFolding.shared.collapsed.insert("local")    // and folded This Mac
+                model.workspaces.select(a.id, in: state.workspaceID)
+                try? await Task.sleep(for: .milliseconds(500))
+                check(a, "clicking a tab selects it in the sidebar")
+                say(SidebarFolding.shared.collapsed.contains("local") ? "FAIL still folded" : "PASS unfolded")
+                model.settings.sessionSortOrder = .manual
+                model.sessions.reorder([c.id, a.id, b.id])
+                let order = model.sessions.sessions(for: "local").map(\.displayTitle)
+                say(order == ["bravo", "charlie", "alpha"] ? "PASS manual order" : "FAIL manual order \(order)")
+                try? await Task.sleep(for: .milliseconds(500))
+                SelfTest.snapshot(state.window, "sidebar-manual")
+                model.settings.sessionSortOrder = .name
+                try? await Task.sleep(for: .milliseconds(500))
+                SelfTest.snapshot(state.window, "sidebar-name")
+                let all = model.sessions.sessions(for: "local")
+                for order in SessionSortOrder.allCases {
+                    say("order \(order.rawValue): \(HostChildren.ordered(all, by: order).map(\.displayTitle))")
+                }
+                model.settings.sessionSortOrder = .status
+                // Tab bar: live reordering while a tab is dragged over the others.
+                let center = TabBarCenter.shared
+                let ws = state.workspaceID
+                @MainActor func titles() -> [String] { model.workspaces.workspace(ws).tabs.compactMap { model.sessions.session($0)?.displayTitle } }
+                say("tabs before \(titles())")
+                center.beginDrag(a.id)
+                center.dragMoved(over: b.id, x: 1, in: ws)        // not past the middle yet: stays
+                let early = titles()
+                center.dragMoved(over: b.id, x: 500, in: ws)      // past the middle of alpha
+                let afterB = titles()
+                center.dragMoved(over: c.id, x: 500, in: ws)      // and of bravo
+                let afterC = titles()
+                center.dragMoved(over: b.id, x: 0, in: ws)        // back to the left of alpha
+                let back = titles()
+                center.drop(a.id, into: ws, before: nil)          // released over empty bar space
+                let dropped = titles()
+                say("drag \(early) \(afterB) \(afterC) \(back) \(dropped)")
+                say(early == ["charlie", "alpha", "bravo"] && afterB == ["alpha", "charlie", "bravo"]
+                    && afterC == ["alpha", "bravo", "charlie"] && back == ["charlie", "alpha", "bravo"] && dropped == back
+                    ? "PASS live reorder" : "FAIL live reorder")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
         // Host key check against a real sshd whose key differs from the trusted one: the warning, removing
         // the old key, the first-connection question for the new key, and connecting. TETHER_SELFTEST_HOSTKEY=1.
         if env["TETHER_SELFTEST_HOSTKEY"] != nil {

@@ -26,6 +26,49 @@ struct SidebarView: View {
 
     @ViewBuilder
     private var list: some View {
+        ScrollViewReader { proxy in
+            sidebarList
+                // The tab selected at the top is also selected here, under its host, and scrolled into view.
+                .onChange(of: state.workspace.selected, initial: true) { _, id in reveal(id, proxy: proxy) }
+        }
+    }
+
+    /// Selects a tab's row in the sidebar, unfolding whatever hides it (its group, its host, "Show more").
+    private func reveal(_ id: UUID?, proxy: ScrollViewProxy) {
+        guard let id, let item = state.item(id) else {
+            // The tab is gone: drop a selection that pointed at it.
+            switch state.sidebarSelection {
+            case .session(let s)? where model.sessions.session(s) == nil: state.sidebarSelection = nil
+            case .files(let f)? where model.fileTabs.tab(f) == nil: state.sidebarSelection = nil
+            default: break
+            }
+            return
+        }
+        let row: SidebarItem
+        let key = item.target.key
+        switch item {
+        case .terminal(let s):
+            row = .session(s.id)
+            let live = HostChildren.ordered(model.sessions.sessions(for: key), by: model.settings.sessionSortOrder)
+            let folding = SidebarFolding.shared
+            if (live.firstIndex { $0.id == s.id } ?? 0) >= HostChildren.limit, !folding.expanded.contains(key) {
+                folding.expanded.insert(key)
+            }
+        case .files(let f):
+            row = .files(f.id)
+        }
+        if SidebarFolding.shared.collapsed.contains(key) { SidebarFolding.shared.collapsed.remove(key) }
+        if case .alias(let alias) = item.target, let group = model.metadata(for: alias).groupID,
+           model.groups.first(where: { $0.id == group })?.isExpanded == false {
+            model.updateGroup(group) { $0.isExpanded = true }
+        }
+        if state.sidebarSelection != row { state.sidebarSelection = row }
+        // After the unfolded rows exist; scrolls only as far as needed.
+        DispatchQueue.main.async { withAnimation(.snappy) { proxy.scrollTo(row) } }
+    }
+
+    @ViewBuilder
+    private var sidebarList: some View {
         @Bindable var state = state
         List(selection: $state.sidebarSelection) {
             LocalSection()
@@ -219,7 +262,7 @@ private struct HostRows: View {
 /// Everything listed under a host: its sessions (active first; ended ones disappear — they are in
 /// the archive), its file manager tabs, and tmux/screen sessions found on the server. Long lists
 /// are cut to a few rows with "Show all", and a host can be folded away entirely.
-private struct HostChildren: View {
+struct HostChildren: View {
     @Environment(AppModel.self) private var model
     let key: String
     let target: ConnectionTarget
@@ -238,16 +281,42 @@ private struct HostChildren: View {
         }
     }
 
+    /// The host's live sessions in the order chosen in Settings (Sidebar ▸ Sort sessions).
+    static func ordered(_ sessions: [TerminalSession], by order: SessionSortOrder) -> [TerminalSession] {
+        let live = Array(sessions.filter { !$0.phase.isDead }.enumerated())
+        let sorted: [(offset: Int, element: TerminalSession)]
+        switch order {
+        case .status:
+            sorted = live.sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+        case .name:
+            sorted = live.sorted {
+                let c = $0.element.displayTitle.localizedStandardCompare($1.element.displayTitle)
+                return c == .orderedSame ? $0.offset < $1.offset : c == .orderedAscending
+            }
+        case .newest:
+            sorted = live.sorted { ($0.element.startedAt, $0.offset) > ($1.element.startedAt, $1.offset) }
+        case .oldest:
+            sorted = live.sorted { ($0.element.startedAt, $0.offset) < ($1.element.startedAt, $1.offset) }
+        case .manual:
+            sorted = live
+        }
+        return sorted.map(\.element)
+    }
+
     var body: some View {
         let folding = SidebarFolding.shared
         if searching || !folding.collapsed.contains(key) {
             let expanded = searching || folding.expanded.contains(key)
-            let list = (sessions ?? model.sessions.sessions(for: key))
-                .filter { !$0.phase.isDead }
-                .enumerated().sorted { (Self.rank($0.element), $0.offset) < (Self.rank($1.element), $1.offset) }
-                .map(\.element)
+            let order = model.settings.sessionSortOrder
+            let list = Self.ordered(sessions ?? model.sessions.sessions(for: key), by: order)
             let shown = expanded ? list : Array(list.prefix(Self.limit))
             ForEach(shown) { SessionRow(session: $0) }
+                // Manual order: drag sessions within their host (not while a search filters the list).
+                .onMove(perform: order == .manual && !searching ? { from, to in
+                    var ids = shown.map(\.id)
+                    ids.move(fromOffsets: from, toOffset: to)
+                    model.sessions.reorder(ids + list.dropFirst(shown.count).map(\.id))
+                } : nil)
             ForEach(model.fileTabs.tabs(for: key)) { FileTabRow(tab: $0) }
             let all = serverSessions
             // Tether sessions left on the server (after a crash, or a tab that never connected)
@@ -683,6 +752,7 @@ struct SessionRow: View {
         }
         .padding(.leading, 22)
         .tag(SidebarItem.session(session.id))
+        .id(SidebarItem.session(session.id))
         .help(inBackground ? "In the background — click to open in a tab · double-click to rename" : "Double-click to rename")
     }
 }
@@ -734,6 +804,7 @@ struct HostContextMenu: View {
                 Button(c.title) { model.updateMetadata(for: alias) { $0.color = c } }
             }
         }
+        SessionSortMenu()
         Divider()
         Button("Terminate All Sessions on This Host…", role: .destructive) { state.terminateAll(on: .alias(alias)) }
         Button("Remove from SSH Config…", role: .destructive) {
@@ -747,6 +818,19 @@ struct HostContextMenu: View {
                 do { try model.removeHost(alias) } catch { NSAlert(error: error).runModal() }
             }
         }
+    }
+}
+
+/// "Sort Sessions" (one order for every host), in host and session context menus.
+struct SessionSortMenu: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var settings = model.settingsStore
+        Picker("Sort Sessions", selection: $settings.settings.sessionSortOrder) {
+            ForEach(SessionSortOrder.allCases) { Text($0.title).tag($0) }
+        }
+        .pickerStyle(.menu)
     }
 }
 
@@ -766,6 +850,7 @@ struct SessionContextMenu: View {
                 Button(c.title) { model.sessions.setColor(session.id, c) }
             }
         }
+        SessionSortMenu()
         Button("New Session to Same Host") { state.connect(session.descriptor.target) }
         if case .waiting = session.phase {
             Button("Reconnect Now") { session.reconnectNow() }
@@ -802,6 +887,7 @@ struct FileTabRow: View {
         }
         .padding(.leading, 22)
         .tag(SidebarItem.files(tab.id))
+        .id(SidebarItem.files(tab.id))
         .help(open ? "File manager tab" : "File manager in the background — click to open")
     }
 }

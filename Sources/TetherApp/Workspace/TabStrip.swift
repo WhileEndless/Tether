@@ -10,7 +10,8 @@ final class TabBarCenter {
     static let shared = TabBarCenter()
     /// True while ⌘ is held: tabs show the number to press.
     private(set) var showNumbers = false
-    @ObservationIgnored private var dragging: UUID?
+    /// The tab being dragged (dimmed in its bar while the others make room).
+    private(set) var dragging: UUID?
     @ObservationIgnored private var dropHandled = false
     @ObservationIgnored private var monitors: [Any] = []
     @ObservationIgnored private var numberTimer: DispatchWorkItem?
@@ -108,7 +109,39 @@ final class TabBarCenter {
     func drop(_ id: UUID, into workspace: UUID, before: UUID?) {
         dropHandled = true
         guard id != before else { return }
-        AppModel.shared.workspaces.add(id, to: workspace, select: true, before: before)
+        let store = AppModel.shared.workspaces
+        // Within its own window the tab was already reordered live while dragging: leave it there.
+        if store.workspace(containing: id) == workspace { return }
+        store.add(id, to: workspace, select: true, before: before)
+    }
+
+    /// The dragged tab passes the middle of `target` in the same window: it takes that place, and
+    /// the tabs in between slide over (animated), as in Safari. `x` is the pointer within `target`.
+    /// Waiting for the middle keeps tabs of different widths from swapping back and forth.
+    func dragMoved(over target: UUID, x: CGFloat, in workspace: UUID) {
+        let store = AppModel.shared.workspaces
+        guard let id = dragging, id != target, store.workspace(containing: id) == workspace else { return }
+        let tabs = store.workspace(workspace).tabs
+        guard let from = tabs.firstIndex(of: id), let to = tabs.firstIndex(of: target) else { return }
+        let middle = (tabFrames[target]?.width ?? 0) / 2
+        guard from < to ? x >= middle : x <= middle else { return }
+        withAnimation(.snappy(duration: 0.22)) {
+            _ = AppModel.shared.workspaces.move(id, to: target, in: workspace)
+        }
+    }
+
+    /// Scrolls an overflowing tab bar while a dragged tab is held over one of its arrows.
+    @ObservationIgnored private var edgeScroll: Timer?
+    func dragHover(_ scroller: TabScroller?, by delta: CGFloat) {
+        edgeScroll?.invalidate()
+        edgeScroll = nil
+        guard let scroller else { return }
+        edgeScroll = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                if NSEvent.pressedMouseButtons & 1 == 0 { timer.invalidate(); return }
+                scroller.scroll(by: delta, animated: false)
+            }
+        }
     }
 
     /// SwiftUI has no "drag ended without a drop" callback; poll the mouse button instead.
@@ -117,8 +150,9 @@ final class TabBarCenter {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             guard let self, let id = self.dragging else { return }
             if NSEvent.pressedMouseButtons & 1 != 0 { self.watchForDropOutside(); return }
+            self.dragHover(nil, by: 0)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                defer { self.dragging = nil }
+                defer { withAnimation(.snappy(duration: 0.15)) { self.dragging = nil } }
                 guard !self.dropHandled else { return }
                 let point = NSEvent.mouseLocation
                 // Released inside a Tether window: not a "drag out".
@@ -157,6 +191,7 @@ struct TabStrip: View {
         HStack(spacing: 0) {
             if overflowing {
                 TabArrow(symbol: "chevron.left", enabled: offset > 1) { scroller.scroll(by: -max(visibleWidth * 0.8, 200)) }
+                    .onDrop(of: [.plainText], delegate: EdgeScrollDelegate(scroller: scroller, delta: -24))
             }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: true) {
@@ -200,6 +235,7 @@ struct TabStrip: View {
                 TabArrow(symbol: "chevron.right", enabled: offset < contentWidth - visibleWidth - 1) {
                     scroller.scroll(by: max(visibleWidth * 0.8, 200))
                 }
+                .onDrop(of: [.plainText], delegate: EdgeScrollDelegate(scroller: scroller, delta: 24))
             }
             if tabs.count > 1 {
                 // Every tab in a list: handy with dozens of tabs.
@@ -347,11 +383,8 @@ private struct TabChip: View {
             TabBarCenter.shared.beginDrag(session.id)
             return NSItemProvider(object: session.id.uuidString as NSString)
         }
-        .dropDestination(for: String.self) { items, _ in
-            guard let id = items.first.flatMap(UUID.init(uuidString:)), id != session.id else { return false }
-            TabBarCenter.shared.drop(id, into: state.workspaceID, before: session.id)
-            return true
-        } isTargeted: { dropTargeted = $0 }
+        .onDrop(of: [.plainText], delegate: TabDropDelegate(target: session.id, workspace: state.workspaceID, targeted: $dropTargeted))
+        .opacity(TabBarCenter.shared.dragging == session.id ? 0.35 : 1)
         .help("\(session.descriptor.target.displayName) — \(session.phase.label)  ·  double-click to rename")
     }
 
@@ -432,11 +465,8 @@ private struct FileTabChip: View {
             TabBarCenter.shared.beginDrag(tab.id)
             return NSItemProvider(object: tab.id.uuidString as NSString)
         }
-        .dropDestination(for: String.self) { items, _ in
-            guard let id = items.first.flatMap(UUID.init(uuidString:)), id != tab.id else { return false }
-            TabBarCenter.shared.drop(id, into: state.workspaceID, before: tab.id)
-            return true
-        } isTargeted: { dropTargeted = $0 }
+        .onDrop(of: [.plainText], delegate: TabDropDelegate(target: tab.id, workspace: state.workspaceID, targeted: $dropTargeted))
+        .opacity(TabBarCenter.shared.dragging == tab.id ? 0.35 : 1)
         .help("Files on \(tab.target.displayName)")
     }
 }
@@ -470,17 +500,66 @@ private struct TabScrollMarker: NSViewRepresentable {
 final class TabScroller {
     weak var scrollView: NSScrollView?
 
-    func scroll(by delta: CGFloat) {
+    func scroll(by delta: CGFloat, animated: Bool = true) {
         guard let scroll = scrollView else { return }
         let clip = scroll.contentView
         let maxX = max((scroll.documentView?.frame.width ?? 0) - clip.bounds.width, 0)
         let x = min(max(clip.bounds.origin.x + delta, 0), maxX)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            clip.animator().setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                clip.animator().setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
+            }
+        } else {
+            clip.setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
         }
         scroll.reflectScrolledClipView(clip)
     }
+}
+
+/// A tab as a drop target. In its own window a dragged tab takes this tab's place as soon as it
+/// passes over it; a tab from another window is inserted here when dropped.
+private struct TabDropDelegate: DropDelegate {
+    let target: UUID
+    let workspace: UUID
+    @Binding var targeted: Bool
+
+    private var fromOtherWindow: Bool {
+        guard let id = TabBarCenter.shared.dragging else { return false }
+        return AppModel.shared.workspaces.workspace(containing: id) != workspace
+    }
+
+    func validateDrop(info: DropInfo) -> Bool { TabBarCenter.shared.dragging != nil }
+
+    func dropEntered(info: DropInfo) {
+        if fromOtherWindow { targeted = true } else { TabBarCenter.shared.dragMoved(over: target, x: info.location.x, in: workspace) }
+    }
+
+    func dropExited(info: DropInfo) { targeted = false }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if !fromOtherWindow { TabBarCenter.shared.dragMoved(over: target, x: info.location.x, in: workspace) }
+        return DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        targeted = false
+        guard let id = TabBarCenter.shared.dragging else { return false }
+        TabBarCenter.shared.drop(id, into: workspace, before: target)
+        return true
+    }
+}
+
+/// Holding a dragged tab over a tab bar arrow scrolls the bar that way.
+private struct EdgeScrollDelegate: DropDelegate {
+    let scroller: TabScroller
+    let delta: CGFloat
+
+    func validateDrop(info: DropInfo) -> Bool { TabBarCenter.shared.dragging != nil }
+    func dropEntered(info: DropInfo) { TabBarCenter.shared.dragHover(scroller, by: delta) }
+    func dropExited(info: DropInfo) { TabBarCenter.shared.dragHover(nil, by: 0) }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool { TabBarCenter.shared.dragHover(nil, by: 0); return false }
 }
 
 /// A small arrow at either end of an overflowing tab bar.
