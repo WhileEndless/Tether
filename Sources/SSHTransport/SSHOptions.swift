@@ -11,6 +11,10 @@ public struct SSHOptions: Sendable, Equatable {
     public var serverAliveInterval: Int
     public var serverAliveCountMax: Int
     public var hostKeyPolicy: HostKeyPolicy
+    /// Which shared connection to use. Servers allow only so many sessions per connection
+    /// (sshd `MaxSessions`, 10 by default), so many terminals to one host are spread over
+    /// several shared connections: slot 0 (also used by monitoring and transfers), 1, 2, …
+    public var controlSlot = 0
 
     public init(sshBinary: String = "/usr/bin/ssh", scpBinary: String = "/usr/bin/scp", configFile: URL? = nil,
                 useControlMaster: Bool = true, controlPersistSeconds: Int = 600,
@@ -34,7 +38,7 @@ public struct SSHOptions: Sendable, Equatable {
     }
 
     public var controlPathTemplate: String {
-        AppPaths.controlSocketDirectory.appendingPathComponent("%C").path
+        AppPaths.controlSocketDirectory.appendingPathComponent(controlSlot == 0 ? "%C" : "%C-\(controlSlot)").path
     }
 
     /// Options shared by ssh and scp (`-o` style, valid for both).

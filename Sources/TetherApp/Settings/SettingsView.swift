@@ -31,10 +31,11 @@ private struct GeneralSettings: View {
             Section {
                 Toggle("Re-attach persistent sessions on launch", isOn: $store.settings.restoreSessionsOnLaunch)
                 Toggle("Check for a new version at launch", isOn: $store.settings.checkForUpdates)
+                Toggle("Keep running in the menu bar when the window is closed", isOn: $store.settings.keepRunningInMenuBar)
             } header: {
                 Text("Startup")
             } footer: {
-                Text("One request to GitHub when Tether starts. If a newer release exists, Tether tells you and links to it; nothing is downloaded or sent.")
+                Text("In the menu bar, closing the window hides Tether from the Dock while every session keeps running; click the menu bar icon to open it again with its tabs. ⌘Q quits (persistent sessions re-attach next time). The update check is one request to GitHub at launch; nothing is downloaded or sent.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Tabs & Windows") {
@@ -453,10 +454,12 @@ private struct PasswordSettings: View {
             }
             Section {
                 Toggle("Offer to fill passwords in terminals", isOn: $store.settings.detectPasswordPrompts)
+                Toggle("Fill saved passwords automatically", isOn: $store.settings.autoFillPasswordPrompts)
+                    .disabled(!store.settings.detectPasswordPrompts)
             } header: {
                 Text("sudo, su and other prompts")
             } footer: {
-                Text("When a terminal shows a prompt such as “[sudo] password for alice:”, “Password:” (su) or “alice@host's password:”, a bar offers to fill a saved password (⌥⌘P) or to type one in a secure field and save it. Nothing is typed without your click, and prompts for a new password are ignored. Applies to sessions connected after the change.")
+                Text("When a terminal shows a prompt such as “[sudo] password for alice:”, “Password:” (su) or “alice@host's password:”, a saved password is filled right away (after Touch ID, if required) — or, with automatic filling off, a bar offers it (⌥⌘P). Without a saved password, ⌥⌘P opens a secure field to type one and save it. Another host's login prompt (“alice@host's password:”) is never filled on its own, a wrong password is not retried, and prompts for a new password are ignored. Applies to sessions connected after the change.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Saved in Keychain") {

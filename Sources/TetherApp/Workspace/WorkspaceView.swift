@@ -61,7 +61,7 @@ struct SessionPane: View {
                     SessionBanner(session: session)
                         .padding(.top, 10)
                 }
-                if olderHistoryOnDisk, let url = session.recordingURL {
+                if olderHistoryOnDisk, let url = session.flushedRecordingURL() {
                     GlassPill {
                         HStack(spacing: 10) {
                             Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
@@ -98,9 +98,13 @@ struct SessionPane: View {
             .animation(.smooth(duration: 0.25), value: session.progress == nil)
             SessionFooter(session: session)
         }
+        .onDisappear { session.isOnScreen = false }
         .onAppear {
+            session.isOnScreen = true
             let view = TerminalRegistry.shared.view(for: session)
             view.onReachedHistoryLimit = { at in olderHistoryOnDisk = at }
+            // Scrolling past what is in memory reads earlier output back from the recording.
+            view.historySource = session.recordingURL == nil ? nil : { [weak session] in session?.flushedRecordingURL() }
             view.onFiles = { [weak state] urls in
                 guard let state else { return }
                 AppModel.shared.handleFiles(urls, for: session, in: state)

@@ -18,6 +18,10 @@ public final class SessionManager {
     @ObservationIgnored public var prepare: (TerminalSession) -> Void = { _ in }
     /// Called when a session is removed for good (to release its view).
     @ObservationIgnored public var didRemove: (UUID) -> Void = { _ in }
+    /// A session ended (its shell exited, its server session was gone, …).
+    @ObservationIgnored public var onSessionEnded: ((TerminalSession) -> Void)?
+    /// A session was closed by the user; `killedRemote` when its tmux/screen session was ended too.
+    @ObservationIgnored public var onSessionClosed: ((TerminalSession, Bool) -> Void)?
 
     @ObservationIgnored private let settings: SettingsStore
     @ObservationIgnored private let archiveStore = JSONStore<[ArchivedSession]>(filename: "archive.json")
@@ -77,8 +81,10 @@ public final class SessionManager {
         descriptor.initialDirectory = directory
         if let remoteSessionName { descriptor.remoteSessionName = remoteSessionName }
         let session = makeSession(descriptor)
+        session.controlSlot = nextControlSlot(for: target)
         sessions.append(session)
         if remoteSessionName != nil {
+            session.openedForAttach = true
             // Attaching to an existing remote session: never create a new one.
             session.restore(previous: descriptor.persistence == .screen ? .screen : .tmux)
         } else {
@@ -86,6 +92,19 @@ public final class SessionManager {
         }
         saveOpenSessions()
         return session
+    }
+
+    /// Terminals per shared connection. sshd allows 10 sessions per connection by default; slot 0
+    /// also carries monitoring, transfers and port forwards, so each slot gets at most 6 terminals.
+    public static let terminalsPerConnection = 6
+
+    /// The shared connection a new session to `target` should use: the least loaded slot with room.
+    private func nextControlSlot(for target: ConnectionTarget) -> Int {
+        var load: [Int: Int] = [:]
+        for s in sessions where s.descriptor.target.key == target.key && !s.phase.isDead { load[s.controlSlot, default: 0] += 1 }
+        var slot = 0
+        while load[slot, default: 0] >= Self.terminalsPerConnection { slot += 1 }
+        return slot
     }
 
     /// Opens a fresh session to the same destination (used for dead tabs and "Duplicate").
@@ -99,6 +118,15 @@ public final class SessionManager {
         let store = settings
         let session = TerminalSession(descriptor: descriptor) { SessionConfiguration(settings: store.settings) }
         session.onDeath = { [weak self] s in self?.archiveSession(s) }
+        // An ended session without a tab has nowhere to be seen: remove it (the archive keeps it).
+        session.onEnded = { [weak self] s in
+            guard let self else { return }
+            self.onSessionEnded?(s)
+            // Attaching to a server session that had already ended: nothing to show, close the tab.
+            let staleAttach = s.openedForAttach && s.remoteSessionGone && !s.wasOnline
+            guard self.background.contains(s.id) || staleAttach else { return }
+            DispatchQueue.main.async { self.close(s.id, killRemote: false) }
+        }
         session.onPersistenceKnown = { [weak self] _ in self?.saveOpenSessions() }
         prepare(session)
         return session
@@ -111,6 +139,7 @@ public final class SessionManager {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let session = sessions[index]
         if !session.phase.isDead { session.close(killRemote: killRemote) }
+        onSessionClosed?(session, killRemote)
         sessions.remove(at: index)
         background.remove(id)
         if selectedID == id { selectedID = nil }
@@ -173,7 +202,7 @@ public final class SessionManager {
         archive.removeAll { $0.id == entry.id }
         archive.insert(entry, at: 0)
         if archive.count > 500 { archive.removeLast(archive.count - 500) }
-        archiveStore.save(archive)
+        archiveStore.saveSoon(archive)
         // A background session has no tab to show its end, so drop it once archived.
         if background.contains(s.id) { close(s.id, killRemote: false) }
         saveOpenSessions()
@@ -184,12 +213,12 @@ public final class SessionManager {
             try? FileManager.default.removeItem(atPath: path)
         }
         archive.removeAll { $0.id == id }
-        archiveStore.save(archive)
+        archiveStore.saveSoon(archive)
     }
 
     public func clearArchive() {
         archive.removeAll()
-        archiveStore.save(archive)
+        archiveStore.saveSoon(archive)
     }
 
     // MARK: Persistence across launches
@@ -200,7 +229,7 @@ public final class SessionManager {
             return SavedSession(descriptor: s.descriptor, persistence: s.persistence,
                                 background: background.contains(s.id), suspended: s.phase.isSuspended)
         }
-        openStore.save(saved)
+        openStore.saveSoon(saved)
     }
 
     /// Re-attaches to tmux/screen sessions that were open when the app quit.
@@ -208,6 +237,7 @@ public final class SessionManager {
         guard settings.settings.restoreSessionsOnLaunch, let saved = openStore.load() else { return }
         for item in saved {
             let session = makeSession(item.descriptor)
+            session.controlSlot = nextControlSlot(for: item.descriptor.target)
             sessions.append(session)
             if item.background == true { background.insert(session.id) }
             if item.suspended == true { session.restoreSuspended(previous: item.persistence) }

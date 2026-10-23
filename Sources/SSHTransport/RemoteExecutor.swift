@@ -35,6 +35,7 @@ public struct RemoteExecutor: Sendable {
             if let extra { input.append(extra) }
             return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + arguments, input: input, timeout: timeout)
         }
+        if options.useControlMaster { await ConnectionGate.shared.waitForTurn(target.key) }
         let platform = await resolvedPlatform()
         let call: (command: String, input: Data)
         do {

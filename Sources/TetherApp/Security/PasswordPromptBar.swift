@@ -25,6 +25,28 @@ extension AppModel {
         }
     }
 
+    /// A prompt just appeared. With a saved password and auto-fill on, it is filled right away:
+    /// the only thing left to do is Touch ID (nothing at all during the grace period).
+    /// Prompts for *another* host's login (`user@host's password:`) are never filled on their own,
+    /// since any server could print one; those wait for ⌥⌘P or a click.
+    func passwordPromptAppeared(_ prompt: PasswordPrompt, in session: TerminalSession) {
+        guard settings.autoFillPasswordPrompts, prompt.kind != .login,
+              let key = credentialKey(for: session), PasswordVault.hasPassword(for: key) else { return }
+        // The same prompt again right after filling means the password was wrong: let the user type.
+        if let last = autoFilled[session.id], last.key == key, Date().timeIntervalSince(last.date) < 30 {
+            autoFilled[session.id] = nil
+            return
+        }
+        autoFilled[session.id] = (key, Date())
+        fillSavedPassword(in: session)
+    }
+
+    /// ⌥⌘P: fill the saved password, or open the secure entry sheet when there is none.
+    func fillOrEnterPassword(in session: TerminalSession, state: WindowState?) {
+        guard session.passwordPrompt != nil else { return }
+        if hasSavedPassword(for: session) { fillSavedPassword(in: session) } else { state?.passwordEntry = session }
+    }
+
     /// Types a password the user just entered, optionally saving it for this kind of prompt.
     func enterPassword(_ password: String, in session: TerminalSession, save: Bool) {
         if save, let key = credentialKey(for: session) { PasswordVault.setPassword(password, for: key) }

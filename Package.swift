@@ -73,7 +73,7 @@ let package = Package(
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
         .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit"]),
         .testTarget(name: "SessionKitTests", dependencies: ["SessionKit", "TetherCore"]),
-        .testTarget(name: "TerminalUITests", dependencies: ["TerminalUI", "SessionKit", "TetherCore", "SearchKit",
+        .testTarget(name: "TerminalUITests", dependencies: ["TerminalUI", "SessionKit", "TetherCore", "SearchKit", "RecordingKit",
                                                             .product(name: "SwiftTerm", package: "SwiftTerm")]),
     ],
     swiftLanguageModes: [.v5]

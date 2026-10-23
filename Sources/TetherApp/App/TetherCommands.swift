@@ -100,9 +100,9 @@ struct TetherCommands: Commands {
             Button("Disconnect & Move to Background") { if let active { window?.disconnectToBackground(active) } }
                 .shortcut(.disconnect)
                 .disabled(active.map { $0.phase.isDead || $0.descriptor.target.isLocal } ?? true)
-            Button("Fill Saved Password") { if let active { model.fillSavedPassword(in: active) } }
+            Button("Fill or Enter Password") { if let active { model.fillOrEnterPassword(in: active, state: window) } }
                 .shortcut(.fillPassword)
-                .disabled(active.map { !model.hasSavedPassword(for: $0) } ?? true)
+                .disabled(active?.passwordPrompt == nil)
             Button("Enter Password…") { window?.passwordEntry = active }
                 .disabled(active?.passwordPrompt == nil)
             Button("Terminate Session…") { if let active { window?.terminate(active) } }

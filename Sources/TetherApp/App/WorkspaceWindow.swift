@@ -12,6 +12,13 @@ struct WorkspaceWindow: View {
     @State private var state: WindowState
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @SceneStorage("showInspector") private var showInspector = true
+    @AppStorage("inspectorWidth") private var inspectorWidth = 420.0
+    @State private var detailWidth: CGFloat = 1200
+
+    /// Shown when wanted and when the terminal still gets at least 380 points beside it.
+    private var inspectorVisible: Bool {
+        showInspector && detailWidth >= inspectorWidth + 380
+    }
     @State private var renameText = ""
 
     init(workspaceID: UUID) {
@@ -27,19 +34,29 @@ struct WorkspaceWindow: View {
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
         } detail: {
-            VStack(spacing: 0) {
-                TabStrip()
-                Divider()
-                WorkspaceView()
+            // The host panel is drawn here rather than as a split-view inspector column: AppKit's
+            // three-column split view loops forever (and crashes) when the window is narrower than
+            // the columns' ideal widths. Here nothing has a minimum width that can conflict, and
+            // the panel simply steps aside while the window is too narrow for it.
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    TabStrip()
+                    Divider()
+                    WorkspaceView()
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                if inspectorVisible {
+                    PanelDivider(width: $inspectorWidth, range: 340...640)
+                    InspectorContainer()
+                        .frame(width: inspectorWidth)
+                        .frame(maxHeight: .infinity)
+                        .background(.background)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
-            // A fixed minimum keeps the split view from re-measuring whenever the content changes
-            // (terminal ↔ welcome screen), which otherwise can loop in AppKit's constraint pass.
+            .clipped()
             .frame(minWidth: 320, maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
-            .inspector(isPresented: $showInspector) {
-                InspectorContainer()
-                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
-                    .inspectorColumnWidth(min: 340, ideal: 420, max: 640)
-            }
+            .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { detailWidth = $0 }
         }
         .toolbar { WorkspaceToolbar(showInspector: $showInspector) }
         .navigationTitle(windowTitle)
@@ -50,6 +67,8 @@ struct WorkspaceWindow: View {
             window.tabbingMode = .disallowed
             state.window = window
             model.workspaces.register(window, for: workspaceID, state: state)
+            WindowLayout.apply(to: window, workspace: workspaceID)
+            WindowLayout.watch(window, workspace: workspaceID)
         })
         .sheet(isPresented: $state.showQuickConnect) { QuickConnectView() }
         .sheet(item: $state.hostEditor) { HostEditorView(request: $0) }
@@ -73,7 +92,9 @@ struct WorkspaceWindow: View {
         .onAppear {
             model.workspaces.openWindow = { id in openWindow(id: "workspace", value: id) }
             model.openSearch = { openWindow(id: "search") }
+            WindowLayout.openRemaining { id in openWindow(id: "workspace", value: id) }
             model.adoptOrphanSessions(into: state)
+            MenuBarState.windowOpened()
             #if DEBUG
             SelfTest.runIfRequested(state: state)
             DemoMode.runIfRequested(state: state)
@@ -87,7 +108,16 @@ struct WorkspaceWindow: View {
             if model.sessions.selectedID != id { model.sessions.selectedID = id }
         }
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
-        .onChange(of: state.toggleInspector) { withAnimation(.smooth) { showInspector.toggle() } }
+        .onChange(of: state.toggleInspector) {
+            withAnimation(.smooth) {
+                // Wanted but stepped aside for lack of room: make room by hiding the sidebar.
+                if showInspector && !inspectorVisible && columnVisibility != .detailOnly {
+                    columnVisibility = .detailOnly
+                } else {
+                    showInspector.toggle()
+                }
+            }
+        }
         .onChange(of: state.showInspectorRequest) { _, show in
             if show { withAnimation(.smooth) { showInspector = true }; state.showInspectorRequest = false }
         }
@@ -147,7 +177,7 @@ struct WorkspaceToolbar: ToolbarContent {
             .help("Open a file manager tab in the terminal's current directory (⇧⌘O)")
 
             Button {
-                withAnimation(.smooth) { showInspector.toggle() }
+                state.toggleInspector.toggle()
             } label: {
                 Label("Host Panel", systemImage: "sidebar.trailing")
             }

@@ -139,6 +139,9 @@ final class WindowState {
         case .window:
             let ws = UUID()
             model.workspaces.add(id, to: ws)
+            if let frame = window?.frame {
+                WindowLayout.place(ws, frame: frame.offsetBy(dx: 32, dy: -32))
+            }
             model.workspaces.openWindow?(ws)
         }
     }
@@ -196,9 +199,23 @@ final class WindowState {
         }
     }
 
-    /// Closes a tab, asking first when the session is still running.
+    /// Closes a tab, asking first when the session is online. A session that is not connected
+    /// (still connecting, or failing to reconnect) just closes: keeping it would only keep it
+    /// retrying. A tmux/screen session it had on the server stays there and is listed under the
+    /// host, ready to attach.
     func closeTab(_ session: TerminalSession) {
-        if session.phase.isDead || !model.settings.confirmCloseOnlineSessions {
+        // Nothing was done in it: close without asking and leave nothing behind on the server.
+        if session.phase.isOnline && session.isUnused {
+            model.sessions.close(session.id, killRemote: true)
+            return
+        }
+        if !session.phase.isOnline {
+            // Never connected: nothing to keep, so nothing is left behind on the server either.
+            // (A session that was online and lost its connection keeps running there.)
+            model.sessions.close(session.id, killRemote: !session.wasOnline)
+            return
+        }
+        if !model.settings.confirmCloseOnlineSessions {
             model.sessions.close(session.id, killRemote: false)
             return
         }

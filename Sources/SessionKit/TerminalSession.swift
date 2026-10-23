@@ -51,8 +51,41 @@ public final class TerminalSession: Identifiable {
     /// A password prompt currently waiting in the terminal (sudo, su, ssh, …), if any.
     public private(set) var passwordPrompt: PasswordPrompt?
     @ObservationIgnored private var promptDetector = PasswordPromptDetector()
+    /// Set by the app while this session's terminal is the visible tab of a window.
+    @ObservationIgnored public var isOnScreen = false
+    /// Called when a new password prompt appears (to fill a saved password automatically).
+    @ObservationIgnored public var onPasswordPrompt: ((TerminalSession, PasswordPrompt) -> Void)?
     /// Whether to look for password prompts (from the settings; updated on connect and by the app).
     @ObservationIgnored public var detectPrompts = true
+    /// The tmux/screen session this tab wanted to attach to no longer exists on the server.
+    public private(set) var remoteSessionGone = false
+    /// Opened to attach to an existing server session (from the sidebar list).
+    public var openedForAttach = false
+    /// Which shared connection to the host this session uses (see `SSHOptions.controlSlot`).
+    public var controlSlot = 0
+    @ObservationIgnored private var holdingGate: String?
+
+    private func sshOptions(_ config: SessionConfiguration) -> SSHOptions {
+        var o = config.ssh
+        o.controlSlot = controlSlot
+        return o
+    }
+
+    /// Lets the next queued connection to this host go ahead.
+    private func releaseGate() {
+        guard let key = holdingGate else { return }
+        holdingGate = nil
+        Task { await ConnectionGate.shared.release(key) }
+    }
+
+    /// Waits until it is this session's turn to log in to the host (see `ConnectionGate`).
+    private func waitForGate(_ key: String) async -> Bool {
+        await ConnectionGate.shared.acquire(key)
+        holdingGate = key
+        if Task.isCancelled || intentionalStop { releaseGate(); return false }
+        return true
+    }
+
     /// The host's platform as detected when connecting (Windows hosts get PowerShell, no persistence).
     public private(set) var platform: RemotePlatform = .posix
 
@@ -77,6 +110,14 @@ public final class TerminalSession: Identifiable {
     /// The local recording of this session.
     public var recordingURL: URL? { recorder?.url }
 
+    /// The recording, with everything buffered written out first (for search and history).
+    public func flushedRecordingURL() -> URL? {
+        recorder?.flushNow()
+        return recorder?.url
+    }
+
+    /// Called whenever the session ends, archived or not.
+    @ObservationIgnored public var onEnded: ((TerminalSession) -> Void)?
     /// Called when the session becomes dead (to archive it).
     @ObservationIgnored public var onDeath: ((TerminalSession) -> Void)?
     /// Called when the negotiated persistence backend becomes known, so the session can be
@@ -151,7 +192,25 @@ public final class TerminalSession: Identifiable {
     }
 
     /// User input from the terminal view. Dropped unless the session can accept it.
+    /// True once a command was typed and sent in this session (any non-blank line + Return).
+    public private(set) var hasRunCommands = false
+    @ObservationIgnored private var typedOnLine = false
+
+    /// Nothing worth keeping: no command was run here, nothing is running in it, and it was not
+    /// re-attached to an existing session (which may hold earlier work). Closing it needs no question.
+    public var isUnused: Bool {
+        if hasRunCommands || restoredFromDisk || openedForAttach { return false }
+        if let command = activity?.command, !command.isEmpty, !Self.shells.contains(command) { return false }
+        return true
+    }
+
     public func send(_ bytes: ArraySlice<UInt8>) {
+        if !hasRunCommands {
+            for b in bytes {
+                if b == 0x0d || b == 0x0a { if typedOnLine { hasRunCommands = true }; typedOnLine = false }
+                else if b > 0x20 && b != 0x7f { typedOnLine = true }
+            }
+        }
         if passwordPrompt != nil, bytes.contains(0x0d) || bytes.contains(0x0a) || bytes.contains(0x03) {
             passwordPrompt = nil
             promptDetector.reset()
@@ -219,7 +278,7 @@ public final class TerminalSession: Identifiable {
         retryTask = nil
         Task {
             // A half-dead multiplex master would make the new connection hang; drop it first.
-            let executor = RemoteExecutor(target: descriptor.target, options: configurationProvider().ssh)
+            let executor = RemoteExecutor(target: descriptor.target, options: sshOptions(configurationProvider()))
             if !(await executor.isMasterAlive()) { await executor.closeMaster() }
             launch(attachOnly: wasOnline || restoredFromDisk)
         }
@@ -237,7 +296,7 @@ public final class TerminalSession: Identifiable {
         if killRemote, persistence == .tmux || persistence == .screen {
             let name = descriptor.remoteSessionName
             let target = descriptor.target
-            let options = configurationProvider().ssh
+            let options = sshOptions(configurationProvider())
             let script = persistence == .tmux
                 ? "tmux kill-session -t \"=$1\" 2>/dev/null"
                 : "screen -S \"$1\" -X quit 2>/dev/null"
@@ -292,37 +351,63 @@ public final class TerminalSession: Identifiable {
 
         connectTask?.cancel()
         let target = descriptor.target
-        guard !target.isLocal, config.ssh.useControlMaster else {
+        guard !target.isLocal, sshOptions(config).useControlMaster else {
             platform = target.isLocal ? .posix : (PlatformCache.shared.cached(target.key) ?? .posix)
-            startTerminal(attachOnly: attachOnly)
+            if target.isLocal { startTerminal(attachOnly: attachOnly); return }
+            // Without a shared connection every tab is its own login: start them one at a time
+            // (the gate is released once this one is online or has failed).
+            connectTask = Task { [weak self] in
+                guard let self, await self.waitForGate(target.key) else { return }
+                self.startTerminal(attachOnly: attachOnly)
+            }
             return
         }
         connectTask = Task { [weak self] in
             guard let self else { return }
-            let executor = RemoteExecutor(target: target, options: config.ssh)
+            // One login at a time per host; the others reuse the shared connection right after.
+            guard await self.waitForGate(target.key) else { return }
+            let executor = RemoteExecutor(target: target, options: self.sshOptions(config))
             if await executor.isMasterAlive() {
                 self.progress?.detail = "Using the existing connection"
             } else {
                 let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect", mode: "force")
                 let connector = MasterConnector()
                 self.connector = connector
-                let error = await connector.connect(target: target, options: config.ssh, environment: env) { [weak self] line in
+                let error = await connector.connect(target: target, options: sshOptions(config), environment: env) { [weak self] line in
                     self?.progress?.ingest(line)
                 }
                 AskPassBridge.shared.revoke(environment: env)
                 self.connector = nil
-                guard !Task.isCancelled, !self.intentionalStop else { return }
+                guard !Task.isCancelled, !self.intentionalStop else { self.releaseGate(); return }
                 if let error {
+                    self.releaseGate()
                     self.connectionFailed(error)
                     return
                 }
             }
+            self.releaseGate()
             guard !Task.isCancelled, !self.intentionalStop else { return }
             self.progress?.detail = "Checking the server's shell"
             self.platform = await executor.resolvedPlatform()
             guard !Task.isCancelled, !self.intentionalStop else { return }
             self.startTerminal(attachOnly: attachOnly)
         }
+    }
+
+    /// True when the session ended because it could not connect (not because the remote shell ended).
+    public private(set) var endedByConnectionFailure = false
+
+    /// Tries the same session again after it gave up connecting. Re-attaches to its tmux/screen
+    /// session if it had one, instead of starting a new session.
+    public func retryAfterFailure() {
+        guard phase.isDead, endedByConnectionFailure else { return }
+        endedByConnectionFailure = false
+        endedAt = nil
+        recorder = nil      // the old one was closed; a new recording starts
+        attempt = 0
+        lastError = nil
+        phase = wasOnline || restoredFromDisk ? .waiting(attempt: 0, nextRetry: nil) : .connecting
+        launch(attachOnly: wasOnline || restoredFromDisk)
     }
 
     /// Opening the shared connection failed: show why, then retry or give up.
@@ -332,6 +417,7 @@ public final class TerminalSession: Identifiable {
         lastError = message
         let permanent = progress.map { p in p.log.contains { Self.isPermanentFailure($0) } } ?? false
         if !wasOnline && !pendingAttachOnly && (permanent || attempt >= 2) {
+            endedByConnectionFailure = true
             finish(reason: message, archive: false)
             return
         }
@@ -359,8 +445,8 @@ public final class TerminalSession: Identifiable {
                                              attachOnly: attachOnly, size: sink?.cellSize ?? (80, 24),
                                              directory: attachOnly ? nil : descriptor.initialDirectory)
         let local = descriptor.target.isLocal
-        let executable = local ? "/bin/sh" : config.ssh.sshBinary
-        let args = local ? ["-c", remote] : config.ssh.interactiveArguments(target: descriptor.target, remoteCommand: remote)
+        let executable = local ? "/bin/sh" : sshOptions(config).sshBinary
+        let args = local ? ["-c", remote] : sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: remote)
 
         AskPassBridge.shared.revoke(environment: askPassEnv)
         // "prefer" makes password prompts appear as a native sheet (with keychain support),
@@ -400,7 +486,7 @@ public final class TerminalSession: Identifiable {
         } else if platform == .windowsCmd {
             command = "powershell -NoLogo"
         }
-        let args = config.ssh.interactiveArguments(target: descriptor.target, remoteCommand: command)
+        let args = sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: command)
         AskPassBridge.shared.revoke(environment: askPassEnv)
         askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
         var env = ProcessInfo.processInfo.environment
@@ -411,7 +497,7 @@ public final class TerminalSession: Identifiable {
         self.bridge = bridge
         let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
         self.process = process
-        process.startProcess(executable: config.ssh.sshBinary, args: args,
+        process.startProcess(executable: sshOptions(config).sshBinary, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: "ssh")
         markerResolved = true
         progress?.detail = "Starting PowerShell"
@@ -471,6 +557,7 @@ public final class TerminalSession: Identifiable {
         }
         switch marker {
         case .gone:
+            remoteSessionGone = true
             progress?.failure = "The session no longer exists on the server."
             progress?.hint = "It was ended there (or the server restarted). Open a new session to continue."
             intentionalStop = true
@@ -506,6 +593,7 @@ public final class TerminalSession: Identifiable {
     }
 
     private func becameOnline() {
+        releaseGate()
         if !wasOnline { onPersistenceKnown?(self) }
         progress = nil
         if wasOnline { recorder?.mark("Reconnected \(Date().formatted(date: .omitted, time: .standard))") }
@@ -520,6 +608,7 @@ public final class TerminalSession: Identifiable {
 
     fileprivate func processTerminated(exitCode: Int32?) {
         process = nil
+        releaseGate()
         AskPassBridge.shared.revoke(environment: askPassEnv)
         askPassEnv = [:]
         if intentionalStop || phase.isDead { return }
@@ -535,6 +624,13 @@ public final class TerminalSession: Identifiable {
             return
         }
 
+        // The server limits sessions per shared connection (sshd MaxSessions): use another one.
+        if !phase.isOnline, Self.isSessionRefused(stderrTail), controlSlot < 32, sshOptions(configurationProvider()).useControlMaster {
+            controlSlot += 1
+            progress?.detail = "The server limits sessions per connection — opening another shared connection"
+            launch(attachOnly: pendingAttachOnly)
+            return
+        }
         let code = exitCode ?? 255
         // In a plain shell a non-255 code means the shell exited normally.
         if persistence == .plain && code != 255 && markerResolved {
@@ -548,6 +644,7 @@ public final class TerminalSession: Identifiable {
         if !wasOnline && !pendingAttachOnly {
             let message = stderrTail.isEmpty ? "ssh exited with code \(code)" : stderrTail
             if Self.isPermanentFailure(message) || attempt >= 2 {
+                endedByConnectionFailure = true
                 finish(reason: message, archive: false)
                 return
             }
@@ -577,6 +674,7 @@ public final class TerminalSession: Identifiable {
     }
 
     private func finish(reason: String, archive: Bool) {
+        releaseGate()
         guard !phase.isDead else { return }
         retryTask?.cancel()
         phase = .dead(reason: reason)
@@ -585,6 +683,7 @@ public final class TerminalSession: Identifiable {
         display(Array(notice.utf8))
         recorder?.close()
         if archive { onDeath?(self) }
+        onEnded?(self)
     }
 
     /// Every 2 s while online: asks tmux what is running (tab titles) and measures latency.
@@ -612,12 +711,13 @@ public final class TerminalSession: Identifiable {
 
     /// Without tmux there is no side channel in the session; time a no-op over the shared connection.
     private func measureLatencyOutOfBand() async {
-        guard !descriptor.target.isLocal else { return }
+        // An extra ssh command per session adds up with many tabs; only the one on screen measures.
+        guard !descriptor.target.isLocal, isOnScreen else { return }
         let config = configurationProvider()
-        guard config.ssh.useControlMaster else { return }
-        let executor = RemoteExecutor(target: descriptor.target, options: config.ssh)
+        guard sshOptions(config).useControlMaster else { return }
+        let executor = RemoteExecutor(target: descriptor.target, options: sshOptions(config))
         let start = Date()
-        let r = await executor.run(script: ":", timeout: 10, purpose: "latency")
+        let r = await executor.run(RemoteScript(":", windows: "exit 0"), timeout: 10, purpose: "latency")
         if r.succeeded { recordLatency(Date().timeIntervalSince(start)) }
     }
 
@@ -676,7 +776,10 @@ public final class TerminalSession: Identifiable {
         recorder?.append(bytes)
         if detectPrompts {
             let prompt = promptDetector.feed(bytes)
-            if prompt != passwordPrompt { passwordPrompt = prompt }
+            if prompt != passwordPrompt {
+                passwordPrompt = prompt
+                if let prompt { onPasswordPrompt?(self, prompt) }
+            }
         }
     }
 
@@ -686,6 +789,12 @@ public final class TerminalSession: Identifiable {
         let lines = (stderrTail + text).split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         stderrTail = lines.suffix(2).joined(separator: "\n")
+    }
+
+    static func isSessionRefused(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return m.contains("session open refused") || m.contains("administratively prohibited")
+            || m.contains("session request failed")
     }
 
     static func isPermanentFailure(_ message: String) -> Bool {

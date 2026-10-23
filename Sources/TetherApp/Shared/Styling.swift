@@ -44,12 +44,17 @@ struct StatusDot: View {
         ZStack {
             switch phase {
             case .connecting:
-                ProgressView().controlSize(.mini).scaleEffect(0.7).frame(width: size + 4, height: size + 4)
+                // A static ring: a spinner in every tab and sidebar row while many sessions connect
+                // means dozens of animations redrawing at once.
+                Circle().trim(from: 0, to: 0.7)
+                    .stroke(phase.tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: size + 1, height: size + 1)
             case .waiting:
-                TimelineView(.periodic(from: .now, by: 0.6)) { context in
-                    let on = Int(context.date.timeIntervalSinceReferenceDate / 0.6) % 2 == 0
-                    Circle().fill(phase.tint.opacity(on ? 1 : 0.35)).frame(width: size, height: size)
-                }
+                // Static (a blinking dot redraws every row that shows it, for as long as it waits).
+                Circle().strokeBorder(phase.tint, lineWidth: 1.5)
+                    .background(Circle().fill(phase.tint.opacity(0.35)).padding(2.5))
+                    .frame(width: size, height: size)
             case .suspended:
                 Image(systemName: "pause.circle.fill")
                     .font(.system(size: size + 3))
@@ -57,8 +62,9 @@ struct StatusDot: View {
             case .dead:
                 Circle().strokeBorder(phase.tint, lineWidth: 1.5).frame(width: size, height: size)
             case .online:
+                // A soft ring instead of a shadow: shadows are blurred in software on every redraw.
                 Circle().fill(phase.tint).frame(width: size, height: size)
-                    .shadow(color: phase.tint.opacity(0.6), radius: 3)
+                    .background(Circle().fill(phase.tint.opacity(0.25)).frame(width: size + 4, height: size + 4))
             }
         }
         .frame(width: size * 2, height: size * 2)

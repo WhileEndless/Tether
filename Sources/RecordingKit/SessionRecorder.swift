@@ -36,17 +36,23 @@ public final class SessionRecorder: @unchecked Sendable {
 
     private var flushScheduled = false
 
-    /// Buffers output and writes it in batches: when 64 KB have accumulated, or at most a second
-    /// later, so the file stays current (for search and crash safety) without a write per chunk.
+    /// Output is kept in memory and written in large, infrequent batches — when 512 KB have
+    /// accumulated or 15 s after the first unwritten byte — so a busy terminal (e.g. `tail -f`)
+    /// does not cause a stream of small writes that wear the SSD. Readers that need the file to be
+    /// current (search, scrolling into older history) call `flushNow()` first; closing flushes too.
+    /// At most 15 s of output is only in memory, and the terminal shows it anyway.
+    public static let batchBytes = 512 * 1024
+    public static let batchInterval: TimeInterval = 15
+
     public func append(_ bytes: some Sequence<UInt8>) {
         let data = Data(bytes)
         queue.async { [self] in
             pending.append(data)
-            if pending.count >= 64 * 1024 {
+            if pending.count >= Self.batchBytes {
                 flushLocked()
             } else if !flushScheduled {
                 flushScheduled = true
-                queue.asyncAfter(deadline: .now() + 1) { [self] in
+                queue.asyncAfter(deadline: .now() + Self.batchInterval) { [self] in
                     flushScheduled = false
                     flushLocked()
                 }
@@ -61,6 +67,11 @@ public final class SessionRecorder: @unchecked Sendable {
 
     public func flush() {
         queue.async { [self] in flushLocked() }
+    }
+
+    /// Writes everything buffered before returning (for readers of the file).
+    public func flushNow() {
+        queue.sync { flushLocked() }
     }
 
     private func flushLocked() {

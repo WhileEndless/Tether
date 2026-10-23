@@ -58,7 +58,15 @@ public final class RemoteMonitor {
     public func retain(interval: TimeInterval) {
         interest += 1
         self.interval = max(interval, 1)
-        if stream == nil && !frozen { startStream() }
+        if stream == nil && !frozen && !paused { startStream() }
+    }
+
+    /// While paused (no window of the app is visible), nothing is streamed; the last data stays.
+    public var paused = false {
+        didSet {
+            guard paused != oldValue else { return }
+            if paused { stopStream() } else if interest > 0 && stream == nil && !frozen { startStream() }
+        }
     }
 
     /// A view stops showing it. The stream ends shortly after the last one goes away.
@@ -73,7 +81,7 @@ public final class RemoteMonitor {
     }
 
     private func startStream() {
-        guard !frozen else { return }
+        guard !frozen, !paused else { return }
         restartTask?.cancel()
         let s = RemoteStream(separator: "@@end\n")
         s.onRecord = { [weak self] text in self?.ingest(text) }
@@ -98,6 +106,8 @@ public final class RemoteMonitor {
         let executor = self.executor
         let interval = self.interval
         Task { [weak self] in
+            // A terminal may be logging in to this host right now: stream over its connection.
+            if executor.options.useControlMaster { await ConnectionGate.shared.waitForTurn(executor.target.key) }
             let platform = await executor.resolvedPlatform()
             guard let self, self.stream === s else { return }
             self.platform = platform
@@ -242,6 +252,11 @@ public final class RemoteMonitor {
                                    timeout: 60, purpose: "containers")
         if action != "logs" { await refreshContainers() }
         return (r.succeeded, r.output + r.errorOutput)
+    }
+
+    /// Drops a server session from the list right away (it was just ended); a refresh confirms it.
+    public func forgetRemoteSession(named name: String) {
+        remoteSessions.removeAll { $0.name == name }
     }
 
     public func killRemoteSession(_ entry: RemoteSessionEntry) async {

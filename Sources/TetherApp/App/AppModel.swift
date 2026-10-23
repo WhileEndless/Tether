@@ -75,11 +75,20 @@ final class AppModel {
 
         sessions.prepare = { session in
             _ = TerminalRegistry.shared.view(for: session)
+            session.onPasswordPrompt = { s, prompt in AppModel.shared.passwordPromptAppeared(prompt, in: s) }
             session.onOnline = { s in
                 let model = AppModel.shared
                 model.forwards.sessionConnected(to: s.descriptor.target,
                                                 saved: model.metadata(for: s.descriptor.target.key).forwards ?? [])
             }
+        }
+        // Keep the sidebar's list of sessions on the server current: a session ended or closed here
+        // is updated right away instead of lingering as "detached".
+        sessions.onSessionEnded = { s in
+            if s.remoteSessionGone { AppModel.shared.serverSessionChanged(s, ended: true) }
+        }
+        sessions.onSessionClosed = { s, killed in
+            AppModel.shared.serverSessionChanged(s, ended: killed || s.persistence == .plain)
         }
         sessions.didRemove = { id in
             TerminalRegistry.shared.remove(id)
@@ -109,6 +118,7 @@ final class AppModel {
     }
 
     func launch() {
+        watchWindowVisibility()
         sessions.restoreOpenSessions()
     }
 
@@ -119,8 +129,10 @@ final class AppModel {
     func adoptOrphanSessions(into state: WindowState) {
         guard !orphansAdopted else { return }
         orphansAdopted = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        // Give the other windows of the last run time to reopen first (they keep their own tabs).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self else { return }
+            WindowLayout.finishReopening()
             self.workspaces.removeMissing(existing: Set(self.sessions.sessions.map(\.id)).union(self.fileTabs.tabs.keys))
             // Tabs of windows that did not come back reopen here, in their old order.
             for id in self.workspaces.pruneWithoutWindows() {
@@ -148,7 +160,7 @@ final class AppModel {
         var m = metadata(for: key)
         change(&m)
         library.metadata[key] = m
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     /// Hosts of a group (nil = ungrouped) in the user's sidebar order.
@@ -182,7 +194,7 @@ final class AppModel {
         // Rebuild the global order: this section's new order replaces its old positions.
         let others = ordered(hosts).compactMap(\.alias).filter { !aliases.contains($0) }
         library.hostOrder = aliases + others
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     /// Moves a host into a group (dropped on the group header), placing it last.
@@ -190,7 +202,7 @@ final class AppModel {
         updateMetadata(for: alias) { $0.groupID = group }
         library.hostOrder.removeAll { $0 == alias }
         library.hostOrder.append(alias)
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     func moveGroup(_ id: UUID, by offset: Int) {
@@ -198,20 +210,20 @@ final class AppModel {
         let j = min(max(i + offset, 0), library.groups.count - 1)
         guard i != j else { return }
         library.groups.swapAt(i, j)
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     var groups: [HostGroup] { library.groups }
 
     func addGroup(named name: String) {
         library.groups.append(HostGroup(name: name))
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     func updateGroup(_ id: UUID, _ change: (inout HostGroup) -> Void) {
         guard let i = library.groups.firstIndex(where: { $0.id == id }) else { return }
         change(&library.groups[i])
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     func deleteGroup(_ id: UUID) {
@@ -220,7 +232,7 @@ final class AppModel {
             m.groupID = nil
             library.metadata[k] = m
         }
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
     }
 
     func reloadConfig() {
@@ -241,7 +253,7 @@ final class AppModel {
     func removeHost(_ alias: String) throws {
         try editConfig(alias: alias) { try $0.removeHost(alias) }
         library.metadata[alias] = nil
-        libraryStore.save(library)
+        libraryStore.saveSoon(library)
         PasswordVault.deletePassword(for: alias)
     }
 
@@ -275,9 +287,42 @@ final class AppModel {
 
     // MARK: Monitoring
 
+    /// Whether any Tether window can be seen. When none can (covered, minimized, on another Space,
+    /// or closed to the menu bar), host monitoring pauses so Tether uses no CPU in the background.
+    @ObservationIgnored private var visibilityObserver: Any?
+
+    func watchWindowVisibility() {
+        guard visibilityObserver == nil else { return }
+        let refresh: @Sendable () -> Void = {
+            MainActor.assumeIsolated {
+                let visible = NSApp.windows.contains { $0.isVisible && $0.occlusionState.contains(.visible) && !($0 is NSPanel) }
+                for m in AppModel.shared.monitors.values where m.paused == visible { m.paused = !visible }
+            }
+        }
+        let center = NotificationCenter.default
+        visibilityObserver = center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: nil,
+                                                queue: .main) { _ in refresh() }
+        _ = center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
+            DispatchQueue.main.async { refresh() }
+        }
+    }
+
+    /// A session to `target` closed or ended: update the server session list now and confirm shortly.
+    func serverSessionChanged(_ session: TerminalSession, ended: Bool) {
+        let target = session.descriptor.target
+        guard !target.isLocal, let m = monitors[target.key] else { return }
+        if ended { m.forgetRemoteSession(named: session.descriptor.remoteSessionName) }
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            await m.refreshRemoteSessions()
+        }
+    }
+
     func monitor(for target: ConnectionTarget) -> RemoteMonitor {
         if let m = monitors[target.key] { return m }
         let m = RemoteMonitor(executor: executor(for: target))
+        m.paused = !NSApp.windows.contains { $0.isVisible && $0.occlusionState.contains(.visible) && !($0 is NSPanel) }
+            && !NSApp.windows.isEmpty
         monitors[target.key] = m
         return m
     }
@@ -393,6 +438,8 @@ final class AppModel {
     }
 
     @ObservationIgnored private var triedPasswords: Set<String> = []
+    /// Last automatic fill per session (to stop after a wrong password).
+    @ObservationIgnored var autoFilled: [UUID: (key: String, date: Date)] = [:]
 
     func resolvePrompt(_ prompt: PendingPrompt, answer: String?, save: Bool) {
         prompts.removeAll { $0.id == prompt.id }

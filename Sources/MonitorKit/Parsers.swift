@@ -123,7 +123,15 @@ public enum ProbeParser {
             snap.hostname = prev.hostname; snap.kernel = prev.kernel
             snap.architecture = prev.architecture; snap.osName = prev.osName
         }
-        snap.disks = (s["disk"] ?? []).compactMap(disk).filter { d in
+        // macOS (APFS): "/" is the read-only system snapshot, a few GB of its own; the volumes of a
+        // container share its space, so what is used is everything that is not free (as Finder shows).
+        let apfs = s["darwinmem"] != nil
+        snap.disks = (s["disk"] ?? []).compactMap(disk).map { d in
+            guard apfs, d.sizeKB > d.availableKB else { return d }
+            var d = d
+            d.usedKB = d.sizeKB - d.availableKB
+            return d
+        }.filter { d in
             // Hide pseudo filesystems.
             !["tmpfs", "devtmpfs", "overlay", "shm", "udev", "devfs", "map"].contains(where: { d.filesystem.hasPrefix($0) })
                 && !d.mount.hasPrefix("/System/Volumes/") && !d.mount.hasPrefix("/snap/") && !d.mount.hasPrefix("/run")

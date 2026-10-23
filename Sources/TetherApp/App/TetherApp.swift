@@ -8,6 +8,7 @@ struct TetherApp: App {
     @State private var model = AppModel.shared
 
     init() {
+        CrashLog.installIfRequested()
         // Tether has its own tabs per window; native window tabbing stays off.
         UserDefaults.standard.removeObject(forKey: "AppleWindowTabbingMode")
         NSWindow.allowsAutomaticWindowTabbing = false
@@ -69,6 +70,14 @@ struct TetherApp: App {
             SettingsView()
                 .environment(model)
         }
+
+        // Closing the last window leaves Tether running here (Settings ▸ General).
+        MenuBarExtra("Tether", systemImage: "point.3.connected.trianglepath.dotted",
+                     isInserted: Binding(get: { model.settings.keepRunningInMenuBar },
+                                         set: { model.settings.keepRunningInMenuBar = $0 })) {
+            MenuBarContent()
+                .environment(model)
+        }
     }
 }
 
@@ -114,7 +123,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        MainActor.assumeIsolated { AppModel.shared.isTerminating = true }
+        MainActor.assumeIsolated {
+            WindowLayout.saveOpenWindows()
+            AppModel.shared.isTerminating = true
+        }
         return .terminateNow
     }
 
@@ -122,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             AppModel.shared.fileTabs.saveDirectories()
             AppModel.shared.sessions.prepareForTermination()
+            DeferredWrites.shared.flush()
         }
     }
 }
@@ -134,7 +147,8 @@ struct WorkspaceRoot: View {
         if let workspaceID {
             WorkspaceWindow(workspaceID: workspaceID).id(workspaceID)
         } else {
-            Color.clear.onAppear { workspaceID = UUID() }
+            // At launch this is the frontmost window of the last run, with its tabs.
+            Color.clear.onAppear { workspaceID = WindowLayout.firstWorkspaceAtLaunch() }
         }
     }
 }

@@ -192,8 +192,7 @@ import TetherCore
         try await pump(15) { view.scrollbackText().lines.contains { $0 == "row-2999" } }
         let (base, lines, logical) = view.scrollbackText()
         #expect(base > 0, "old lines should have been dropped from memory")
-        let url = try #require(session.recordingURL)
-        try await pump(1.5)   // let the recorder flush
+        let url = try #require(session.flushedRecordingURL())   // writes out the batched output
         var earlier = SearchSource(id: "e", kind: .recording(url: url, archiveID: nil), title: "e", host: "h", date: nil, status: "")
         earlier.skipTrailingLines = logical
         let live = SearchSource(id: "l", kind: .live(sessionID: session.id, lineBase: base), title: "l", host: "h",

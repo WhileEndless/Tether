@@ -402,11 +402,108 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     public func scrolled(source: TerminalView, position: Double) {
-        let atLimit = position <= 0.0001 && getTerminal().buffer.totalLinesTrimmed > 0
+        let trimmed = getTerminal().buffer.totalLinesTrimmed > 0
+        if position <= 0.0001 && trimmed && historySource != nil {
+            // Older output is read back from disk as the user reaches the top (no visible break).
+            DispatchQueue.main.async { [weak self] in _ = self?.loadOlderHistory() }
+        } else if position >= 0.9999 {
+            DispatchQueue.main.async { [weak self] in self?.shrinkHistoryIfAtBottom() }
+        }
+        let atLimit = position <= 0.0001 && trimmed && historySource == nil
         if atLimit != atHistoryLimit {
             atHistoryLimit = atLimit
             onReachedHistoryLimit?(atLimit)
         }
+    }
+
+    // MARK: History beyond memory
+
+    /// The session's recording on disk (flushed), used to bring back output dropped from memory.
+    public var historySource: (() -> URL?)?
+    /// Lines read back each time the top of memory is reached.
+    public var historyChunkLines = 10_000
+    private var loadingHistory = false
+    private var historyExtended = false
+
+    private var bufferLineCount: Int {
+        let t = getTerminal()
+        var lo = t.buffer.totalLinesTrimmed, hi = lo + 4_000_000
+        while lo < hi {   // first invariant row without a line
+            let mid = (lo + hi) / 2
+            if t.getScrollInvariantLine(row: mid) != nil { lo = mid + 1 } else { hi = mid }
+        }
+        return lo - t.buffer.totalLinesTrimmed
+    }
+
+    /// Replays the end of the recording with room for `historyChunkLines` more lines. The bottom
+    /// of the buffer is the same afterwards, so the line being looked at, the selection and the
+    /// command marks are put back at the same distance from the end: scrolling simply continues.
+    /// Nothing happens in full-screen apps, while the mouse is pressed, or without a recording.
+    @discardableResult
+    func loadOlderHistory() -> Bool {
+        let t = getTerminal()
+        guard !loadingHistory, !isAlternateScreen, NSEvent.pressedMouseButtons == 0,
+              t.buffer.totalLinesTrimmed > 0, t.buffer.yDisp == 0,
+              let url = historySource?() else { return false }
+        loadingHistory = true
+        defer { loadingHistory = false }
+
+        let oldCount = bufferLineCount
+        let oldEnd = t.buffer.totalLinesTrimmed + oldCount
+        let selectionRange = selection.active ? (selection.start, selection.end) : nil
+        let wanted = oldCount + historyChunkLines
+        guard let bytes = Self.tail(of: url, lines: wanted + t.rows) else { return false }
+        let markDistances = markLines.map { oldEnd - $0 }
+
+        t.resetToInitialState()
+        changeScrollback(wanted)
+        feed(bytes[...])
+
+        let newCount = bufferLineCount
+        guard newCount > oldCount else { return false }
+        historyExtended = true
+        let delta = newCount - oldCount
+        scrollTo(row: delta)
+        if let (a, b) = selectionRange {
+            selection.setSelection(start: Position(col: a.col, row: a.row + delta), end: Position(col: b.col, row: b.row + delta))
+        }
+        let newEnd = t.buffer.totalLinesTrimmed + newCount
+        markLines = markDistances.map { newEnd - $0 }
+        return true
+    }
+
+    /// Back at the bottom: drop the extra lines again so memory returns to the configured size.
+    private func shrinkHistoryIfAtBottom() {
+        guard historyExtended, !loadingHistory, !selection.active, NSEvent.pressedMouseButtons == 0 else { return }
+        historyExtended = false
+        changeScrollback(settings.scrollbackLines)
+    }
+
+    /// The last `lines` lines of a file, starting at a line boundary, read backwards in blocks.
+    static func tail(of url: URL, lines: Int) -> [UInt8]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size > 0 else { return nil }
+        let block: UInt64 = 1 << 20
+        var offset = size
+        var newlines = 0
+        var start: UInt64 = 0
+        outer: while offset > 0 {
+            let read = min(block, offset)
+            offset -= read
+            try? handle.seek(toOffset: offset)
+            guard let data = try? handle.read(upToCount: Int(read)) else { return nil }
+            var i = data.count - 1
+            while i >= 0 {
+                if data[data.startIndex + i] == 0x0a {
+                    newlines += 1
+                    if newlines > lines { start = offset + UInt64(i) + 1; break outer }
+                }
+                i -= 1
+            }
+        }
+        try? handle.seek(toOffset: start)
+        return (try? handle.readToEnd()).map { Array($0) }
     }
 
     /// Number of lines dropped from memory so far (still available in the recording).

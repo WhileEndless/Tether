@@ -150,7 +150,13 @@ public final class ForwardManager {
             }
         }
         keepAlive[target.key] = stream
-        stream.start(executor: RemoteExecutor(target: target, options: optionsProvider()),
-                     script: "while sleep 30; do echo; done", arguments: [], purpose: "forward")
+        let executor = RemoteExecutor(target: target, options: optionsProvider())
+        Task {
+            let platform = await executor.resolvedPlatform()
+            stream.start(executor: executor,
+                         script: RemoteScript("while sleep 30; do echo; done",
+                                              windows: "while ($true) { Start-Sleep -Seconds 30; '' }"),
+                         platform: platform, arguments: [], purpose: "forward")
+        }
     }
 }

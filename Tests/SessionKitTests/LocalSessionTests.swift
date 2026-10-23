@@ -223,4 +223,81 @@ final class RecordingSink: TerminalSink {
         try await wait("echo") { sink.text.contains("via-master") }
         session.close(killRemote: true)
     }
+
+    @Test func retryAfterFailedConnectionReusesTheSession() async throws {
+        // A fake ssh that refuses while a "down" file exists.
+        let down = dir.appendingPathComponent("down")
+        FileManager.default.createFile(atPath: down.path, contents: Data())
+        let flaky = dir.appendingPathComponent("flaky-ssh")
+        try """
+        #!/bin/sh
+        if [ -e "\(down.path)" ]; then echo "ssh: connect to host example.invalid port 22: Connection refused" >&2; exit 255; fi
+        exec "\(fakeSSH.path)" "$@"
+        """.write(to: flaky, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: flaky.path)
+        var settings = AppSettings()
+        settings.sshBinary = flaky.path
+        settings.useControlMaster = false
+        settings.recordingEnabled = false
+        settings.reconnectBaseDelay = 0.5      // gives up after a few quick attempts
+        let cfg = SessionConfiguration(settings: settings)
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("down-host"), persistence: .off)) { cfg }
+        let sink = RecordingSink()
+        session.attach(sink: sink)
+        session.start()
+        try await wait("gave up") { session.phase.isDead }
+        #expect(session.endedByConnectionFailure)
+        let id = session.id
+        try FileManager.default.removeItem(at: down)
+        session.retryAfterFailure()
+        try await wait("online after retry") { session.phase.isOnline }
+        #expect(session.id == id && !session.endedByConnectionFailure)
+        session.close(killRemote: true)
+    }
+
+    @Test func manyTabsToOneHostLogInOneAtATime() async throws {
+        // A fake ssh whose login step (the shared-connection setup) takes a moment and logs when it runs.
+        let log = dir.appendingPathComponent("logins.log")
+        let slow = dir.appendingPathComponent("slow-ssh")
+        try """
+        #!/bin/sh
+        for a in "$@"; do if [ "$a" = "-E" ]; then
+          echo "start $(date +%s.%N 2>/dev/null || date +%s)" >> "\(log.path)"; sleep 0.3
+          echo "end $(date +%s.%N 2>/dev/null || date +%s)" >> "\(log.path)"; exit 0
+        fi; done
+        exec "\(fakeSSH.path)" "$@"
+        """.write(to: slow, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slow.path)
+        var settings = AppSettings()
+        settings.sshBinary = slow.path
+        settings.useControlMaster = true
+        settings.recordingEnabled = false
+        settings.autoReconnect = false
+        let cfg = SessionConfiguration(settings: settings)
+        let sessions = (0..<5).map { _ in
+            TerminalSession(descriptor: SessionDescriptor(target: .alias("busy-host"), persistence: .off)) { cfg }
+        }
+        for s in sessions { s.attach(sink: RecordingSink()); s.start() }
+        try await wait("all online") { sessions.allSatisfy { $0.phase.isOnline } }
+        // Logins never overlapped: every "start" is followed by its "end" before the next "start".
+        let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n").map { $0.split(separator: " ")[0] }
+        #expect(lines.count == 10)
+        #expect(lines == Array(repeating: ["start", "end"], count: 5).flatMap { $0 }.map { Substring($0) })
+        for s in sessions { s.close(killRemote: true) }
+    }
+
+    @Test func sessionIsUnusedUntilACommandIsRun() async throws {
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { config() }
+        session.attach(sink: RecordingSink())
+        session.start()
+        try await wait("online") { session.phase.isOnline }
+        #expect(session.isUnused)
+        session.send(Array("\r".utf8)[...])           // an empty line is not a command
+        #expect(session.isUnused)
+        session.send(Array("echo hi".utf8)[...])
+        #expect(session.isUnused, "typed but not sent yet")
+        session.send(Array("\r".utf8)[...])
+        #expect(!session.isUnused && session.hasRunCommands)
+        session.close(killRemote: true)
+    }
 }

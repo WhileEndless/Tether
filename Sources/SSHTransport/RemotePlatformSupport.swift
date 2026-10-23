@@ -119,6 +119,7 @@ extension RemoteExecutor {
     /// Asks the host's default shell a question only it can answer (see `RemotePlatform.probeCommand`).
     public func detectPlatform() async -> RemotePlatform? {
         if target.isLocal { return .posix }
+        if options.useControlMaster { await ConnectionGate.shared.waitForTurn(target.key) }
         let args = options.batchArguments(target: target, remoteCommand: RemotePlatform.probeCommand)
         let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect")
         defer { AskPassBridge.shared.revoke(environment: env) }

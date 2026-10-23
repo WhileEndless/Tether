@@ -100,6 +100,8 @@ struct Shortcut: Identifiable {
     static let cycleAlternates = Shortcut("Next / Previous Tab", .tabs, display: "⌃Tab  ⌃⇧Tab  ⌥⌘→  ⌥⌘←")
     static let tabNumbers = Shortcut("Show Tab 1…8 / Last Tab", .tabs, display: "⌘1 … ⌘8  ⌘9",
                                      note: "Hold ⌘ to see the numbers on the tabs")
+    static let middleClick = Shortcut("Close the Tab Under the Pointer", .tabs, display: "Middle click",
+                                      note: "The mouse wheel scrolls the tab bar; ⌄ lists every tab")
     static let goToSession = Shortcut("Go to Session…", .tabs, k("p"))
     static let moveTabToWindow = Shortcut("Move Tab to New Window", .tabs, k("m", [.command, .shift]))
     static let mergeWindows = Shortcut("Merge All Windows", .tabs, k("m", [.command, .option, .shift]))
@@ -111,8 +113,8 @@ struct Shortcut: Identifiable {
                                            note: "Keeps the session running and connected")
     static let disconnect = Shortcut("Disconnect & Move to Background", .session, k("b", [.command, .option, .shift]),
                                      note: "Drops the connection; tmux/screen keeps running on the server")
-    static let fillPassword = Shortcut("Fill Saved Password", .session, k("p", [.command, .option]),
-                                       note: "When the terminal asks for a password (sudo, su, ssh); asks for Touch ID")
+    static let fillPassword = Shortcut("Fill or Enter Password", .session, k("p", [.command, .option]),
+                                       note: "When the terminal asks for a password: fills the saved one (Touch ID) or opens a secure field")
     static let terminate = Shortcut("Terminate Session…", .session, k("w", [.command, .option, .shift]),
                                     note: "Stops the shell on the server (asks first)")
 
@@ -160,7 +162,7 @@ struct Shortcut: Identifiable {
 
     static let all: [Shortcut] = [
         newConnection, newTab, newLocalTerminal, newWindow, addHost, editConfig,
-        closeTab, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
+        closeTab, middleClick, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
         reconnect, moveToBackground, disconnect, fillPassword, terminate,
         clearScrollback, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,

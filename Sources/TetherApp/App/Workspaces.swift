@@ -89,10 +89,22 @@ final class WorkspaceStore {
 
     /// The window is closing: its sessions keep running in the background.
     func windowClosed(_ id: UUID) {
-        guard let w = all.removeValue(forKey: id) else { return }
+        let closingWindow = windows[id]?.window
+        let isLast = windows.filter { $0.key != id && $0.value.window?.isVisible == true }.isEmpty
         windows[id] = nil
+        if isLast, !AppModel.shared.isTerminating {
+            // The last window keeps its workspace (tabs, selection): the next window — from the menu
+            // bar, the Dock or after relaunch — opens it again, with the same size and position.
+            if let closingWindow { WindowLayout.lastWindowClosing(id, closingWindow) }
+            MenuBarState.lastWindowClosed()
+            save()
+            return
+        }
+        guard let w = all.removeValue(forKey: id) else { return }
         for s in w.tabs { AppModel.shared.sessions.setBackground(s, true) }
         save()
+        // Closed on purpose: it is not part of the layout that comes back after a crash or relaunch.
+        WindowLayout.scheduleSave()
     }
 
     /// A session ended for good.
@@ -118,6 +130,15 @@ final class WorkspaceStore {
     }
 
     func window(of id: UUID) -> NSWindow? { windows[id]?.window }
+
+    func state(ofWorkspace id: UUID) -> WindowState? { states[id]?.state }
+
+    /// The frontmost open window's state (key window first).
+    var frontState: WindowState? {
+        if let key = NSApp.keyWindow, let st = state(of: key) { return st }
+        for w in NSApp.orderedWindows { if let st = state(of: w) { return st } }
+        return states.values.compactMap(\.state).first { $0.window?.isVisible == true }
+    }
 
     func workspace(of window: NSWindow) -> UUID? {
         windows.first { $0.value.window === window }?.key
@@ -172,6 +193,6 @@ final class WorkspaceStore {
     }
 
     private func save() {
-        store.save(Array(all.values))
+        store.saveSoon(Array(all.values))
     }
 }

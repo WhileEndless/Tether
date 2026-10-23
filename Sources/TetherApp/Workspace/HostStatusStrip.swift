@@ -13,15 +13,25 @@ struct HostStatusStrip: View {
 
     private enum Density { case full, compact, minimal }
 
+    /// The bar's width, measured once per resize. Picking the density from it (instead of
+    /// ViewThatFits) means each update lays out one row, not three.
+    @State private var width: CGFloat = 1000
+
+    private var density: Density {
+        width >= 920 ? .full : width >= 620 ? .compact : .minimal
+    }
+
     var body: some View {
         let monitor = model.monitor(for: session.descriptor.target)
         Group {
             if let s = monitor.snapshot {
-                ViewThatFits(in: .horizontal) {
-                    row(s, monitor, .full)
-                    row(s, monitor, .compact)
-                    row(s, monitor, .minimal)
-                }
+                // The row is an overlay of a flexible, empty container: the container's width is
+                // measured, and the row can never change it (no layout feedback loop).
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { width = $0 }
+                    .overlay(alignment: .leading) { row(s, monitor, density) }
+                    .clipped()
             } else {
                 HStack {
                     Label(monitor.error == nil ? "Loading host status…" : "Host status unavailable",

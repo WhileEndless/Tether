@@ -51,3 +51,26 @@ struct ResizablePane<Primary: View, Secondary: View>: View {
             .onEnded { _ in dragStart = nil })
     }
 }
+
+/// A vertical divider that resizes the panel on its right (the host panel).
+struct PanelDivider: View {
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+    @State private var dragStart: Double?
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+        }
+        .frame(width: 7)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onHover { inside in if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
+        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+            .onChanged { value in
+                if dragStart == nil { dragStart = width }
+                width = min(max((dragStart ?? width) - value.translation.width, range.lowerBound), range.upperBound)
+            }
+            .onEnded { _ in dragStart = nil })
+    }
+}

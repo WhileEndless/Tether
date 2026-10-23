@@ -170,7 +170,7 @@ final class SearchModel {
                 guard let view = TerminalRegistry.shared.existingView(for: s.id) else { continue }
                 let (base, lines, logical) = view.scrollbackText()
                 // Older output no longer in memory is searched in the session's recording.
-                if base > 0, let url = s.recordingURL {
+                if base > 0, let url = s.flushedRecordingURL() {
                     var earlier = SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
                                                title: "\(s.displayTitle) — earlier output", host: s.descriptor.target.displayName,
                                                date: s.startedAt, status: status)

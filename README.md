@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.2.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.2.2 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.2.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.2.2): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -58,6 +58,7 @@ Search across every terminal, the archive and recordings.
   - live status dots
   - hold ⌘ to see tab numbers (⌘1…⌘9; ⌃Tab and ⇧⌘[ ] to cycle)
   - drag a tab out into its own window, or onto another window's tab bar
+  - middle-click to close; the mouse wheel scrolls the tab bar, and ⌄ lists every tab
 - ⌘P quick switcher and Merge All Windows. Only the visible tab is drawn, so many tabs stay cheap.
 - Close a tab to keep its session in the background, or terminate it. You can also terminate every session on a host at once.
 - *Disconnect & Move to Background* drops the connection but leaves tmux/screen running on the server. The session shows as *Suspended* and reattaches when you open it again.
@@ -106,6 +107,13 @@ Search across every terminal, the archive and recordings.
 - Copy lines, matches or ranges. Export results as text, CSV or JSON, or export full transcripts.
 - Long sessions are covered too: output that was dropped from memory is searched in the recording, without duplicates.
 - A progress bar shows which source is being searched, and you can stop at any time. Compressed recordings are skipped unless you include them.
+
+**Long sessions and the menu bar**
+- No limit on how long a session runs: memory keeps a set number of lines, and scrolling further reads earlier output back from disk without a visible break (view and selection stay in place).
+- Closing the window keeps Tether and every session running in the menu bar; the icon brings the window back with its tabs.
+- After quitting — or a crash — every window comes back with its tabs, selected tab, size, position and full-screen state.
+- Dozens of tabs to one host: logins are queued and terminals are spread over several shared connections (servers allow 10 sessions per connection by default).
+- Monitoring pauses while no Tether window is visible, and recordings are written in large batches to spare the SSD.
 
 **Local backups.**
 - Every session's output is recorded locally and can be replayed read-only.

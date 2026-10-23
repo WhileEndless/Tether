@@ -158,6 +158,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var confirmCloseOnlineSessions = true
     public var openNewSessionsInWindow = false
     public var showSidebarArchive = false
+    /// Closing the last window keeps Tether (and every session) running in the menu bar.
+    public var keepRunningInMenuBar = true
 
     // Terminal
     public var fontName: String = ""          // empty = system monospaced
@@ -226,6 +228,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var authGraceSeconds = 300
     /// Notice password prompts in terminals (sudo, su, ssh, …) and offer to fill a saved password.
     public var detectPasswordPrompts = true
+    /// Fill a saved password into a terminal prompt as soon as it appears (after Touch ID, if required).
+    public var autoFillPasswordPrompts = true
 
     // SSH
     public var sshConfigPath: String = ""     // empty = ~/.ssh/config
@@ -270,6 +274,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.confirmCloseOnlineSessions, &confirmCloseOnlineSessions)
         d(.openNewSessionsInWindow, &openNewSessionsInWindow)
         d(.showSidebarArchive, &showSidebarArchive)
+        d(.keepRunningInMenuBar, &keepRunningInMenuBar)
         d(.fontName, &fontName)
         d(.fontSize, &fontSize)
         d(.theme, &theme)
@@ -309,6 +314,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.requireAuthForSavedPasswords, &requireAuthForSavedPasswords)
         d(.authGraceSeconds, &authGraceSeconds)
         d(.detectPasswordPrompts, &detectPasswordPrompts)
+        d(.autoFillPasswordPrompts, &autoFillPasswordPrompts)
         d(.sshConfigPath, &sshConfigPath)
         d(.sshBinary, &sshBinary)
         d(.scpBinary, &scpBinary)

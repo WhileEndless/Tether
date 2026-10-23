@@ -177,7 +177,8 @@ struct ConnectionProgressCard: View {
                 }
                 Button("Close") { model.sessions.close(session.id, killRemote: false) }
                 Button("Retry") {
-                    if session.phase.isDead { state.connect(session.descriptor.target); model.sessions.close(session.id, killRemote: false) }
+                    if session.endedByConnectionFailure { session.retryAfterFailure() }
+                    else if session.phase.isDead { state.connect(session.descriptor.target); model.sessions.close(session.id, killRemote: false) }
                     else { session.reconnectNow() }
                 }
                 .buttonStyle(.glassProminent)

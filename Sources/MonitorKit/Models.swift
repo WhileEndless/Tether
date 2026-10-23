@@ -7,7 +7,12 @@ public struct DiskUsage: Identifiable, Hashable, Sendable {
     public var availableKB: Int64
     public var mount: String
     public var id: String { mount }
-    public var fraction: Double { sizeKB > 0 ? Double(usedKB) / Double(sizeKB) : 0 }
+    /// Used share as `df` reports it: used / (used + available), so blocks reserved for root on
+    /// Linux file systems do not make a full disk look like 95 %.
+    public var fraction: Double {
+        let total = usedKB + availableKB
+        return total > 0 ? Double(usedKB) / Double(total) : 0
+    }
 }
 
 /// Raw cumulative CPU counters from /proc/stat, used to compute utilisation between samples.

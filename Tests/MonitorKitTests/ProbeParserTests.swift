@@ -256,3 +256,30 @@ import Testing
         #expect(s.disks.first?.mount == "C:/")
     }
 }
+
+@Suite struct DiskUsageTests {
+    @Test func macOSShowsContainerUsageLikeFinder() {
+        let frame = """
+        @@darwinmem
+        68719476736
+        @@disk
+        /dev/disk3s1s1   971350180  13333684 179974488     7%    /
+        /dev/disk3s5     971350180 764605392 179974488    81%    /System/Volumes/Data
+        devfs                  201       201         0   100%    /dev
+        """
+        let s = ProbeParser.system(frame, previous: nil)
+        #expect(s.disks.count == 1)
+        let root = s.disks[0]
+        #expect(root.mount == "/")
+        #expect(abs(root.fraction - 0.815) < 0.01, "got \(root.fraction)")
+    }
+
+    @Test func linuxMatchesDfCapacity() {
+        let frame = """
+        @@disk
+        /dev/sda1 100000 90000 5000 95% /
+        """
+        let s = ProbeParser.system(frame, previous: nil)
+        #expect(abs((s.disks.first?.fraction ?? 0) - 90000.0 / 95000.0) < 0.001)
+    }
+}

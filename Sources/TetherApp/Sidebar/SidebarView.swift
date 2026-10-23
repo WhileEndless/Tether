@@ -128,8 +128,7 @@ struct SidebarView: View {
                 ForEach(keys, id: \.self) { key in
                     Label(key, systemImage: "bolt.horizontal")
                                     .tag(SidebarItem.host(key))
-                    ForEach(model.sessions.sessions(for: key)) { SessionRow(session: $0) }
-                    ForEach(model.fileTabs.tabs(for: key)) { FileTabRow(tab: $0) }
+                    HostChildren(key: key, target: model.target(forKey: key))
                 }
             }
         }
@@ -212,24 +211,141 @@ private struct HostRows: View {
             HostRow(host: host)
                 .tag(SidebarItem.host(alias))
                 .draggable(alias)
-            ForEach(visibleSessions(alias)) { SessionRow(session: $0) }
-            ForEach(model.fileTabs.tabs(for: alias)) { FileTabRow(tab: $0) }
-            ServerSessionRows(target: .alias(alias))
+            HostChildren(key: alias, target: .alias(alias), sessions: visibleSessions(alias), searching: !search.isEmpty)
         }
     }
 }
 
-/// tmux/screen sessions found on the server that are not open in Tether (including the user's own).
-private struct ServerSessionRows: View {
+/// Everything listed under a host: its sessions (active first; ended ones disappear — they are in
+/// the archive), its file manager tabs, and tmux/screen sessions found on the server. Long lists
+/// are cut to a few rows with "Show all", and a host can be folded away entirely.
+private struct HostChildren: View {
     @Environment(AppModel.self) private var model
+    let key: String
     let target: ConnectionTarget
+    var sessions: [TerminalSession]? = nil
+    var searching = false
+
+    static let limit = 8
+    static let serverLimit = 3
+
+    private static func rank(_ s: TerminalSession) -> Int {
+        switch s.phase {
+        case .online: 0
+        case .connecting, .waiting: 1
+        case .suspended: 2
+        case .dead: 3
+        }
+    }
 
     var body: some View {
-        let monitor = model.monitor(for: target)
-        let open = Set(model.sessions.sessions(for: target.key).map(\.descriptor.remoteSessionName))
-        ForEach(monitor.remoteSessions.filter { !open.contains($0.name) }) { entry in
-            ServerSessionRow(entry: entry, target: target, monitor: monitor)
+        let folding = SidebarFolding.shared
+        if searching || !folding.collapsed.contains(key) {
+            let expanded = searching || folding.expanded.contains(key)
+            let list = (sessions ?? model.sessions.sessions(for: key))
+                .filter { !$0.phase.isDead }
+                .enumerated().sorted { (Self.rank($0.element), $0.offset) < (Self.rank($1.element), $1.offset) }
+                .map(\.element)
+            let shown = expanded ? list : Array(list.prefix(Self.limit))
+            ForEach(shown) { SessionRow(session: $0) }
+            ForEach(model.fileTabs.tabs(for: key)) { FileTabRow(tab: $0) }
+            let all = serverSessions
+            // Tether sessions left on the server (after a crash, or a tab that never connected)
+            // are summed up in one row with a clean-up button instead of a row each.
+            let leftovers = all.filter { $0.isTether && !$0.attached }
+            let server = all.filter { !($0.isTether && !$0.attached) }
+            let shownServer = expanded ? server : Array(server.prefix(Self.serverLimit))
+            ForEach(shownServer) { entry in
+                ServerSessionRow(entry: entry, target: target, monitor: model.monitor(for: target))
+            }
+            if !leftovers.isEmpty {
+                LeftoverSessionsRow(count: leftovers.count, target: target)
+                if expanded {
+                    ForEach(leftovers) { entry in
+                        ServerSessionRow(entry: entry, target: target, monitor: model.monitor(for: target))
+                    }
+                }
+            }
+            let hidden = (list.count - shown.count) + (server.count - shownServer.count)
+            if hidden > 0 {
+                FoldRow(title: "Show \(hidden) more") { folding.expanded.insert(key) }
+            } else if expanded && !searching && (list.count > Self.limit || server.count > Self.serverLimit) {
+                FoldRow(title: "Show fewer") { folding.expanded.remove(key) }
+            }
         }
+    }
+
+    /// tmux/screen sessions on the server that are not open in Tether (including the user's own).
+    private var serverSessions: [RemoteSessionEntry] {
+        guard !target.isLocal else { return [] }
+        let open = Set(model.sessions.sessions(for: target.key).map(\.descriptor.remoteSessionName))
+        return model.monitor(for: target).remoteSessions.filter { !open.contains($0.name) }
+    }
+}
+
+/// "3 leftover sessions on the server" with a button that ends them.
+private struct LeftoverSessionsRow: View {
+    @Environment(AppModel.self) private var model
+    let count: Int
+    let target: ConnectionTarget
+    @State private var cleaning = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "tray.full").font(.caption).foregroundStyle(.secondary).frame(width: 16)
+            Text("\(count) leftover session\(count == 1 ? "" : "s") on the server")
+                .font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            Spacer(minLength: 4)
+            if cleaning {
+                Image(systemName: "hourglass").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Button("Clean Up") {
+                    cleaning = true
+                    let open = Set(model.sessions.sessions(for: target.key).map(\.descriptor.remoteSessionName))
+                    Task {
+                        _ = await model.monitor(for: target).cleanUpOrphans(keeping: open)
+                        cleaning = false
+                    }
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .help("End the Tether sessions on this server that are not open in any tab (your own tmux sessions are not touched)")
+            }
+        }
+        .padding(.leading, 26)
+    }
+}
+
+/// "Show 42 more" / "Show fewer" under a host.
+private struct FoldRow: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: { withAnimation(.snappy) { action() } }) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.tint)
+                .padding(.leading, 26)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Which hosts are folded in the sidebar (remembered) or fully expanded (this run).
+@MainActor
+@Observable
+final class SidebarFolding {
+    static let shared = SidebarFolding()
+    var collapsed: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "sidebar.collapsedHosts") ?? []) {
+        didSet { UserDefaults.standard.set(Array(collapsed), forKey: "sidebar.collapsedHosts") }
+    }
+    var expanded: Set<String> = []
+
+    func toggle(_ key: String) {
+        if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
     }
 }
 
@@ -332,8 +448,7 @@ private struct LocalSection: View {
                 .help("New local terminal (⌥⌘T)")
             }
             .tag(SidebarItem.host("local"))
-            ForEach(model.sessions.sessions(for: "local")) { SessionRow(session: $0) }
-            ForEach(model.fileTabs.tabs(for: "local")) { FileTabRow(tab: $0) }
+            HostChildren(key: "local", target: .local)
         } header: {
             Text("Local")
         }
@@ -489,12 +604,25 @@ struct HostRow: View {
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 4)
-            if !sessions.isEmpty {
-                let online = sessions.filter { $0.phase.isOnline }.count
-                Text("\(online)/\(sessions.count)")
+            let live = sessions.filter { !$0.phase.isDead }
+            if !live.isEmpty {
+                let online = live.filter { $0.phase.isOnline }.count
+                let folded = SidebarFolding.shared.collapsed.contains(alias)
+                Button {
+                    withAnimation(.snappy) { SidebarFolding.shared.toggle(alias) }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .rotationEffect(.degrees(folded ? 0 : 90))
+                        Text("\(online)/\(live.count)")
+                    }
                     .font(.caption2.monospacedDigit())
                     .padding(.horizontal, 6).padding(.vertical, 1)
                     .background(Capsule().fill((online > 0 ? Color.green : Color.orange).opacity(0.18)))
+                }
+                .buttonStyle(.plain)
+                .help(folded ? "Show this host's sessions" : "Hide this host's sessions (\(online) of \(live.count) online)")
             }
             // Always present (a row that changes its content on hover makes the list re-measure it).
             RowAction(symbol: "terminal", help: "New terminal") { state.connect(.alias(alias)) }
