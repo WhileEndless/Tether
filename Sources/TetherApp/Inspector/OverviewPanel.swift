@@ -412,11 +412,30 @@ struct Card<Content: View>: View {
 struct ErrorCard: View {
     let message: String
     let retry: () -> Void
+    @State private var showOutput = false
+
+    /// A known ssh failure in the message (e.g. a changed host key), said in a sentence.
+    private var diagnosis: (String, String)? {
+        message.split(whereSeparator: \.isNewline).lazy.compactMap { ConnectionProgress.diagnose(String($0)) }.first
+    }
 
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle").font(.title).foregroundStyle(.orange)
-            Text(message).multilineTextAlignment(.center).font(.callout).textSelection(.enabled)
+            if let (problem, hint) = diagnosis {
+                // ssh's own output (banners and all) stays one click away.
+                Text(problem).multilineTextAlignment(.center).font(.callout.weight(.medium))
+                Text(hint).multilineTextAlignment(.center).font(.caption).foregroundStyle(.secondary)
+                Button(showOutput ? "Hide ssh Output" : "Show ssh Output") { showOutput.toggle() }
+                    .buttonStyle(.borderless).font(.caption)
+                if showOutput {
+                    Text(message).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                Text(message).multilineTextAlignment(.center).font(.callout).textSelection(.enabled)
+            }
             Button("Retry", action: retry).buttonStyle(.glass)
         }
         .frame(maxWidth: .infinity)

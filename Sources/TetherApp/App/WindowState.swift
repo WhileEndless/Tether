@@ -38,6 +38,8 @@ enum TabItem: @MainActor Identifiable {
 @Observable
 final class WindowState {
     var sidebarSelection: SidebarItem?
+    /// Quick Connect was opened with ⌘↩: start in the host search.
+    var quickConnectSearch = false
     var showQuickConnect = false
     var hostEditor: HostEditorRequest?
     var keySetupTarget: KeySetupRequest?
@@ -84,9 +86,10 @@ final class WindowState {
 
     var selectedItem: TabItem? { workspace.selected.flatMap(item) }
 
-    /// Opens a file manager tab for a host, in a directory (nil = last used / home).
+    /// Opens a file manager tab for a host, in a directory (nil = the home folder).
     func openFiles(_ target: ConnectionTarget, path: String? = nil, mode: OpenMode = .tab) {
-        let tab = model.fileTabs.open(target, path: path ?? model.metadata(for: target.key).lastRemoteDirectory)
+        // Without a folder (sidebar, menu) the file manager starts in the home folder.
+        let tab = model.fileTabs.open(target, path: path)
         present(tab.id, mode: mode)
     }
 

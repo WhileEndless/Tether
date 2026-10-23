@@ -46,6 +46,9 @@ public struct ConnectionProgress: Equatable, Sendable {
 
     public init() {}
 
+    /// The server's host key differs from the trusted one (ssh refused to connect).
+    public var hostKeyChange: HostKeyChange? { HostKeyChange.parse(log) }
+
     mutating func append(_ line: String) {
         log.append(line)
         if log.count > 200 { log.removeFirst(log.count - 200) }
@@ -111,7 +114,7 @@ public struct ConnectionProgress: Equatable, Sendable {
         }
         if l.contains("host key verification failed") || l.contains("remote host identification has changed") {
             return ("The server's host key does not match the one you trusted before.",
-                    "If the server was reinstalled, remove its old entry from ~/.ssh/known_hosts. Otherwise, do not connect.")
+                    "This happens when a server is reinstalled or its keys are replaced — or when someone intercepts the connection. Only continue if you know why it changed.")
         }
         if l.contains("too many authentication failures") {
             return ("Too many keys were offered.", "Set an explicit key for this host (IdentitiesOnly) in “Edit Host…”.")

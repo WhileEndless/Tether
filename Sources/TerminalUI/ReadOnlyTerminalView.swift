@@ -16,6 +16,10 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
         options.scrollback = 100_000
         super.init(frame: frame, font: settings.terminalFont, options: options)
         terminalDelegate = self
+        // A transcript is for reading: a visible scroller, and the wheel always scrolls (a replayed
+        // program may have turned on mouse reporting, which would otherwise swallow the wheel).
+        scrollerStyle = .legacy
+        allowMouseReporting = false
         applyTheme()
     }
 
@@ -40,10 +44,13 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
         pending = nil
         // Wait one runloop so the view has its final size before replaying.
         DispatchQueue.main.async { [weak self] in
-            self?.feed(byteArray: [UInt8](data)[...])
-            // Hide the cursor of the replay.
-            self?.feed(byteArray: Array("\u{1b}[?25l".utf8)[...])
-            self?.revealPending()
+            guard let self else { return }
+            self.feedKeepingScrollback([UInt8](data)[...])
+            // Leave a full-screen program's screen (where there is no scrollback), stop any mouse
+            // reporting it turned on, and hide the replay's cursor.
+            self.feed(byteArray: Array("\u{1b}[?1049l\u{1b}[?1047l\u{1b}[?47l\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1006l\u{1b}[r\u{1b}[?25l".utf8)[...])
+            self.scrollTo(row: Int.max / 2)
+            self.revealPending()
         }
     }
 

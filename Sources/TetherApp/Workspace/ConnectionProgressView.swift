@@ -1,6 +1,7 @@
 import SwiftUI
 import TetherCore
 import SessionKit
+import SSHTransport
 
 /// Step-by-step view of a connection being made (or re-made), with what is happening right now,
 /// and — if it fails — why, and what to do about it.
@@ -10,6 +11,9 @@ struct ConnectionProgressCard: View {
     let session: TerminalSession
     let progress: ConnectionProgress
     @State private var showDetails = false
+    @State private var confirmRemoveKey = false
+    @State private var removingKey = false
+    @State private var removeKeyError: String?
 
     private var failed: Bool { progress.failure != nil && !isRetrying }
     private var isRetrying: Bool { if case .waiting(_, let next) = session.phase { next != nil } else { false } }
@@ -23,14 +27,19 @@ struct ConnectionProgressCard: View {
                 ProgressView(value: progress.fraction)
                     .animation(.smooth, value: progress.fraction)
             }
-            if let failure = progress.failure { failureBox(failure) }
+            if failed, let change = progress.hostKeyChange {
+                hostKeyBox(change)
+            } else if let failure = progress.failure {
+                failureBox(failure)
+            }
             if showDetails { details }
             buttons
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(maxWidth: 460)
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
         .shadow(color: .black.opacity(0.15), radius: 20, y: 6)
+        .padding(16)   // stays inside narrow terminal panes
     }
 
     // MARK: Parts
@@ -152,6 +161,52 @@ struct ConnectionProgressCard: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
     }
 
+    /// The server's identity changed: same look as other failures, plus the new key and where the old one is.
+    private func hostKeyBox(_ change: HostKeyChange) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("The server's identity has changed", systemImage: "exclamationmark.shield")
+                .fontWeight(.medium)
+            Text("Expected if the server was reinstalled or its keys were replaced. Otherwise someone may be intercepting the connection: do not continue, and ask the server's administrator.")
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let fp = change.fingerprint {
+                Text("New key: \(change.keyType.map { "\($0) " } ?? "")\(fp)")
+                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+            if let removeKeyError {
+                Text(removeKeyError).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+        .confirmationDialog("Remove the old key for \(change.host)?", isPresented: $confirmRemoveKey) {
+            Button("Remove Old Key and Reconnect", role: .destructive) { removeOldKey(change) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only do this if you know why the key changed. The old entry is removed from \(change.knownHostsFile.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "known_hosts") (a copy is kept as known_hosts.old), and Tether then asks you to verify the new key.")
+        }
+    }
+
+    private func removeOldKey(_ change: HostKeyChange) {
+        removingKey = true
+        removeKeyError = nil
+        Task {
+            let error = await change.removeOldKey()
+            removingKey = false
+            if let error { removeKeyError = error; return }
+            retry()
+        }
+    }
+
+    private func retry() {
+        if session.endedByConnectionFailure { session.retryAfterFailure() }
+        else if session.phase.isDead { state.connect(session.descriptor.target); model.sessions.close(session.id, killRemote: false) }
+        else { session.reconnectNow() }
+    }
+
     private var details: some View {
         ScrollView {
             Text(progress.log.suffix(40).joined(separator: "\n"))
@@ -176,13 +231,15 @@ struct ConnectionProgressCard: View {
                     Button("Edit Host…") { state.hostEditor = HostEditorRequest(alias: alias) }
                 }
                 Button("Close") { model.sessions.close(session.id, killRemote: false) }
-                Button("Retry") {
-                    if session.endedByConnectionFailure { session.retryAfterFailure() }
-                    else if session.phase.isDead { state.connect(session.descriptor.target); model.sessions.close(session.id, killRemote: false) }
-                    else { session.reconnectNow() }
+                if failed, progress.hostKeyChange?.knownHostsFile != nil {
+                    // Never the default button: accepting a changed key must be a deliberate choice.
+                    Button("Remove Old Key…") { confirmRemoveKey = true }
+                        .disabled(removingKey)
+                } else {
+                    Button("Retry") { retry() }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.defaultAction)
                 }
-                .buttonStyle(.glassProminent)
-                .keyboardShortcut(.defaultAction)
             } else {
                 Button("Cancel") { session.cancelConnecting() }
                     .keyboardShortcut(.cancelAction)

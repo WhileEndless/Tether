@@ -38,7 +38,7 @@ struct SessionPane: View {
         switch session.phase {
         case .connecting: return true
         case .waiting: return p.failure != nil || !session.wasOnline || p.includesRestore
-        case .dead: return !session.wasOnline && p.failure != nil
+        case .dead: return (!session.wasOnline && p.failure != nil) || p.hostKeyChange != nil
         default: return false
         }
     }
@@ -192,6 +192,7 @@ struct SessionBanner: View {
 
 struct SessionFooter: View {
     @Environment(AppModel.self) private var model
+    @Environment(WindowState.self) private var state
     let session: TerminalSession
 
     var body: some View {
@@ -200,24 +201,54 @@ struct SessionFooter: View {
                 StatusDot(phase: session.phase, size: 6)
                 Text(session.phase.label)
             }
+            .fixedSize()
             // The host status bar already shows latency; only repeat it here when that bar is hidden.
             if !model.settings.showStatusStrip, session.phase.isOnline, let median = session.latency.median {
                 Label("Latency \(LatencyStats.format(median)) · \(session.latency.quality.rawValue)", systemImage: "antenna.radiowaves.left.and.right")
                     .help("Round-trip time to the server" + (session.latency.jitter.map { ", jitter \(LatencyStats.format($0))" } ?? ""))
                     .contentTransition(.numericText())
             }
-            Label(persistenceText, systemImage: persistenceIcon)
+            // Narrow windows keep just the icon (the text is in its tooltip).
+            ViewThatFits(in: .horizontal) {
+                Label(persistenceText, systemImage: persistenceIcon).fixedSize()
+                Image(systemName: persistenceIcon)
+            }
+            .help(persistenceText)
             if session.recordingURL != nil {
                 Label("Recording", systemImage: "record.circle").foregroundStyle(.secondary)
             }
             Spacer()
+            // The terminal's folder, one click from a file manager there (⇧⌘O). A real button, so it
+            // reads as one and is never squeezed away by the labels beside it.
+            Button {
+                state.openFiles(session.descriptor.target, path: session.currentDirectory)
+            } label: {
+                Label(session.currentDirectory.map(folderName).map { "Browse \($0)" } ?? "Browse Files",
+                      systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+            .disabled(session.phase.isDead)
+            .help("Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⇧⌘O)")
             Text(session.descriptor.target.displayName).foregroundStyle(.secondary)
+                .truncationMode(.middle)
         }
+        .lineLimit(1)
         .font(.caption)
         .labelStyle(.titleAndIcon)
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.bar)
+    }
+
+    /// "~" for home-like paths, else the last folder name ("/" stays "/").
+    private func folderName(_ path: String) -> String {
+        if path == "/" { return "/" }
+        if path == "~" || path.hasSuffix("/~") { return "~" }
+        let name = (path as NSString).lastPathComponent
+        let short = name.isEmpty ? path : name
+        return short.count > 24 ? short.prefix(23) + "…" : short
     }
 
     private var persistenceText: String {

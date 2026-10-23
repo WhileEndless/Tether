@@ -40,9 +40,18 @@ struct TetherCommands: Commands {
                 if let window { window.showQuickConnect = true } else { openWindow(id: "workspace") }
             }
             .shortcut(.newConnection)
-            Button("New Tab to Same Host") {
-                if let t = active?.descriptor.target ?? window?.inspectedTarget { window?.connect(t, mode: .tab) }
-                else { window?.showQuickConnect = true }
+            Button(window?.selectedItem.map { if case .files = $0 { true } else { false } } == true
+                   ? "New File Manager Tab" : "New Tab to Same Host") {
+                guard let window else { return }
+                // In a file manager, ⌘T opens another file manager there (like a Finder window), not a terminal.
+                if case .files(let f)? = window.selectedItem {
+                    let dir = model.fileTabs.browser(for: f).directory
+                    window.openFiles(f.target, path: dir.isEmpty ? f.path : dir)
+                } else if let t = active?.descriptor.target ?? window.inspectedTarget {
+                    window.connect(t, mode: .tab)
+                } else {
+                    window.showQuickConnect = true
+                }
             }
             .shortcut(.newTab)
             Button("New Local Terminal") {

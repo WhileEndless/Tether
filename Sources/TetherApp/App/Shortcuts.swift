@@ -84,8 +84,10 @@ struct Shortcut: Identifiable {
 
     // MARK: Connections
     static let newConnection = Shortcut("New Connection…", .connections, k("n"))
+    static let quickConnect = Shortcut("Quick Connect (search hosts)", .connections, display: "⌘↩",
+                                       note: "Opens New Connection with the host search ready for typing")
     static let newTab = Shortcut("New Tab to Same Host", .connections, k("t"),
-                                 note: "Opens a new session to the host of the current tab")
+                                 note: "Opens a new session to the host of the current tab; in a file manager, another file manager")
     static let newLocalTerminal = Shortcut("New Local Terminal", .connections, k("t", [.command, .option]))
     static let newWindow = Shortcut("New Window", .connections, k("n", [.command, .shift]))
     static let addHost = Shortcut("Add Host…", .connections, k("h", [.command, .shift]))
@@ -151,6 +153,8 @@ struct Shortcut: Identifiable {
                                         note: "In the file manager; works with Finder")
     static let fileOpen = Shortcut("Open / Go Up", .files, display: "↩  ⌘↓  ⌘↑")
     static let fileDelete = Shortcut("Delete", .files, display: "⌘⌫", note: "Asks first")
+    static let fileBackForward = Shortcut("Back / Forward", .files, display: "⌘[  ⌘]",
+                                          note: "The mouse's side buttons work too")
 
     // MARK: View
     static let toggleSidebar = Shortcut("Show / Hide Sidebar", .view, display: "⌃⌘S")
@@ -161,14 +165,14 @@ struct Shortcut: Identifiable {
     static let shortcuts = Shortcut("Keyboard Shortcuts", .view, k("/"))
 
     static let all: [Shortcut] = [
-        newConnection, newTab, newLocalTerminal, newWindow, addHost, editConfig,
+        newConnection, quickConnect, newTab, newLocalTerminal, newWindow, addHost, editConfig,
         closeTab, middleClick, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
         reconnect, moveToBackground, disconnect, fillPassword, terminate,
         clearScrollback, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
-        browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileDelete,
+        browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
         toggleSidebar, hostPanel, showArchive, statusBar, settings, shortcuts,
     ]
 }

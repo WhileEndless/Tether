@@ -144,12 +144,22 @@ struct TabStrip: View {
     @State private var center = TabBarCenter.shared
     @State private var dropTargeted = false
 
+    @State private var contentWidth: CGFloat = 0
+    @State private var visibleWidth: CGFloat = 0
+    @State private var offset: CGFloat = 0
+    @State private var scroller = TabScroller()
+
+    private var overflowing: Bool { contentWidth > visibleWidth + 1 }
+
     var body: some View {
         let tabs = state.items
         let selected = state.workspace.selected
         HStack(spacing: 0) {
+            if overflowing {
+                TabArrow(symbol: "chevron.left", enabled: offset > 1) { scroller.scroll(by: -max(visibleWidth * 0.8, 200)) }
+            }
             ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
+                ScrollView(.horizontal, showsIndicators: true) {
                     HStack(spacing: 4) {
                         ForEach(Array(tabs.enumerated()), id: \.element.id) { index, item in
                             switch item {
@@ -166,10 +176,29 @@ struct TabStrip: View {
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
-                    .background(TabScrollMarker())
+                    .background(TabScrollMarker(scroller: scroller))
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0 }
+                .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.x } action: { _, x in offset = x }
+                // Fades at the edges show that more tabs are hidden there.
+                .mask {
+                    HStack(spacing: 0) {
+                        LinearGradient(colors: [overflowing && offset > 1 ? .clear : .black, .black], startPoint: .leading, endPoint: .trailing)
+                            .frame(width: 18)
+                        Color.black
+                        LinearGradient(colors: [.black, overflowing && offset < contentWidth - visibleWidth - 1 ? .clear : .black],
+                                       startPoint: .leading, endPoint: .trailing)
+                            .frame(width: 18)
+                    }
                 }
                 .onChange(of: selected) { _, id in
                     if let id { withAnimation(.snappy(duration: 0.2)) { proxy.scrollTo(id) } }
+                }
+            }
+            if overflowing {
+                TabArrow(symbol: "chevron.right", enabled: offset < contentWidth - visibleWidth - 1) {
+                    scroller.scroll(by: max(visibleWidth * 0.8, 200))
                 }
             }
             if tabs.count > 1 {
@@ -412,15 +441,60 @@ private struct FileTabChip: View {
     }
 }
 
-/// Finds the tab bar's scroll view so the mouse wheel can scroll it sideways.
+/// Finds the tab bar's scroll view: for the mouse wheel and the arrow buttons.
 private struct TabScrollMarker: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { Marker() }
+    let scroller: TabScroller
+    func makeNSView(context: Context) -> NSView {
+        let m = Marker()
+        m.scroller = scroller
+        return m
+    }
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     final class Marker: NSView {
+        weak var scroller: TabScroller?
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if let scroll = enclosingScrollView { MainActor.assumeIsolated { TabBarCenter.shared.register(scroll) } }
+            if let scroll = enclosingScrollView {
+                MainActor.assumeIsolated {
+                    TabBarCenter.shared.register(scroll)
+                    scroller?.scrollView = scroll
+                }
+            }
         }
+    }
+}
+
+/// Scrolls one window's tab bar (arrow buttons).
+@MainActor
+final class TabScroller {
+    weak var scrollView: NSScrollView?
+
+    func scroll(by delta: CGFloat) {
+        guard let scroll = scrollView else { return }
+        let clip = scroll.contentView
+        let maxX = max((scroll.documentView?.frame.width ?? 0) - clip.bounds.width, 0)
+        let x = min(max(clip.bounds.origin.x + delta, 0), maxX)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            clip.animator().setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
+        }
+        scroll.reflectScrolledClipView(clip)
+    }
+}
+
+/// A small arrow at either end of an overflowing tab bar.
+private struct TabArrow: View {
+    let symbol: String
+    let enabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .disabled(!enabled)
+        .help(symbol == "chevron.left" ? "Scroll tabs left" : "Scroll tabs right")
     }
 }

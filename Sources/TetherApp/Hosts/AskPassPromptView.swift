@@ -1,5 +1,6 @@
 import SwiftUI
 import TetherCore
+import SSHTransport
 
 /// Sheet shown when ssh asks for a password, passphrase or confirmation.
 struct AskPassPromptView: View {
@@ -7,6 +8,11 @@ struct AskPassPromptView: View {
     let prompt: PendingPrompt
     @State private var answer = ""
     @State private var save = false
+    /// A fingerprint from the server's administrator, to compare with the one ssh received.
+    @State private var expected = ""
+    /// The trust button arms a moment after the prompt appears, so a Return typed elsewhere just as
+    /// the window pops up cannot accept a server's key by accident.
+    @State private var armed = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -21,10 +27,14 @@ struct AskPassPromptView: View {
                     Text(hostLine).font(.subheadline).foregroundStyle(.secondary)
                 }
             }
-            Text(prompt.request.prompt.trimmingCharacters(in: .whitespacesAndNewlines))
-                .font(.callout)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            if let key = unknownKey {
+                newHostDetails(key)
+            } else {
+                Text(prompt.request.prompt.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if prompt.request.isConfirmation {
                 HStack {
@@ -34,6 +44,8 @@ struct AskPassPromptView: View {
                     Button("Trust and Continue") { model.resolvePrompt(prompt, answer: "yes", save: false) }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.glassProminent)
+                        // A fingerprint that was checked and does not match must not be accepted by accident.
+                        .disabled(!armed || (unknownKey.map { k in !expected.trimmingCharacters(in: .whitespaces).isEmpty && !k.matches(expected) } ?? false))
                 }
             } else {
                 Group {
@@ -69,6 +81,50 @@ struct AskPassPromptView: View {
         .padding(24)
         .frame(width: 420)
         .onAppear { focused = true }
+        .task(id: prompt.id) {
+            armed = false
+            try? await Task.sleep(for: .seconds(1))
+            armed = true
+        }
+    }
+
+    private var unknownKey: UnknownHostKey? {
+        prompt.request.isConfirmation ? UnknownHostKey.parse(prompt.request.prompt) : nil
+    }
+
+    /// First connection to a server: what is being trusted, and a way to check it.
+    private func newHostDetails(_ key: UnknownHostKey) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("This is the first connection to \(key.host ?? "this server") from this Mac. Trusting it saves its key in known_hosts; if the key ever changes, Tether warns you.")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(key.keyType ?? "Host") key fingerprint").font(.caption).foregroundStyle(.secondary)
+                Text(key.fingerprint).font(.caption.monospaced()).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
+            if !key.knownAs.isEmpty {
+                Text("The same key is already trusted as: \(key.knownAs.joined(separator: ", "))")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("Optional: paste the fingerprint you were given", text: $expected)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                if !expected.trimmingCharacters(in: .whitespaces).isEmpty {
+                    if key.matches(expected) {
+                        Label("Matches — this is the expected server", systemImage: "checkmark.seal.fill")
+                            .font(.caption).foregroundStyle(.green)
+                    } else {
+                        Label("Does not match — do not trust this server", systemImage: "xmark.octagon.fill")
+                            .font(.caption).foregroundStyle(.red)
+                    }
+                }
+            }
+        }
     }
 
     /// Which host is asking. With jump hosts this can differ from the tab's host.

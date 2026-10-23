@@ -22,6 +22,8 @@ final class FileBrowserModel {
     var error: String?
     var showHidden = false { didSet { recomputeVisible() } }
     private(set) var history: [String] = []
+    /// Folders left with Back, for Forward.
+    private(set) var forwardHistory: [String] = []
     /// Kept here (not in the view) so it survives tab switches and refreshes.
     var selection = Set<RemoteFile.ID>()
 
@@ -74,7 +76,10 @@ final class FileBrowserModel {
     }
 
     private func show(_ dir: String, _ list: [RemoteFile], from previous: String, pushHistory: Bool) {
-        if pushHistory, !previous.isEmpty, previous != dir, history.last != previous { history.append(previous) }
+        if pushHistory, !previous.isEmpty, previous != dir, history.last != previous {
+            history.append(previous)
+            forwardHistory.removeAll()   // a new path forgets where Forward would have gone
+        }
         if dir != directory {
             directory = dir
             selection = []
@@ -97,7 +102,30 @@ final class FileBrowserModel {
 
     func back() async {
         guard let prev = history.popLast() else { return }
+        if !directory.isEmpty { forwardHistory.append(directory) }
         await load(prev, pushHistory: false)
+    }
+
+    func forward() async {
+        guard let next = forwardHistory.popLast() else { return }
+        if !directory.isEmpty { history.append(directory) }
+        await load(next, pushHistory: false)
+    }
+
+    /// The folders leading to the current one, for the clickable path ("/", "home", "user", …).
+    var pathComponents: [(name: String, path: String)] {
+        guard !directory.isEmpty else { return [] }
+        var result: [(String, String)] = []
+        var path = directory
+        while true {
+            let name = path == "/" ? "/" : (path as NSString).lastPathComponent
+            result.insert((name.isEmpty ? path : name, path), at: 0)
+            let up = (path as NSString).deletingLastPathComponent
+            if path == "/" || up == path || up.isEmpty { break }
+            if path.range(of: #"^[A-Za-z]:/?$"#, options: .regularExpression) != nil { break }
+            path = up.range(of: #"^[A-Za-z]:$"#, options: .regularExpression) != nil ? up + "/" : up
+        }
+        return result.map { (name: $0.0, path: $0.1) }
     }
 
     var parent: String {
@@ -132,6 +160,7 @@ struct FileBrowserView: View {
     @State private var previewURL: URL?
     @State private var bulk: BulkAction?
     @State private var notice: Notice?
+    @State private var width: CGFloat = 1000
 
     var body: some View {
         Group {
@@ -150,7 +179,7 @@ struct FileBrowserView: View {
             let b = FileBrowserModel(target: target, fs: RemoteFileSystem(executor: model.executor(for: target)))
             own = b
             let requested = model.fileBrowserRequests.removeValue(forKey: target.key)
-            Task { await b.load(initialPath ?? requested ?? model.metadata(for: target.key).lastRemoteDirectory) }
+            Task { await b.load(initialPath ?? requested) }   // nil: the home folder
         }
         .onChange(of: model.fileBrowserRequests[target.key]) { _, path in
             guard let path, let browser else { return }
@@ -167,7 +196,9 @@ struct FileBrowserView: View {
             toolbar(b)
             Divider()
             TransferStatusBar(target: target)
-            if standalone {
+            // The details column only stays beside the list while the list keeps room for all its
+            // columns; on a small screen the details move below the list and show up only for a selection.
+            if standalone && width >= detailWidth + 620 {
                 ResizablePane(axis: .horizontal, size: $detailWidth, range: 220...520) {
                     table(b)
                 } secondary: {
@@ -183,6 +214,7 @@ struct FileBrowserView: View {
                 }
             }
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { width = $0 }
         .quickLookPreview($previewURL)
         .overlay(alignment: .bottom) {
             if let notice {
@@ -235,22 +267,25 @@ struct FileBrowserView: View {
 
     private func toolbar(_ b: FileBrowserModel) -> some View {
         VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                Button { Task { await b.back() } } label: { Image(systemName: "chevron.left") }
-                    .disabled(b.history.isEmpty)
-                Button { Task { await b.load(b.parent) } } label: { Image(systemName: "arrow.up") }
-                    .disabled(b.directory == "/")
-                Button { Task { await b.load(nil) } } label: { Image(systemName: "house") }
+            HStack(spacing: 4) {
+                NavButton(symbol: "chevron.left", help: "Back (⌘[ or the mouse's back button)", enabled: !b.history.isEmpty) {
+                    Task { await b.back() }
+                }
+                NavButton(symbol: "chevron.right", help: "Forward (⌘])", enabled: !b.forwardHistory.isEmpty) {
+                    Task { await b.forward() }
+                }
+                NavButton(symbol: "arrow.up", help: "Enclosing folder (⌘↑)", enabled: b.directory != "/") {
+                    Task { await b.load(b.parent) }
+                }
+                NavButton(symbol: "house", help: "Home folder", enabled: true) { Task { await b.load(nil) } }
                 TextField("Path", text: $pathText)
                     .textFieldStyle(.roundedBorder)
-                    .font(.callout.monospaced())
+                    .font(.body.monospaced())
+                    .controlSize(.large)
                     .onSubmit { Task { await b.load(pathText) } }
-                Button { Task { await b.reload() } } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
+                NavButton(symbol: "arrow.clockwise", help: "Refresh", enabled: true) { Task { await b.reload() } }
                 if let openTerminal {
-                    Button { openTerminal(b.directory) } label: { Image(systemName: "apple.terminal") }
-                        .help("Open Terminal Here")
+                    NavButton(symbol: "apple.terminal", help: "Open Terminal Here", enabled: true) { openTerminal(b.directory) }
                 }
                 Menu {
                     Button("Upload Files…") { pickUpload(b) }
@@ -262,12 +297,27 @@ struct FileBrowserView: View {
                         OpenFilesWindowButton(target: target, path: b.directory)
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis.circle").font(.system(size: 15)).frame(width: 30, height: 28)
                 }
                 .menuIndicator(.hidden)
                 .fixedSize()
             }
             .buttonStyle(.borderless)
+            // Click any part of the path to go there.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(b.pathComponents.enumerated()), id: \.offset) { i, c in
+                        if i > 0 { Image(systemName: "chevron.compact.right").font(.caption).foregroundStyle(.tertiary) }
+                        Button { Task { await b.load(c.path) } } label: {
+                            Text(c.name)
+                                .font(.callout)
+                                .padding(.horizontal, 6).padding(.vertical, 3)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(i == b.pathComponents.count - 1 ? Color.accentColor.opacity(0.15) : .clear))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
             if b.refreshing {
                 Text("Showing cached listing — refreshing…")
                     .font(.caption).foregroundStyle(.secondary)
@@ -287,7 +337,7 @@ struct FileBrowserView: View {
         Table(of: RemoteFile.self, selection: Binding(get: { b.selection }, set: { b.selection = $0 })) {
             TableColumn("Name") { (f: RemoteFile) in
                 HStack(spacing: 6) {
-                    Image(nsImage: icon(for: f)).resizable().frame(width: 16, height: 16)
+                    Image(nsImage: icon(for: f)).resizable().frame(width: 22, height: 22)
                     Text(f.name).lineLimit(1).foregroundStyle(f.isHidden ? .secondary : .primary)
                     if f.kind == .symlink { Image(systemName: "arrow.turn.up.right").font(.caption2).foregroundStyle(.secondary) }
                 }
@@ -302,15 +352,25 @@ struct FileBrowserView: View {
                     .foregroundStyle(.secondary)
             }
             .width(min: 90, ideal: 130)
-            TableColumn("Permissions") { (f: RemoteFile) in
-                Text(f.permissionString).font(.caption.monospaced()).foregroundStyle(.secondary)
+            // Owner and permissions join once the list is wide enough to show them without scrolling;
+            // narrower, they stay in the details shown for the selection.
+            if width >= 600 {
+                TableColumn("Owner") { (f: RemoteFile) in
+                    Text(f.owner == "-" || f.owner.isEmpty ? "—" : (f.group.isEmpty || f.group == "-" || f.group == f.owner ? f.owner : "\(f.owner):\(f.group)"))
+                        .font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .width(min: 60, ideal: 110)
+                TableColumn("Permissions") { (f: RemoteFile) in
+                    Text(f.permissionString).font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
+                .width(min: 70, ideal: 90)
             }
-            .width(min: 70, ideal: 90)
         } rows: {
             ForEach(b.visibleFiles) { f in
                 TableRow(f).itemProvider { dragProvider(for: f) }
             }
         }
+        .environment(\.defaultMinListRowHeight, 30)
         .contextMenu(forSelectionType: RemoteFile.ID.self) { ids in
             let items = b.files.filter { ids.contains($0.id) }
             if let openTerminal, items.count == 1, let f = items.first, f.isDirectory {
@@ -376,18 +436,21 @@ struct FileBrowserView: View {
             if !items.isEmpty { deleting = items }
             return .handled
         }
-        // Finder keys: ⌘↓ opens, ⌘↑ goes to the parent, ⌘[ goes back.
-        .onKeyPress(keys: [.downArrow, .upArrow, "["]) { press in
+        // Finder keys: ⌘↓ opens, ⌘↑ goes to the parent, ⌘[ / ⌘] go back and forward.
+        .onKeyPress(keys: [.downArrow, .upArrow, "[", "]"]) { press in
             switch (press.key, press.modifiers) {
             case (.downArrow, .command):
                 guard let f = b.files.first(where: { b.selection.contains($0.id) }) else { return .ignored }
                 if f.isDirectory || f.kind == .symlink { Task { await b.load(f.path) } } else { quickLook(f) }
             case (.upArrow, .command): Task { await b.load(b.parent) }
             case ("[", .command): Task { await b.back() }
+            case ("]", .command): Task { await b.forward() }
             default: return .ignored
             }
             return .handled
         }
+        // The mouse's side buttons go back and forward, as in Finder.
+        .background(MouseNavigationButtons(back: { Task { await b.back() } }, forward: { Task { await b.forward() } }))
         .onKeyPress(.space) {
             if let f = b.files.first(where: { b.selection.contains($0.id) }), !f.isDirectory { quickLook(f) }
             return .handled
@@ -794,5 +857,66 @@ private struct BulkActionSheet: View {
         guard !action.value.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         perform(action)
         dismiss()
+    }
+}
+
+/// A large, easy-to-hit navigation button for the file manager.
+private struct NavButton: View {
+    let symbol: String
+    let help: String
+    let enabled: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 32, height: 28)
+                .background(RoundedRectangle(cornerRadius: 6).fill(hovering && enabled ? Color.primary.opacity(0.08) : .clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(enabled ? .primary : .tertiary)
+        .disabled(!enabled)
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
+/// Calls `back` / `forward` for the mouse's side buttons (3 and 4) pressed over this view.
+private struct MouseNavigationButtons: NSViewRepresentable {
+    var back: () -> Void
+    var forward: () -> Void
+
+    func makeNSView(context: Context) -> MonitorView { MonitorView() }
+
+    func updateNSView(_ view: MonitorView, context: Context) {
+        view.back = back
+        view.forward = forward
+    }
+
+    final class MonitorView: NSView {
+        var back: () -> Void = {}
+        var forward: () -> Void = {}
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseUp) { [weak self] event in
+                guard let self, let window = self.window, event.window === window,
+                      self.bounds.contains(self.convert(event.locationInWindow, from: nil)) else { return event }
+                switch event.buttonNumber {
+                case 3: self.back(); return nil
+                case 4: self.forward(); return nil
+                default: return event
+                }
+            }
+        }
+
+        // Never takes clicks itself; it only watches.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }

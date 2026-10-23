@@ -31,11 +31,15 @@ struct QuickConnectView: View {
             }
         }
         .frame(width: 560)
-        .onAppear { if model.hosts.isEmpty { mode = .direct } }
+        .onAppear {
+            if model.hosts.isEmpty { mode = .direct }
+            else if state.quickConnectSearch { mode = .saved }
+            state.quickConnectSearch = false
+        }
     }
 }
 
-/// Type-to-filter list of hosts from ssh config. Typing `user@host:port` also works.
+/// Type-to-filter list of hosts from ssh config, plus This Mac. Typing `user@host:port` also works.
 private struct SavedHostPicker: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
@@ -58,7 +62,16 @@ private struct SavedHostPicker: View {
         return t
     }
 
-    private var rowCount: Int { matches.count + (adhoc == nil ? 0 : 1) }
+    /// "This Mac" (a local terminal): listed with no search, or when the search names it.
+    private var showsLocal: Bool {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return true }
+        return ["This Mac", "local", "localhost", localMachineName].contains { $0.localizedCaseInsensitiveContains(q) }
+    }
+
+    private var localIndex: Int { matches.count }
+    private var adhocIndex: Int { matches.count + (showsLocal ? 1 : 0) }
+    private var rowCount: Int { adhocIndex + (adhoc == nil ? 0 : 1) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,19 +91,26 @@ private struct SavedHostPicker: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 2) {
-                        if let adhoc {
-                            row(index: 0, icon: "arrow.right.circle", title: "Connect to \(adhoc.displayName)",
-                                subtitle: "Direct connection (not saved)")
-                        }
-                        ForEach(Array(matches.enumerated()), id: \.element.id) { i, host in
-                            let index = i + (adhoc == nil ? 0 : 1)
+                        // Saved hosts come first: typing part of a host's name selects that host,
+                        // and the direct connection is offered after them.
+                        ForEach(Array(matches.enumerated()), id: \.element.id) { index, host in
                             row(index: index, icon: host.proxyJump == nil ? "server.rack" : "point.3.connected.trianglepath.dotted",
                                 title: host.alias ?? "",
                                 subtitle: [host.user, host.hostName].compactMap { $0 }.joined(separator: "@")
                                     + (host.port.map { ":\($0)" } ?? "") + (host.proxyJump.map { "  via \($0)" } ?? ""))
                                 .id(index)
                         }
-                        if matches.isEmpty && adhoc == nil {
+                        if showsLocal {
+                            row(index: localIndex, icon: "laptopcomputer", title: "This Mac",
+                                subtitle: "Local terminal · \(localMachineName)")
+                                .id(localIndex)
+                        }
+                        if let adhoc {
+                            row(index: adhocIndex, icon: "arrow.right.circle", title: "Connect to \(adhoc.displayName)",
+                                subtitle: "Direct connection (not saved)")
+                                .id(adhocIndex)
+                        }
+                        if rowCount == 0 {
                             Text(model.hosts.isEmpty ? "No saved hosts yet — use Direct." : "No matching hosts")
                                 .foregroundStyle(.secondary).padding(20)
                         }
@@ -108,7 +128,11 @@ private struct SavedHostPicker: View {
             }
             .padding(12)
         }
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            // The sheet becomes key a moment after it appears; focus again once it has.
+            DispatchQueue.main.async { focused = true }
+        }
         .onChange(of: query) { _, _ in highlighted = 0 }
     }
 
@@ -134,10 +158,12 @@ private struct SavedHostPicker: View {
 
     private func connect(newWindow: Bool) {
         let target: ConnectionTarget?
-        if let adhoc, highlighted == 0 {
-            target = adhoc
+        if let host = matches[safe: highlighted] {
+            target = host.alias.map { .alias($0) }
+        } else if showsLocal && highlighted == localIndex {
+            target = .local
         } else {
-            target = matches[safe: highlighted - (adhoc == nil ? 0 : 1)]?.alias.map { .alias($0) }
+            target = adhoc
         }
         guard let target else { return }
         onDone()

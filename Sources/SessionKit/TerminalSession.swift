@@ -416,7 +416,7 @@ public final class TerminalSession: Identifiable {
         let message = progress?.failure ?? fallback
         lastError = message
         let permanent = progress.map { p in p.log.contains { Self.isPermanentFailure($0) } } ?? false
-        if !wasOnline && !pendingAttachOnly && (permanent || attempt >= 2) {
+        if (!wasOnline && !pendingAttachOnly && (permanent || attempt >= 2)) || progress?.hostKeyChange != nil {
             endedByConnectionFailure = true
             finish(reason: message, archive: false)
             return
@@ -465,8 +465,10 @@ public final class TerminalSession: Identifiable {
         let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
         self.process = process
         if local { env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin") }
+        // A Finder-launched app runs in "/": local shells start in the home folder like Terminal.app.
         process.startProcess(executable: executable, args: args,
-                             environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh")
+                             environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh",
+                             currentDirectory: local ? (descriptor.initialDirectory ?? NSHomeDirectory()) : nil)
     }
 
     /// Windows hosts: an interactive PowerShell over ssh. There is no tmux or screen on Windows,
@@ -519,7 +521,10 @@ public final class TerminalSession: Identifiable {
 
     // MARK: Process callbacks
 
+    @ObservationIgnored private var lastReceivedAt = Date()
+
     fileprivate func processOutput(_ slice: ArraySlice<UInt8>) {
+        lastReceivedAt = Date()
         if !markerResolved {
             markerBuffer.append(contentsOf: slice)
             if let found = RemoteBootstrap.extractMarker(from: markerBuffer) {
@@ -641,9 +646,11 @@ public final class TerminalSession: Identifiable {
         for line in stderrTail.split(separator: "\n") {
             if let (problem, hint) = ConnectionProgress.diagnose(String(line)) { progress?.failure = problem; progress?.hint = hint }
         }
-        if !wasOnline && !pendingAttachOnly {
+        // A changed host key never fixes itself: stop and let the user decide, even for a session
+        // that was online before (the server may have been reinstalled — or the connection intercepted).
+        if !wasOnline && !pendingAttachOnly || progress?.hostKeyChange != nil {
             let message = stderrTail.isEmpty ? "ssh exited with code \(code)" : stderrTail
-            if Self.isPermanentFailure(message) || attempt >= 2 {
+            if Self.isPermanentFailure(message) || attempt >= 2 || progress?.hostKeyChange != nil {
                 endedByConnectionFailure = true
                 finish(reason: message, archive: false)
                 return
@@ -679,7 +686,8 @@ public final class TerminalSession: Identifiable {
         retryTask?.cancel()
         phase = .dead(reason: reason)
         endedAt = Date()
-        let notice = "\r\n\u{1b}[2m[Tether] \(reason). This session is now read-only.\u{1b}[0m\r\n"
+        let sentence = reason.hasSuffix(".") ? reason : reason + "."
+        let notice = "\r\n\u{1b}[2m[Tether] \(sentence) This session is now read-only.\u{1b}[0m\r\n"
         display(Array(notice.utf8))
         recorder?.close()
         if archive { onDeath?(self) }
@@ -696,7 +704,10 @@ public final class TerminalSession: Identifiable {
             while !Task.isCancelled {
                 guard let self, self.phase.isOnline else { return }
                 if let tmux = self.tmux {
-                    if let sent = tmux.activitySentAt, Date().timeIntervalSince(sent) > timeout {
+                    // Lost only when the question went unanswered *and* nothing at all arrived:
+                    // a connection busy with other tabs' output is slow, not dead.
+                    if let sent = tmux.activitySentAt, Date().timeIntervalSince(sent) > timeout,
+                       Date().timeIntervalSince(self.lastReceivedAt) > timeout {
                         self.connectionLost("The server stopped responding")
                         return
                     }
@@ -789,6 +800,10 @@ public final class TerminalSession: Identifiable {
         let lines = (stderrTail + text).split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         stderrTail = lines.suffix(2).joined(separator: "\n")
+        // Before the session is up, ssh's messages (e.g. a host key warning) go to the details log too.
+        if !phase.isOnline {
+            for line in text.split(whereSeparator: \.isNewline) { progress?.append(String(line)) }
+        }
     }
 
     static func isSessionRefused(_ message: String) -> Bool {

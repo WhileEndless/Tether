@@ -9,9 +9,24 @@ struct TetherApp: App {
 
     init() {
         CrashLog.installIfRequested()
+        Self.raiseOpenFileLimit()
         // Tether has its own tabs per window; native window tabbing stays off.
         UserDefaults.standard.removeObject(forKey: "AppleWindowTabbingMode")
         NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
+    /// Apps started from Finder may only open 256 files. Every terminal uses several (pseudo-terminal,
+    /// pipes, its recording), so dozens of tabs would run out — new tabs fail and old ones cannot
+    /// reconnect. Raise the limit to what the system allows (up to 16384).
+    static func raiseOpenFileLimit() {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        let wanted = rlim_t(16_384)
+        let target = min(wanted, limit.rlim_max)
+        if limit.rlim_cur < target {
+            limit.rlim_cur = target
+            setrlimit(RLIMIT_NOFILE, &limit)
+        }
     }
 
     var body: some Scene {
@@ -113,6 +128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 model.workspaces.selectNeighbour(in: state.workspaceID, offset: 1)
             case (48, [.control, .shift]), (123, [.command, .option]): // ⌃⇧Tab, ⌥⌘←
                 model.workspaces.selectNeighbour(in: state.workspaceID, offset: -1)
+            case (36, [.command]), (76, [.command]):                 // ⌘↩: Quick Connect, typing in the search
+                guard !state.showQuickConnect else { return event }
+                state.quickConnectSearch = true
+                state.showQuickConnect = true
             case (24, [.command]):                                   // ⌘= as Bigger
                 model.adjustFont(+1)
             default:

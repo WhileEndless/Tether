@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import TetherCore
 import SessionKit
+import SSHTransport
 import TerminalUI
 
 /// Debug-only scripted UI run used to reproduce window/tab problems without a person at the keyboard.
@@ -46,6 +47,164 @@ enum SelfTest {
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
 
+        // Host key check against a real sshd whose key differs from the trusted one: the warning, removing
+        // the old key, the first-connection question for the new key, and connecting. TETHER_SELFTEST_HOSTKEY=1.
+        if env["TETHER_SELFTEST_HOSTKEY"] != nil {
+            Task { @MainActor in
+                if let cfg = env["TETHER_SELFTEST_SSHCONFIG"] { model.settings.sshConfigPath = cfg }
+                model.settings.useControlMaster = true
+                let host = ConnectionTarget.alias(env["TETHER_SELFTEST_HOST"] ?? "loadtest")
+                state.window?.setFrame(NSRect(x: 80, y: 80, width: 1100, height: 760), display: true)
+                let s = state.connect(host)
+                for _ in 0..<150 where !s.phase.isDead { try? await Task.sleep(for: .milliseconds(100)) }
+                guard let change = s.progress?.hostKeyChange else { say("FAIL no host key change: \(s.phase.label) \(s.lastError ?? "")"); return }
+                say("PASS change host=\(change.host) fp=\(change.fingerprint != nil) line=\(change.line ?? -1) ended=\(s.endedByConnectionFailure)")
+                try? await Task.sleep(for: .seconds(1))
+                SelfTest.snapshot(state.window, "hostkey-changed")
+                if let error = await change.removeOldKey() { say("FAIL remove \(error)"); return }
+                s.retryAfterFailure()
+                for _ in 0..<100 where model.prompts.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
+                guard let p = model.prompts.first else { say("FAIL no new-key question"); return }
+                say(p.request.isConfirmation && UnknownHostKey.parse(p.request.prompt) != nil ? "PASS new-key question" : "FAIL question: \(p.request.prompt)")
+                try? await Task.sleep(for: .seconds(1))
+                if let panel = NSApp.windows.first(where: { $0 is NSPanel && $0.isVisible }) { SelfTest.snapshot(panel, "hostkey-new") }
+                if env["TETHER_SELFTEST_NOANSWER"] != nil { say("WAITING"); return }
+                model.resolvePrompt(p, answer: "yes", save: false)
+                for _ in 0..<150 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                say(s.phase.isOnline ? "PASS online after trusting" : "FAIL \(s.phase.label)")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // File manager check against a real sshd: home folder, back/forward, the clickable path, the
+        // owner column, and the tab bar once it overflows. TETHER_SELFTEST_FILES=1 (+ _SSHCONFIG, _HOST).
+        if env["TETHER_SELFTEST_FILES"] != nil {
+            Task { @MainActor in
+                if let cfg = env["TETHER_SELFTEST_SSHCONFIG"] { model.settings.sshConfigPath = cfg }
+                model.settings.useControlMaster = true
+                let host = ConnectionTarget.alias(env["TETHER_SELFTEST_HOST"] ?? "loadtest")
+                state.window?.setFrame(NSRect(x: 80, y: 80, width: 1100, height: 700), display: true)
+                let term = state.connect(host)
+                for _ in 0..<100 where !term.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(2))
+                SelfTest.snapshot(state.window, "terminal-footer")
+                state.openFiles(host)
+                guard case .files(let tab)? = state.selectedItem else { say("FAIL no file tab"); return }
+                let b = model.fileTabs.browser(for: tab)
+                for _ in 0..<100 where b.directory.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
+                let home = b.directory
+                say("home=\(home.isEmpty ? "?" : "ok") owners=\(b.files.filter { !$0.owner.isEmpty }.count)/\(b.files.count)")
+                SelfTest.snapshot(state.window, "files-home")
+                await b.load("/usr")
+                await b.load("/usr/bin")
+                await b.back()
+                let afterBack = b.directory
+                await b.forward()
+                say("back=\(afterBack) forward=\(b.directory) path=\(b.pathComponents.map(\.name).joined(separator: ">"))")
+                say(afterBack == "/usr" && b.directory == "/usr/bin" ? "PASS history" : "FAIL history")
+                await b.back(); await b.back()
+                say(b.directory == home ? "PASS back home" : "FAIL back home \(b.directory)")
+                SelfTest.snapshot(state.window, "files-nav")
+                state.window?.setFrame(NSRect(x: 40, y: 40, width: 1700, height: 800), display: true)
+                try? await Task.sleep(for: .seconds(1))
+                SelfTest.snapshot(state.window, "files-wide")
+                b.selection = Set(b.files.prefix(1).map(\.id))
+                state.window?.setFrame(NSRect(x: 80, y: 80, width: 1100, height: 700), display: true)
+                try? await Task.sleep(for: .seconds(1))
+                SelfTest.snapshot(state.window, "files-narrow-selected")
+                for _ in 0..<25 { state.openFiles(host, path: "/tmp") }
+                try? await Task.sleep(for: .seconds(2))
+                SelfTest.snapshot(state.window, "tabs-overflow")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Load test against a real sshd: open many tabs to one host as fast as possible and watch
+        // whether any session (old or new) drops. TETHER_SELFTEST_LOAD=<count>, TETHER_SELFTEST_SSHCONFIG=<file>.
+        if let count = env["TETHER_SELFTEST_LOAD"].flatMap(Int.init) {
+            Task { @MainActor in
+                if let cfg = env["TETHER_SELFTEST_SSHCONFIG"] { model.settings.sshConfigPath = cfg }
+                model.settings.useControlMaster = true
+                model.settings.recordingEnabled = env["TETHER_SELFTEST_RECORD"] != nil
+                model.settings.defaultPersistence = .tmux
+                let host = ConnectionTarget.alias(env["TETHER_SELFTEST_HOST"] ?? "loadtest")
+                try? await Task.sleep(for: .seconds(1))
+                var everLost = Set<UUID>()
+                var everDead = Set<UUID>()
+                let sampler = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+                    MainActor.assumeIsolated {
+                        for s in model.sessions.sessions {
+                            if case .waiting = s.phase, s.wasOnline { everLost.insert(s.id) }
+                            if s.phase.isDead { everDead.insert(s.id) }
+                        }
+                    }
+                }
+                // A first batch, then a burst while those are online.
+                for _ in 0..<min(count, 4) { state.connect(host, mode: .tab) }
+                for _ in 0..<120 where !model.sessions.sessions.allSatisfy({ $0.phase.isOnline }) {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                say("first batch online=\(model.sessions.sessions.filter(\.phase.isOnline).count)")
+                if env["TETHER_SELFTEST_BUSY"] != nil {
+                    // The old sessions are busy: a stream of output while the burst connects.
+                    for s in model.sessions.sessions {
+                        s.send(Array("i=0; while [ $i -lt 400000 ]; do echo \"line $i $(date +%s)\"; i=$((i+1)); done\r".utf8)[...])
+                    }
+                }
+                let t0 = Date()
+                for _ in 0..<max(count - 4, 0) { state.connect(host, mode: .tab) }
+                for _ in 0..<240 where !model.sessions.sessions.allSatisfy({ $0.phase.isOnline || $0.phase.isDead }) {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                let ready = Date().timeIntervalSince(t0)
+                try? await Task.sleep(for: .seconds(15))   // do the old ones survive the burst?
+                let fds = (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
+                var limit = rlimit()
+                getrlimit(RLIMIT_NOFILE, &limit)
+                say("open file descriptors: \(fds) (limit \(limit.rlim_cur))")
+                sampler.invalidate()
+                let all = model.sessions.sessions
+                let slots = Dictionary(grouping: all, by: \.controlSlot).mapValues(\.count).sorted { $0.key < $1.key }
+                say("load: \(all.count) sessions, online=\(all.filter(\.phase.isOnline).count) waiting=\(all.filter { if case .waiting = $0.phase { true } else { false } }.count) dead=\(all.filter(\.phase.isDead).count) everLost=\(everLost.count) everDead=\(everDead.count) ready in \(Int(ready)) s slots=\(slots)")
+                for s in all where s.phase.isDead || !s.phase.isOnline { say("  \(s.phase.label): \(s.lastError ?? "") \(s.progress?.failure ?? "")") }
+                if env["TETHER_SELFTEST_CLOSETIMING"] != nil {
+                    // Fill every terminal's history, then close the tabs one by one through the UI path.
+                    for s in model.sessions.sessions {
+                        s.send(Array("i=0; while [ $i -lt 12000 ]; do echo \"history line $i of a long session\"; i=$((i+1)); done\r".utf8)[...])
+                    }
+                    try? await Task.sleep(for: .seconds(20))
+                    model.settings.confirmCloseOnlineSessions = false
+                    if env["TETHER_SELFTEST_RESIZE"] != nil, let w = state.window {
+                        // The hidden terminals now have a stale size: each one revealed by a close must adapt.
+                        w.setFrame(NSRect(x: w.frame.minX, y: w.frame.minY, width: w.frame.width - 260, height: w.frame.height - 120), display: true)
+                        try? await Task.sleep(for: .seconds(1))
+                    }
+                    var gap = 0.0
+                    var tick = Date()
+                    let ticker = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { _ in
+                        let now = Date(); gap = max(gap, now.timeIntervalSince(tick)); tick = now
+                    }
+                    var durations: [Int] = []
+                    for s in Array(model.sessions.sessions) {
+                        let target = model.workspaces.workspace(containing: s.id).flatMap { model.workspaces.state(ofWorkspace: $0) } ?? state
+                        let t0 = Date()
+                        target.closeTab(s)
+                        durations.append(Int(Date().timeIntervalSince(t0) * 1000))
+                        try? await Task.sleep(for: .milliseconds(400))
+                    }
+                    ticker.invalidate()
+                    say("close timing: per closeTab ms max=\(durations.max() ?? 0) avg=\(durations.isEmpty ? 0 : durations.reduce(0, +) / durations.count); longest main-thread pause \(Int(gap * 1000)) ms")
+                }
+                for s in model.sessions.sessions { model.sessions.close(s.id, killRemote: true) }
+                try? await Task.sleep(for: .seconds(2))
+                say("done")
+            }
+            return
+        }
         // Window layout across quit and relaunch: "save" arranges two windows and quits properly,
         // "check" reports what came back.
         if let mode = env["TETHER_SELFTEST_LAYOUT"] {
