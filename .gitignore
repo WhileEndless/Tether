@@ -1,0 +1,10 @@
+.DS_Store
+/.build
+/.swiftpm
+/dist
+/Packages
+xcuserdata/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+graphify-out/
