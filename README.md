@@ -2,11 +2,11 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.1.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether)
+Version 0.1.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Changelog](CHANGELOG.md)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host.
 
-> Requires macOS 26 or later. Tether is an early release (0.1.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.1.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Features
 
@@ -69,7 +69,7 @@ Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, witho
 - Directories you have visited open instantly from a cache and refresh in the background, keeping scroll position and selection.
 - *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*.
 - Transfers show speed, amount transferred and ETA.
-- **Drop or paste files into a terminal** to upload them: Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report (1).pdf` is chosen instead.
+- **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead.
 - Copy files in the file manager and paste them in Finder (and the other way round). Bulk move, copy, permissions, compress, rename and delete.
 
 **Search**

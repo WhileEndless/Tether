@@ -33,7 +33,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         terminalDelegate = self
         // A permanent scroller shows how far back the history goes.
         scrollerStyle = .legacy
-        registerForDraggedTypes([.fileURL])
+        registerForDraggedTypes([.fileURL] + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
         apply(settings: settings)
         KeyboardRouter.shared.install()
     }
@@ -84,31 +84,38 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     // MARK: Files (drag & drop, paste)
 
-    private func fileURLs(from pasteboard: NSPasteboard) -> [URL] {
-        (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    private func carriesFiles(_ pasteboard: NSPasteboard) -> Bool {
+        !PasteboardFiles.fileURLs(on: pasteboard).isEmpty
+            || pasteboard.canReadObject(forClasses: [NSFilePromiseReceiver.self], options: nil)
     }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        fileURLs(from: sender.draggingPasteboard).isEmpty || onFiles == nil ? [] : .copy
+        onFiles != nil && carriesFiles(sender.draggingPasteboard) ? .copy : []
     }
 
     public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         draggingEntered(sender)
     }
 
+    /// Dropped files upload; so do file promises (the screenshot thumbnail, Photos, Mail).
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = fileURLs(from: sender.draggingPasteboard)
-        guard !urls.isEmpty, let onFiles else { return false }
-        onFiles(urls)
-        return true
+        guard let onFiles else { return false }
+        let pasteboard = sender.draggingPasteboard
+        let urls = PasteboardFiles.fileURLs(on: pasteboard)
+        if !urls.isEmpty {
+            onFiles(urls)
+            return true
+        }
+        return PasteboardFiles.receivePromises(from: pasteboard) { urls in
+            if !urls.isEmpty { onFiles(urls) }
+        }
     }
 
-    /// Pasting copied files (Finder ⌘C) uploads them like a drop; text pastes as usual.
+    /// Pasting copied files (Finder ⌘C) or a copied image (e.g. a screenshot taken with ⌃⇧⌘4)
+    /// uploads them like a drop; text pastes as usual.
     public override func paste(_ sender: Any) {
-        let urls = fileURLs(from: NSPasteboard.general)
-        if !urls.isEmpty, let onFiles, NSPasteboard.general.string(forType: .string) == nil
-            || NSPasteboard.general.types?.contains(.fileURL) == true {
-            onFiles(urls)
+        if let onFiles, let files = PasteboardFiles.filesToPaste(from: NSPasteboard.general) {
+            onFiles(files)
             return
         }
         super.paste(sender)

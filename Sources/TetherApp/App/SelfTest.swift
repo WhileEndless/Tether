@@ -107,6 +107,21 @@ enum SelfTest {
             try? await Task.sleep(for: .seconds(1))
             snapshot(help, "07-shortcuts")
             help.close()
+            // Pasted image → upload sheet (private pasteboard; the user's clipboard is not touched).
+            let pb = NSPasteboard(name: NSPasteboard.Name("tether-selftest"))
+            pb.clearContents()
+            pb.writeObjects([NSImage(size: NSSize(width: 8, height: 8), flipped: false) { NSColor.blue.setFill(); $0.fill(); return true }])
+            if let files = PasteboardFiles.filesToPaste(from: pb), let s = state.session {
+                TerminalRegistry.shared.existingView(for: s.id)?.onFiles?(files)
+                try? await Task.sleep(for: .seconds(1))
+                say("paste image files=\(files.map(\.lastPathComponent)) sheet=\(state.uploadRequest != nil)")
+                snapshot(state.window?.attachedSheet, "08-upload-sheet")
+                state.uploadRequest = nil
+                files.forEach { try? FileManager.default.removeItem(at: $0) }
+            } else {
+                say("paste image failed")
+            }
+            pb.releaseGlobally()
             say("phases \(model.sessions.sessions.map { "\($0.phase)" })")
             say("windows \(NSApp.windows.filter(\.isVisible).count) tabs \(state.workspace.tabs.count)")
             // File manager tab: open, list, switch away and back, move to background.

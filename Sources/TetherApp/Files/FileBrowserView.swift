@@ -3,6 +3,7 @@ import QuickLook
 import UniformTypeIdentifiers
 import TetherCore
 import FileTransferKit
+import TerminalUI
 
 @MainActor
 @Observable
@@ -317,6 +318,7 @@ struct FileBrowserView: View {
             }
             Button(items.count > 1 ? "Copy \(items.count) Items" : "Copy") { copyToMac(items) }
             Button("Paste from Mac") { pasteFromMac(b) }
+                .help("Uploads files or an image copied on this Mac")
                 .disabled(!clipboardHasFiles)
             Button("Copy Path\(items.count > 1 ? "s" : "")") {
                 NSPasteboard.general.clearContents()
@@ -444,7 +446,8 @@ struct FileBrowserView: View {
     // MARK: Uploads, clipboard and bulk actions
 
     private var clipboardHasFiles: Bool {
-        NSPasteboard.general.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        let pb = NSPasteboard.general
+        return !PasteboardFiles.fileURLs(on: pb).isEmpty || PasteboardFiles.hasImageOnly(pb)
     }
 
     /// Uploads into the current folder without overwriting: clashing names get a suffix.
@@ -472,8 +475,10 @@ struct FileBrowserView: View {
 
     /// Pastes files copied in Finder into the current folder.
     private func pasteFromMac(_ b: FileBrowserModel) {
-        let urls = (NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-        if urls.isEmpty { show("The clipboard holds no files. Copy files in Finder first.", isError: true); return }
+        guard let urls = PasteboardFiles.filesToPaste(from: NSPasteboard.general) else {
+            show("The clipboard holds no files or images. Copy files in Finder, or take a screenshot with ⌃⇧⌘4.", isError: true)
+            return
+        }
         uploadSafely(urls, into: b)
     }
 
