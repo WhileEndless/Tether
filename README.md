@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.2.4 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.3.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.2.4): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.3.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -38,7 +38,14 @@ Search across every terminal, the archive and recordings.
 **Passwords, Touch ID and sudo**
 - Saving passwords is optional: tick *Remember in Keychain* when signing in (works for every jump host and for SSH key passphrases).
 - Saved passwords stay in the macOS login keychain. Optionally Touch ID (or your Mac's password) is asked before one is used, then not again for a time you choose; locking the screen always asks again.
-- When a terminal asks for a password — `sudo`, `su`, `ssh` to another host, a key passphrase — a bar offers to fill a saved one with Touch ID (⌥⌘P) or to type one in a secure field and save it. Nothing is typed without your click.
+- A saved password only answers its own host: never a server's own prompt text naming another host, never a jump host asking for the target's password.
+- When a terminal asks for a password — `sudo`, `su`, `ssh` to another host, a key passphrase — a bar offers to fill a saved one (⌥⌘P) or to type one in a secure field and save it. Passwords are kept per user: sudo's for the user who runs it, su's for the account it switches to (also on macOS, where both just ask "Password:"). Only sudo is filled automatically, and only while sudo itself is waiting; a password is never typed into a shell (where it would land in the shell history and the recording). Secure Keyboard Entry is on while a terminal waits for a password.
+- A saved password that stops working (changed on the server) is not sent again: you are asked for the current one, which replaces it. Saved passwords can also be replaced or removed in Settings ▸ Passwords.
+
+**Security**
+- **App Lock** (off by default): Touch ID or the Mac password, or a separate Tether password. Every window is covered until Tether is unlocked; sessions keep running meanwhile. Coming back to Tether asks for Touch ID right away. Optionally locks when the Mac sleeps or its screen locks; ⌃⌘L or the toolbar's lock button locks at once.
+- **Encrypted recordings** (off by default, a simple on/off switch): AES-256-GCM, hardware accelerated, with the key kept behind your Tether password (set when you turn it on, typed twice). Turning it on encrypts every recording, existing and compressed ones too; turning it off decrypts them again. Search, transcripts and scrolling back work as usual. Forgot the password? *Reset* (after typing RESET and the Mac's own check) removes it and the recordings nobody can open any more, and keeps everything else.
+- Security settings are also kept in the keychain, so other programs cannot quietly switch them off; weakening one asks for Touch ID or the Mac password.
 
 **Windows servers**
 - Windows 10/11 and Windows Server with OpenSSH (cmd or PowerShell as the default shell) are detected automatically. Nothing is installed.
@@ -82,6 +89,7 @@ Search across every terminal, the archive and recordings.
 - Connection details: server address and port, the address you appear as, sshd ports, and latency with jitter and a quality rating.
 - Metrics with sparklines, disks, and **GPUs** (NVIDIA via `nvidia-smi`, including unified-memory systems such as DGX Spark; AMD via `rocm-smi` or sysfs).
 - Processes with signals, **systemd services** (start, stop, restart, logs), and **Docker/Podman containers** with their published ports and whether each is public or local only.
+- **Kubernetes**: pods (status, ready containers, restarts, node, age) and nodes of the cluster that `kubectl`, k3s, microk8s or `oc` on the host can reach, filtered by namespace or name, with logs, describe and Delete Pod.
 - **Listening ports:**
   - every TCP/UDP port the server listens on, with the process and container behind it
   - grouped by reach: all interfaces, one interface, or local only
@@ -127,13 +135,14 @@ Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option as M
 
 | | |
 | --- | --- |
-| New connection / tab to same host / local terminal | ⌘N / ⌘T / ⌥⌘T |
+| New connection / quick connect (host search) / tab to same host / local terminal | ⌘N / ⌘↩ / ⌘T / ⌥⌘T |
 | Close tab / close window | ⌘W / ⇧⌘W |
 | Next / previous tab | ⇧⌘] ⇧⌘[ (also ⌃Tab, ⌥⌘→ ⌥⌘←) |
 | Tab 1…8 / last tab · go to any session | ⌘1…⌘8 / ⌘9 · ⌘P |
 | Move tab to background / disconnect to background | ⇧⌘B / ⌥⇧⌘B |
 | Terminate session | ⌥⇧⌘W |
 | Fill a saved password (sudo, su, ssh prompt) | ⌥⌘P |
+| Lock Tether (with App Lock on) | ⌃⌘L |
 | Jump between commands / select a command's output | ⌘↑ ⌘↓ / ⇧⌘↑ ⇧⌘↓ |
 | Find in terminal / search all sessions | ⌘F (⌘G, ⇧⌘G, ⌘E) / ⇧⌘F |
 | Browse files here / file manager window / transfers | ⇧⌘O / ⌥⌘O / ⌥⌘L |
@@ -241,7 +250,7 @@ When a terminal connects, Tether runs a short POSIX `sh` script on the server. I
 
 ## Privacy
 
-Tether talks only to the hosts you connect to. Settings, host groups and recordings stay in `~/Library/Application Support/Tether`. Passwords stay in your login keychain.
+Tether talks only to the hosts you connect to. Settings, host groups and recordings stay in `~/Library/Application Support/Tether` (recordings can be encrypted, see Security). Passwords stay in your login keychain.
 
 Nothing else is sent anywhere: no analytics, no telemetry. At launch Tether asks GitHub once whether a newer release exists (Settings ▸ General can turn this off); if GitHub cannot be reached, nothing happens.
 

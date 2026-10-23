@@ -46,8 +46,12 @@ public struct ConnectionProgress: Equatable, Sendable {
 
     public init() {}
 
-    /// The server's host key differs from the trusted one (ssh refused to connect).
-    public var hostKeyChange: HostKeyChange? { HostKeyChange.parse(log) }
+    /// Lines from ssh's own log file (`-E`), which nothing on the server can write into.
+    var sshLog: [String] = []
+
+    /// The server's host key differs from the trusted one (ssh refused to connect). Read only from
+    /// ssh's own log: text printed by the server could imitate the warning.
+    public var hostKeyChange: HostKeyChange? { HostKeyChange.parse(sshLog) }
 
     mutating func append(_ line: String) {
         log.append(line)
@@ -58,6 +62,8 @@ public struct ConnectionProgress: Equatable, Sendable {
     mutating func ingest(_ raw: String) {
         let line = raw.hasPrefix("debug1: ") ? String(raw.dropFirst(8)) : raw
         append(line)
+        sshLog.append(line)
+        if sshLog.count > 400 { sshLog.removeFirst(sshLog.count - 400) }
         if let m = line.firstMatch(of: #/^Connecting to (\S+) \[([^\]]+)\] port (\d+)/#) {
             let host = String(m.1)
             if !hops.contains(host) { hops.append(host) }
@@ -163,7 +169,10 @@ final class MasterConnector {
         timer = poll
         let status: Int32 = await withCheckedContinuation { cont in
             p.terminationHandler = { cont.resume(returning: $0.terminationStatus) }
-            do { try p.run() } catch { p.terminationHandler = nil; cont.resume(returning: -1) }
+            do {
+                try p.run()
+                AskPassBridge.shared.bindToken(environment, pid: p.processIdentifier)
+            } catch { p.terminationHandler = nil; cont.resume(returning: -1) }
         }
         readLog(onLine)
         timer?.invalidate()

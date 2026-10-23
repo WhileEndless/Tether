@@ -66,7 +66,7 @@ struct PortsPanel: View {
         .task { await monitor.refreshListeningPorts() }
         .refreshable { await monitor.refreshListeningPorts() }
         .sheet(item: $editing) { f in
-            ForwardEditor(forward: f, isNew: isNew) { result in save(result) }
+            ForwardEditor(forward: f, isNew: isNew) { result in save(result) }.appLockCover()
         }
     }
 

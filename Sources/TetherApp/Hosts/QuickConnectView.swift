@@ -282,7 +282,8 @@ private struct DirectConnectForm: View {
             target = .alias(name)
         }
         if auth == .password && !password.isEmpty {
-            if rememberPassword || saveAsHost { PasswordVault.setPassword(password, for: target.key) }
+            // Saved only when asked to ("Save as host" alone does not store the password).
+            if rememberPassword { PasswordVault.setPassword(password, for: target.key) }
             else { model.transientPasswords[target.key] = password }
         }
         onDone()

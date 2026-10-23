@@ -57,3 +57,26 @@ import TetherCore
         #expect((LocalPorts.nextFree(from: port) ?? port) != port)
     }
 }
+
+@Suite struct ShellQuoteTests {
+    /// Every POSIX shell must read back exactly the original text.
+    @Test func roundTripsInPosixShells() throws {
+        let samples = ["plain", "with space", "it's", "x\\'; touch pwned #", "back\\slash", "a\\\\b", "$HOME `id` $(id)",
+                       "new\nline", "'", "\\", "\"double\"", "tab\there", "ünïcødé ✓", "--rm -rf /", "*?[a]", ""]
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] where FileManager.default.isExecutableFile(atPath: shell) {
+            for sample in samples {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: shell)
+                p.arguments = ["-c", "printf %s " + sample.shellQuoted]
+                let out = Pipe()
+                p.standardOutput = out
+                try p.run()
+                p.waitUntilExit()
+                let got = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                #expect(got == sample, "\(shell): \(sample.debugDescription) → \(got.debugDescription)")
+            }
+        }
+        // No backslash ever stays inside single quotes (what fish would read as an escape).
+        #expect("x\\'y".shellQuoted == #"'x'\\''\''y'"#)
+    }
+}

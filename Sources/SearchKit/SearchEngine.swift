@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import RecordingKit
 
 /// What to look for.
@@ -172,10 +173,10 @@ public enum SearchEngine {
     }
 
     /// Reads a recording (compressed or not) as plain text lines, in chunks so large files stay manageable.
-    public static func readLines(_ url: URL) throws -> [String] {
+    public static func readLines(_ url: URL, key: SymmetricKey? = RecordingCrypto.key) throws -> [String] {
         var converter = PlainTextConverter()
         var lines: [String] = []
-        try RecordingCompression.forEachChunk(of: url) { chunk in
+        try RecordingReader.forEachChunk(of: url, key: key) { chunk in
             try Task.checkCancellation()
             lines.append(contentsOf: converter.feed(chunk))
             return true

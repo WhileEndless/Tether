@@ -32,3 +32,26 @@ import Testing
         #expect(d.feed(Array("\r\nfile1  file2\r\nalice@web:~$ ".utf8)) == nil)
     }
 }
+
+@Suite struct ForegroundProcessTests {
+    @Test func findsTheProgramAskingAndItsUser() {
+        // macOS `ps -t ttys003 -o stat=,ruser=,args=`
+        let mac = """
+        Ss   alice  -zsh
+        S+   alice  sudo -u bob ls
+        """
+        let p = ForegroundProcess.parse(ps: mac, command: "sudo")
+        #expect(p?.command == "sudo" && p?.user == "alice")
+        let linux = """
+        Ss   carol    -bash
+        S+   carol    su - dbadmin
+        """
+        let su = ForegroundProcess.parse(ps: linux, command: "su")
+        #expect(su?.user == "carol" && su?.suTarget == "dbadmin")
+        #expect(ForegroundProcess.parse(ps: "S+ carol su\n", command: "su")?.suTarget == "root")
+        #expect(ForegroundProcess.parse(ps: "S+ carol su -c 'id' bob\n", command: "su")?.suTarget == "bob")
+        #expect(ForegroundProcess.parse(ps: "S+ carol /usr/bin/su -l eve\n", command: "su")?.suTarget == "eve")
+        // Nothing in the foreground: nothing known.
+        #expect(ForegroundProcess.parse(ps: "Ss alice -zsh\n", command: "sudo") == nil)
+    }
+}

@@ -173,6 +173,24 @@ public enum SessionSortOrder: String, Codable, CaseIterable, Identifiable, Senda
     }
 }
 
+/// How Tether is unlocked when it opens.
+public enum AppLockMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case off
+    /// Touch ID, an Apple Watch or the Mac's login password (whatever macOS offers).
+    case system
+    /// A password only for Tether. It also protects the key of encrypted recordings.
+    case password
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .off: "Off"
+        case .system: "Touch ID or Mac Password"
+        case .password: "Tether Password"
+        }
+    }
+}
+
 /// All user preferences. Persisted as JSON in UserDefaults.
 public struct AppSettings: Codable, Equatable, Sendable {
     // General
@@ -212,6 +230,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var serverAliveInterval = 10
     public var serverAliveCountMax = 3
     public var historyLinesOnReattach = 5_000
+    /// Scrollback the server keeps for Tether's tmux/screen sessions, so output printed while
+    /// disconnected can be fetched on reconnect.
+    public var serverHistoryLines = 100_000
     /// Seconds without any answer from the server before a session is considered disconnected.
     public var stallTimeout: Double = 6
 
@@ -246,6 +267,18 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     // Passwords
     /// Ask for Touch ID (or the Mac's password) before a saved password is used.
+    // Security
+    public var appLockMode: AppLockMode = .off
+    /// Lock again when the Mac sleeps or its screen locks.
+    public var lockOnSleep = true
+    /// With a Tether password: Touch ID (or the Mac password) unlocks too. The key of encrypted
+    /// recordings is then also kept in the login keychain.
+    public var unlockWithTouchID = false
+    /// New recordings are encrypted (AES-256-GCM, key in the keychain or behind the Tether password).
+    public var encryptRecordings = false
+    /// macOS Secure Keyboard Entry while a terminal waits for a password, so no other app can read the keys.
+    public var secureKeyboardAtPasswordPrompts = true
+
     public var requireAuthForSavedPasswords = true
     /// After a successful check, saved passwords can be used without asking again for this long (seconds).
     public var authGraceSeconds = 300
@@ -320,6 +353,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.serverAliveInterval, &serverAliveInterval)
         d(.serverAliveCountMax, &serverAliveCountMax)
         d(.historyLinesOnReattach, &historyLinesOnReattach)
+        d(.serverHistoryLines, &serverHistoryLines)
         d(.stallTimeout, &stallTimeout)
         d(.recordingEnabled, &recordingEnabled)
         d(.recordingQuotaMB, &recordingQuotaMB)
@@ -335,6 +369,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.transferArchiveThreshold, &transferArchiveThreshold)
         d(.transferCompress, &transferCompress)
         d(.checkForUpdates, &checkForUpdates)
+        d(.appLockMode, &appLockMode)
+        d(.lockOnSleep, &lockOnSleep)
+        d(.unlockWithTouchID, &unlockWithTouchID)
+        d(.encryptRecordings, &encryptRecordings)
+        d(.secureKeyboardAtPasswordPrompts, &secureKeyboardAtPasswordPrompts)
         d(.requireAuthForSavedPasswords, &requireAuthForSavedPasswords)
         d(.authGraceSeconds, &authGraceSeconds)
         d(.detectPasswordPrompts, &detectPasswordPrompts)
@@ -361,11 +400,16 @@ public final class SettingsStore {
             if let data = try? JSONEncoder().encode(settings) {
                 defaults.set(data, forKey: Self.defaultsKey)
             }
+            let pinned = SecuritySettings(settings)
+            if pinned != SecuritySettings(oldValue) { SecuritySettings.pin(pinned) }
         }
     }
 
+    /// Security settings found changed outside Tether (and put back) at launch, if any.
+    public private(set) var tamperedSecuritySettings: [String] = []
+
     /// Separate defaults suite for tests (TETHER_DEFAULTS_SUITE), otherwise the app's own defaults.
-    private let defaults: UserDefaults = ProcessInfo.processInfo.environment["TETHER_DEFAULTS_SUITE"]
+    private let defaults: UserDefaults = AppPaths.debugOverride("TETHER_DEFAULTS_SUITE")
         .flatMap(UserDefaults.init(suiteName:)) ?? .standard
 
     public init() {
@@ -376,9 +420,32 @@ public final class SettingsStore {
         } else {
             settings = AppSettings()
         }
+        // Never run an ssh/scp that is missing, not executable or in a temporary folder.
+        let defaults = AppSettings()
+        settings.sshBinary = SecuritySettings.usableProgram(settings.sshBinary, fallback: defaults.sshBinary)
+        settings.scpBinary = SecuritySettings.usableProgram(settings.scpBinary, fallback: defaults.scpBinary)
+        // The keychain copy of the security settings wins over the preferences file.
+        if var pinned = SecuritySettings.pinned() {
+            pinned.sshBinary = SecuritySettings.usableProgram(pinned.sshBinary, fallback: defaults.sshBinary)
+            pinned.scpBinary = SecuritySettings.usableProgram(pinned.scpBinary, fallback: defaults.scpBinary)
+            tamperedSecuritySettings = pinned.differences(from: SecuritySettings(settings))
+            if !tamperedSecuritySettings.isEmpty { pinned.apply(to: &settings) }
+        } else {
+            // No keychain copy yet (first launch of this version, or it was removed): keep what the
+            // preferences say, but list what differs from the defaults so the user can check it.
+            unpinnedNonDefaults = SecuritySettings(AppSettings()).differences(from: SecuritySettings(settings))
+            SecuritySettings.pin(SecuritySettings(settings))
+        }
     }
 
+    /// Security settings that differed from the defaults when no keychain copy existed (to review).
+    public private(set) var unpinnedNonDefaults: [String] = []
+
+    /// Everything back to defaults except the security settings (App Lock, encryption, where
+    /// passwords go …): those change only in their own places, with confirmation.
     public func resetToDefaults() {
-        settings = AppSettings()
+        var fresh = AppSettings()
+        SecuritySettings(settings).apply(to: &fresh)
+        settings = fresh
     }
 }

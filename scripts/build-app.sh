@@ -76,6 +76,8 @@ if [ "$CONFIG" = release ]; then
 fi
 
 # Ad-hoc signature so macOS runs it locally. Sign with your own identity for distribution.
-codesign --force --sign - "$APP/Contents/MacOS/tether-askpass"
-codesign --force --sign - "$APP"
+# Hardened runtime: macOS ignores DYLD_* variables for the app, so no library can be injected into
+# Tether (which holds the keychain access, the recording key and the askpass socket).
+codesign --force --options runtime --sign - "$APP/Contents/MacOS/tether-askpass"
+codesign --force --options runtime --sign - "$APP"
 echo "Built $APP"

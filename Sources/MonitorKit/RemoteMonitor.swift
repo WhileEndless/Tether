@@ -29,6 +29,9 @@ public final class RemoteMonitor {
     public private(set) var connections: [ConnectionEntry] = []
     public private(set) var services: [ServiceEntry] = []
     public private(set) var containers: [ContainerEntry] = []
+    /// nil until loaded, or when the host has no Kubernetes client.
+    public private(set) var kubernetes: Result<KubeCluster, KubeError>?
+    public private(set) var kubernetesLoaded = false
     public private(set) var remoteSessions: [RemoteSessionEntry] = []
     /// Sockets the server listens on (for the ports overview and quick forwarding).
     public private(set) var listeningPorts: [ListeningSocket] = []
@@ -194,6 +197,26 @@ public final class RemoteMonitor {
         if let text = try? await executor.output(RemoteScript(ProbeScripts.containers, windows: WindowsProbeScripts.containers), timeout: 20, purpose: "monitor") {
             containers = ProbeParser.containers(text)
         }
+    }
+
+    public func refreshKubernetes() async {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(KubeScripts.list, windows: KubeScripts.listWindows),
+                                                 timeout: 30, purpose: "monitor") {
+            kubernetes = ProbeParser.kubernetes(text)
+        }
+        kubernetesLoaded = true
+    }
+
+    /// logs / describe / delete for a pod. Returns the output (or the error).
+    public func kubernetes(_ action: String, _ pod: KubePod) async -> (ok: Bool, output: String) {
+        // The tool name came from the host: only a known client is ever run.
+        guard case .success(let cluster)? = kubernetes, KubeScripts.tools.contains(cluster.tool),
+              ["logs", "describe", "delete"].contains(action) else { return (false, "Not available.") }
+        let r = await executor.run(RemoteScript(KubeScripts.action, windows: KubeScripts.actionWindows),
+                                   arguments: [cluster.tool, action, pod.namespace, pod.name], timeout: 60, purpose: "kubernetes")
+        if action == "delete" { await refreshKubernetes() }
+        return (r.succeeded, r.output + r.errorOutput)
     }
 
     public func refreshRemoteSessions() async {

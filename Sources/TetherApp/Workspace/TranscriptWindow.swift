@@ -56,7 +56,9 @@ struct TranscriptWindow: View {
                     .id(reloadToken)
             } else if path == nil {
                 EmptyStateView(symbol: "record.circle", title: "No Recording",
-                               message: "Recording was turned off for this session.")
+                               message: archived?.reason.hasPrefix("Opened") == true
+                                   ? "Nothing was run in this session, so only its opening is kept."
+                                   : "Recording was turned off for this session.")
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }

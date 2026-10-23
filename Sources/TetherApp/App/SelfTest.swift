@@ -3,6 +3,9 @@ import AppKit
 import SwiftUI
 import TetherCore
 import SessionKit
+import KeySetupKit
+import SearchKit
+import RecordingKit
 import SSHTransport
 import TerminalUI
 
@@ -29,6 +32,12 @@ enum SelfTest {
         guard !started, let logPath = env["TETHER_SELFTEST"], let ssh = env["TETHER_SSH_BINARY"],
               env["TETHER_SUPPORT_DIR"] != nil, env["TETHER_DEFAULTS_SUITE"] != nil else { return }
         started = true
+        // Local sessions of a test run get their own tmux server, never the user's.
+        // (A short path: tmux's socket path must fit in about 104 bytes.)
+        let tmuxDir = URL(fileURLWithPath: "/tmp/tether-\(getuid())-tmux-\(getpid())", isDirectory: true)
+        AppPaths.ensure(tmuxDir, permissions: 0o700)
+        setenv("TMUX_TMPDIR", tmuxDir.path, 1)
+        unsetenv("TMUX")
         FileManager.default.createFile(atPath: logPath, contents: nil)
         let log = FileHandle(forWritingAtPath: logPath)
         func say(_ s: String) {
@@ -46,6 +55,326 @@ enum SelfTest {
         model.settings.requireAuthForSavedPasswords = false
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
+
+        // What a local terminal runs: shell, directory, persistence. TETHER_SELFTEST_LOCALSHELL=1.
+        if env["TETHER_SELFTEST_LOCALSHELL"] != nil {
+            Task { @MainActor in
+                say("app env SHELL=\(ProcessInfo.processInfo.environment["SHELL"] ?? "-") cwd=\(FileManager.default.currentDirectoryPath)")
+                let s = state.connect(.local)
+                for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(1.5))
+                s.send(Array("echo PROBE shell=$0 pwd=$(pwd) SHELL=$SHELL\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(1.5))
+                let lines = TerminalRegistry.shared.view(for: s).scrollbackText().lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                say("persistence=\(s.persistence) phase=\(s.phase.label)")
+                for l in lines.suffix(6) { say("  | \(l)") }
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Real sshd, a key with a passphrase saved in Tether: ssh asks through askpass and only the ssh
+        // the token was given to gets an answer. TETHER_SELFTEST_PASSPHRASE=<sshd test dir>.
+        if let rig = env["TETHER_SELFTEST_PASSPHRASE"] {
+            Task { @MainActor in
+                // A short path: ssh shortens long key paths in its prompt (which then names no file).
+                let dir = URL(fileURLWithPath: "/tmp/tpp-\(getpid())", isDirectory: true)
+                AppPaths.ensure(dir, permissions: 0o700)
+                let keyURL = dir.appendingPathComponent("id_pp")
+                do { _ = try await KeySetup.generate(at: keyURL, comment: "tether-selftest-pp", passphrase: "pp-secret-456", addToKeychain: false) }
+                catch { say("FAIL keygen \(error.localizedDescription)"); return }
+                let pub = (try? String(contentsOf: keyURL.appendingPathExtension("pub"), encoding: .utf8)) ?? ""
+                let auth = URL(fileURLWithPath: rig).appendingPathComponent("authorized_keys")
+                let before = (try? String(contentsOf: auth, encoding: .utf8)) ?? ""
+                try? (before + pub).write(to: auth, atomically: true, encoding: .utf8)
+                let config = dir.appendingPathComponent("ssh_config")
+                try? """
+                Host pptest
+                    HostName 127.0.0.1
+                    Port 22222
+                    IdentityFile \(keyURL.path)
+                    IdentitiesOnly yes
+                    IdentityAgent none
+                    UseKeychain no
+                    AddKeysToAgent no
+                    UserKnownHostsFile \(rig)/known_hosts
+                    StrictHostKeyChecking no
+                """.write(to: config, atomically: true, encoding: .utf8)
+                model.settings.sshConfigPath = config.path
+                model.settings.useControlMaster = true
+                model.settings.requireAuthForSavedPasswords = false
+                PasswordVault.setPassword("pp-secret-456", for: CredentialKey.passphrase(keyPath: keyURL.path))
+                let s = state.connect(.alias("pptest"), persistence: .off)
+                for _ in 0..<150 where !s.phase.isOnline && !s.phase.isDead { try? await Task.sleep(for: .milliseconds(100)) }
+                say(s.phase.isOnline ? "PASS signed in with the saved passphrase (token bound to its ssh)"
+                                     : "FAIL \(s.phase.label) \(s.progress?.failure ?? "") prompts=\(model.prompts.map(\.request.prompt))")
+                // A token used by a Tether child it was not given to: refused.
+                let stolen = AskPassBridge.shared.environment(targetKey: "pptest", purpose: "connect", mode: "force")
+                var e = ProcessInfo.processInfo.environment
+                e.merge(stolen) { $1 }
+                let r = await ProcessRunner.run(AskPassBridge.shared.helperPath ?? "/usr/bin/false",
+                                                arguments: ["Enter passphrase for key '\(keyURL.path)': "], timeout: 10)
+                _ = e
+                let direct = Process()
+                direct.executableURL = URL(fileURLWithPath: AskPassBridge.shared.helperPath ?? "/usr/bin/false")
+                direct.arguments = ["Enter passphrase for key '\(keyURL.path)': "]
+                direct.environment = e
+                let out = Pipe(); direct.standardOutput = out
+                try? direct.run(); direct.waitUntilExit()
+                let answer = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                AskPassBridge.shared.revoke(environment: stolen)
+                say(direct.terminationStatus != 0 && !answer.contains("pp-secret") && !r.succeeded
+                    ? "PASS a token used by another process gets nothing" : "FAIL stolen token answered: \(answer)")
+                model.sessions.close(s.id, killRemote: true)
+                try? before.write(to: auth, atomically: true, encoding: .utf8)
+                try? FileManager.default.removeItem(at: dir)
+                try? await Task.sleep(for: .seconds(1))
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // A key with a passphrase, handed to ssh-keygen through askpass (never in its arguments).
+        // TETHER_SELFTEST_KEYGEN=1.
+        if env["TETHER_SELFTEST_KEYGEN"] != nil {
+            Task { @MainActor in
+                let dir = AppPaths.supportDirectory.appendingPathComponent("keys", isDirectory: true)
+                AppPaths.ensure(dir, permissions: 0o700)
+                let url = dir.appendingPathComponent("id_test")
+                say("socket dir private: \(AppPaths.controlSocketDirectory.path.contains("-dbg-"))")
+                do {
+                    _ = try await KeySetup.generate(at: url, comment: "selftest", passphrase: "kp-secret-123", addToKeychain: false)
+                    @MainActor func opens(_ pw: String) async -> Bool {
+                        await ProcessRunner.run("/usr/bin/ssh-keygen", arguments: ["-y", "-P", pw, "-f", url.path], timeout: 20).succeeded
+                    }
+                    let right = await opens("kp-secret-123"), wrong = await opens("nope"), empty = await opens("")
+                    say(right && !wrong && !empty ? "PASS key encrypted with the passphrase" : "FAIL right=\(right) wrong=\(wrong) empty=\(empty)")
+                } catch {
+                    say("FAIL \(error.localizedDescription)")
+                }
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // App Lock and encrypted recordings. TETHER_SELFTEST_LOCK=1 (keychain items stay in memory).
+        if env["TETHER_SELFTEST_LOCK"] != nil {
+            Task { @MainActor in
+                let lock = AppLock.shared
+                model.settings.recordingEnabled = true
+                // A plain recording from before encryption was switched on.
+                let old = state.connect(.local)
+                for _ in 0..<100 where !old.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                old.send(Array("echo plain-before-\(42 * 1000)\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(1.5))
+                let oldURL = old.flushedRecordingURL()
+                model.sessions.close(old.id, killRemote: true)
+                try? await Task.sleep(for: .seconds(0.5))
+                say(oldURL.map { !RecordingCrypto.isEncrypted($0) } == true ? "PASS old recording is plain" : "FAIL old recording state")
+
+                // Tether password + encryption: the old recording is encrypted automatically.
+                say(lock.enablePassword("correct horse battery") ? "PASS password set" : "FAIL password")
+                model.settings.encryptRecordings = true
+                lock.installKey(RecordingCrypto.key)
+                if let key = RecordingCrypto.writerKey { _ = RecordingStore.encryptAll(with: key) }
+                say(oldURL.map(RecordingCrypto.isEncrypted) == true ? "PASS existing recording encrypted" : "FAIL existing not encrypted")
+
+                let s = state.connect(.local)
+                for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                s.send(Array("echo secret-marker-\(6 * 7)\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let url = s.flushedRecordingURL() else { say("FAIL no recording"); return }
+                let raw = (try? Data(contentsOf: url)) ?? Data()
+                say(RecordingCrypto.isEncrypted(url) && raw.range(of: Data("secret-marker-42".utf8)) == nil
+                    ? "PASS new recording encrypted on disk" : "FAIL new recording readable on disk")
+
+                // An open sheet is closed by locking (and SwiftUI knows it).
+                state.showQuickConnect = true
+                try? await Task.sleep(for: .seconds(1))
+                let sheetBefore = state.window?.attachedSheet != nil
+                lock.lock()
+                try? await Task.sleep(for: .milliseconds(600))
+                say(sheetBefore && lock.isLocked ? "PASS open sheet covered by the lock screen" : "FAIL sheet before=\(sheetBefore)")
+                state.showQuickConnect = false
+                let firstResponder = state.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+                say(lock.isLocked && RecordingCrypto.key == nil && !firstResponder.contains("TerminalView")
+                    ? "PASS locked: key dropped, no terminal has the keyboard" : "FAIL lock state responder=\(firstResponder)")
+                say((try? SearchEngine.readLines(url)) == nil ? "PASS recordings unreadable while locked" : "FAIL readable while locked")
+                // The session keeps running and recording while locked.
+                s.send(Array("echo during-lock-$((7*11))\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(1.5))
+                say(s.phase.isOnline ? "PASS session still running while locked" : "FAIL session \(s.phase.label) while locked")
+                let wrong = await lock.unlock(password: "wrong")
+                say(!wrong && lock.retryAfter != nil ? "PASS wrong password refused and slowed down" : "FAIL wrong password")
+                try? await Task.sleep(for: .seconds(1.2))
+                let right = await lock.unlock(password: "correct horse battery")
+                let lines = (try? SearchEngine.readLines(url)) ?? []
+                let oldLines = oldURL.flatMap { try? SearchEngine.readLines($0) } ?? []
+                let duringLock = (try? SearchEngine.readLines(s.flushedRecordingURL() ?? url))?.contains { $0.contains("during-lock-77") } == true
+                let stillEncrypted = (try? Data(contentsOf: url)).map { $0.range(of: Data("during-lock-77".utf8)) == nil } == true && RecordingCrypto.isEncrypted(url)
+                say(duringLock && stillEncrypted ? "PASS output while locked was recorded, encrypted, and is searchable" : "FAIL during lock found=\(duringLock) encrypted=\(stillEncrypted)")
+                say(right && !lock.isLocked && lines.contains { $0.contains("secret-marker-42") } && oldLines.contains { $0.contains("plain-before-42000") }
+                    ? "PASS unlocked: search reads new and old recordings"
+                    : "FAIL unlock right=\(right) new=\(lines.contains { $0.contains("secret-marker-42") }) old=\(oldLines.contains { $0.contains("plain-before-42000") }) oldTail=\(oldLines.suffix(3))")
+                // Turning encryption off and decrypting, then on again: every recording stays readable.
+                @MainActor func allReadable() -> Bool {
+                    [url, oldURL].compactMap { $0 }.allSatisfy { u in
+                        let text = (try? SearchEngine.readLines(u)) ?? []
+                        return text.contains { $0.contains("secret-marker-42") || $0.contains("plain-before-42000") }
+                    }
+                }
+                model.settings.encryptRecordings = false
+                lock.installKey(RecordingCrypto.key)
+                _ = s.flushedRecordingURL()
+                model.sessions.close(s.id, killRemote: true)
+                try? await Task.sleep(for: .seconds(0.5))
+                let decrypted = RecordingStore.decryptAll()
+                let plainNow = [url, oldURL].compactMap { $0 }.allSatisfy { !RecordingCrypto.isEncrypted($0) }
+                // (The maintenance pass that runs when the session closes may have decrypted them already.)
+                say(plainNow && allReadable() ? "PASS encryption off: recordings decrypted, intact" : "FAIL decrypt n=\(decrypted) plain=\(plainNow) readable=\(allReadable())")
+                model.settings.encryptRecordings = true
+                lock.installKey(RecordingCrypto.key)
+                let encrypted = RecordingCrypto.writerKey.map { RecordingStore.encryptAll(with: $0) } ?? 0
+                let encryptedNow = [url, oldURL].compactMap { $0 }.allSatisfy { RecordingCrypto.isEncrypted($0) }
+                say(encrypted >= 1 && encryptedNow && allReadable() ? "PASS encryption on again: recordings encrypted, intact" : "FAIL re-encrypt n=\(encrypted) encrypted=\(encryptedNow) readable=\(allReadable())")
+                // The key is not kept in the keychain in plain form with a Tether password.
+                say(RecordingKeyStore.storedKey() == nil ? "PASS key only behind the password" : "FAIL plain key stored")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Catch-up against a real sshd: output printed while disconnected reaches the terminal once, in
+        // order. TETHER_SELFTEST_CATCHUP=1 (+ _SSHCONFIG, _HOST, _TMUXDIR = the server's TMUX_TMPDIR).
+        if env["TETHER_SELFTEST_CATCHUP"] != nil {
+            Task { @MainActor in
+                if let cfg = env["TETHER_SELFTEST_SSHCONFIG"] { model.settings.sshConfigPath = cfg }
+                model.settings.useControlMaster = true
+                model.settings.recordingEnabled = true
+                model.settings.defaultPersistence = .tmux
+                model.settings.reconnectBaseDelay = 3
+                let host = ConnectionTarget.alias(env["TETHER_SELFTEST_HOST"] ?? "loadtest")
+                @MainActor func tmux(_ args: [String]) async -> String {
+                    var e = ProcessInfo.processInfo.environment
+                    e["TMUX_TMPDIR"] = env["TETHER_SELFTEST_TMUXDIR"]
+                    e["TMUX"] = nil
+                    let r = await ProcessRunner.run("/opt/homebrew/bin/tmux", arguments: args, environment: e, timeout: 10)
+                    if r.status != 0 { say("tmux \(args.first ?? ""): \(String(decoding: r.stderr, as: UTF8.self))") }
+                    return String(decoding: r.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                let s = state.connect(host, persistence: .tmux)
+                for _ in 0..<200 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(1))
+                let name = s.descriptor.remoteSessionName
+                say("session \(name) persistence=\(s.persistence) phase=\(s.phase.label) server sessions: \(await tmux(["list-sessions", "-F", "#{session_name}"]))")
+                let limit = await tmux(["show-options", "-t", "=\(name):", "-v", "history-limit"])
+                say(limit == String(model.settings.serverHistoryLines) ? "PASS server keeps \(limit) lines" : "FAIL history-limit=\(limit)")
+                let windows = await tmux(["list-windows", "-t", "=\(name)", "-F", "#{window_name}"])
+                say(windows.contains("tether-init") ? "FAIL placeholder window left: \(windows)" : "PASS one window")
+                _ = await tmux(["send-keys", "-t", "=\(name):", "seq -f before-%g 1 40", "Enter"])
+                try? await Task.sleep(for: .seconds(1.5))
+                // Start output that happens while disconnected, then cut the connection.
+                _ = await tmux(["send-keys", "-t", "=\(name):", "sleep 1; seq -f during-%g 1 3000; echo done-marker", "Enter"])
+                try? await Task.sleep(for: .milliseconds(200))
+                await model.sessions.closeAllMasters()
+                for _ in 0..<100 where s.phase.isOnline { try? await Task.sleep(for: .milliseconds(50)) }
+                say("disconnected: \(s.phase.label)")
+                for _ in 0..<300 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(2))
+                let lines = TerminalRegistry.shared.view(for: s).scrollbackText().lines
+                func count(_ t: String) -> Int { lines.filter { $0.trimmingCharacters(in: .whitespaces) == t }.count }
+                let order = ["before-40", "during-1", "during-1500", "during-3000", "done-marker"].map { t in lines.firstIndex { $0.trimmingCharacters(in: .whitespaces) == t } ?? -1 }
+                say("online=\(s.phase.isOnline) counts b40=\(count("before-40")) d1=\(count("during-1")) d1500=\(count("during-1500")) d3000=\(count("during-3000")) done=\(count("done-marker")) order=\(order)")
+                let ordered = !order.contains(-1) && order == order.sorted()
+                say(ordered && [count("before-40"), count("during-1"), count("during-1500"), count("during-3000"), count("done-marker")] == [1, 1, 1, 1, 1]
+                    ? "PASS missed output arrived once, in order" : "FAIL catch-up")
+                if let i = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "before-40" }) {
+                    for (n, l) in lines[max(0, i - 3)..<min(lines.count, i + 50)].enumerated() { say("  \(max(0, i - 3) + n): \(l)") }
+                }
+                let missing = (1...3000).filter { count("during-\($0)") != 1 }
+                say(missing.isEmpty ? "PASS all 3000 lines" : "FAIL \(missing.count) lines missing or repeated, first \(missing.prefix(5))")
+                model.sessions.close(s.id, killRemote: true)
+                try? await Task.sleep(for: .seconds(1))
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Windows: a detached tab can be typed in, merging the last tab into another window closes the empty
+        // one, and closing a window offers to move its tabs. TETHER_SELFTEST_WINDOWS=1.
+        if env["TETHER_SELFTEST_WINDOWS"] != nil {
+            Task { @MainActor in
+                let store = model.workspaces
+                state.window?.setFrame(NSRect(x: 60, y: 60, width: 1000, height: 650), display: true)
+                let a = state.connect(.local), b = state.connect(.local), c = state.connect(.local)
+                try? await Task.sleep(for: .seconds(1.5))
+                @MainActor func focusOK(_ ws: UUID) -> Bool {
+                    guard let w = store.window(of: ws) else { return false }
+                    return w.firstResponder.map { String(describing: type(of: $0)).contains("TerminalView") } == true
+                }
+                say("main focused=\(focusOK(state.workspaceID))")
+                // Detach a: new window, typing goes there.
+                state.present(a.id, mode: .window)
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let w2 = store.workspace(containing: a.id), w2 != state.workspaceID else { say("FAIL no new window"); return }
+                store.activate(w2)
+                try? await Task.sleep(for: .seconds(0.5))
+                say(focusOK(w2) ? "PASS detached tab has the keyboard" : "FAIL detached focus: \(String(describing: store.window(of: w2)?.firstResponder))")
+                // Drag b and c into w2 (as a drop on its tab bar): the first window is left empty and closes.
+                TabBarCenter.shared.beginDrag(b.id)
+                TabBarCenter.shared.drop(b.id, into: w2, before: nil)
+                TabBarCenter.shared.beginDrag(c.id)
+                TabBarCenter.shared.drop(c.id, into: w2, before: nil)
+                try? await Task.sleep(for: .seconds(1.5))
+                let firstGone = state.window?.isVisible != true
+                say(firstGone && store.workspace(w2).tabs.count == 3 ? "PASS empty window closed after merge" : "FAIL merge: first visible=\(!firstGone) tabs=\(store.workspace(w2).tabs.count)")
+                say(focusOK(w2) ? "PASS merged window has the keyboard" : "FAIL merged focus: \(String(describing: store.window(of: w2)?.firstResponder))")
+                // Real drag paths with screen points: out of every window → its own window at once;
+                // onto another window's tab bar → into that window, the empty one closes.
+                @MainActor func screenPoint(onBarOf ws: UUID) -> CGPoint? {
+                    guard let w = store.window(of: ws), let content = w.contentView, let bar = TabBarCenter.shared.barFrames[ws] else { return nil }
+                    let local = CGPoint(x: bar.midX, y: content.bounds.height - bar.midY)
+                    return w.convertPoint(toScreen: local)
+                }
+                let outside = CGPoint(x: (store.window(of: w2)?.frame.maxX ?? 0) + 300, y: (store.window(of: w2)?.frame.midY ?? 300))
+                let t0 = Date()
+                TabBarCenter.shared.dragChanged(b.id, title: "b", at: outside)
+                TabBarCenter.shared.dragEnded(b.id, at: outside)
+                try? await Task.sleep(for: .milliseconds(100))
+                let w4 = store.workspace(containing: b.id)
+                say(w4 != nil && w4 != w2 ? "PASS dropped outside → new window in \(Int(Date().timeIntervalSince(t0) * 1000)) ms" : "FAIL drop outside")
+                try? await Task.sleep(for: .seconds(1))
+                if let w4, let p = screenPoint(onBarOf: w2) {
+                    TabBarCenter.shared.dragChanged(b.id, title: "b", at: p)
+                    let lit = TabBarCenter.shared.dropTarget == w2
+                    TabBarCenter.shared.dragEnded(b.id, at: p)
+                    try? await Task.sleep(for: .seconds(1))
+                    say(lit && store.workspace(containing: b.id) == w2 && store.window(of: w4)?.isVisible != true
+                        ? "PASS dropped on other tab bar (highlighted, empty window closed)" : "FAIL drop on bar lit=\(lit)")
+                } else { say("FAIL no bar point") }
+                // Close question: open a third window with one tab, ask to close it, choose Move.
+                guard let st2 = store.state(ofWorkspace: w2) else { say("FAIL no state"); return }
+                st2.present(c.id, mode: .window)
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let w3 = store.workspace(containing: c.id), w3 != w2, let st3 = store.state(ofWorkspace: w3), let win3 = st3.window else { say("FAIL third window"); return }
+                st3.requestCloseWindow()
+                try? await Task.sleep(for: .seconds(0.8))
+                guard let sheet = win3.attachedSheet else { say("FAIL no close question"); return }
+                let buttons = (sheet.contentView?.subviews ?? []).flatMap { [$0] + $0.subviews }.compactMap { ($0 as? NSButton)?.title }
+                say("question buttons \(buttons)")
+                win3.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+                try? await Task.sleep(for: .seconds(1))
+                say(!win3.isVisible && store.workspace(containing: c.id) == w2 ? "PASS moved tabs on close" : "FAIL move on close")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
 
         // Sidebar follows the selected tab, and sessions sort / reorder under their host. TETHER_SELFTEST_SIDEBAR=1.
         if env["TETHER_SELFTEST_SIDEBAR"] != nil {

@@ -228,7 +228,7 @@ struct FileBrowserView: View {
             }
         }
         .sheet(item: $bulk) { action in
-            BulkActionSheet(action: action) { perform($0, b) }
+            BulkActionSheet(action: action) { perform($0, b) }.appLockCover()
         }
         .alert("New Folder", isPresented: $showNewFolder) {
             TextField("Name", text: $newFolderName)

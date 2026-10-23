@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ObjectiveC
+import TetherCore
 
 /// Writes uncaught exceptions and fatal signals with their call stacks to the file named by
 /// TETHER_CRASH_LOG (diagnostics only; off unless the variable is set).
@@ -9,7 +10,7 @@ enum CrashLog {
     nonisolated(unsafe) static var previousPreprocessor: objc_exception_preprocessor?
 
     static func installIfRequested() {
-        guard let path = ProcessInfo.processInfo.environment["TETHER_CRASH_LOG"] else { return }
+        guard let path = AppPaths.debugOverride("TETHER_CRASH_LOG") else { return }
         fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
         guard fd >= 0 else { return }
         // Every Objective-C exception at the point it is thrown (AppKit catches some of them

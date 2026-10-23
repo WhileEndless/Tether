@@ -79,6 +79,7 @@ public final class RemoteStream: @unchecked Sendable {
         }
         do {
             try process.run()
+            AskPassBridge.shared.bindToken(env, pid: process.processIdentifier)
             let data = stdinData
             // Keep stdin open: closing it would end `sh -s` once the script has been read anyway,
             // but some shells read lazily, so the pipe stays open until stop().

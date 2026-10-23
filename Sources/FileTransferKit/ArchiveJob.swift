@@ -73,6 +73,8 @@ final class ArchiveJob: TransferJob {
         do {
             try consumer.run()
             try producer.run()
+            AskPassBridge.shared.bindToken(environment, pid: consumer.processIdentifier)
+            AskPassBridge.shared.bindToken(environment, pid: producer.processIdentifier)
         } catch {
             producer.terminate()
             consumer.terminate()

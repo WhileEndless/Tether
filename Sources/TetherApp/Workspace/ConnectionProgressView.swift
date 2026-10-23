@@ -178,6 +178,10 @@ struct ConnectionProgressCard: View {
             if let removeKeyError {
                 Text(removeKeyError).font(.caption).foregroundStyle(.red)
             }
+            if !model.canRemoveHostKey(change, for: session.descriptor.target) {
+                Text("This warning does not name this connection's host or your ~/.ssh folder, so Tether does not offer to change anything. Check ~/.ssh/known_hosts yourself.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -231,7 +235,7 @@ struct ConnectionProgressCard: View {
                     Button("Edit Host…") { state.hostEditor = HostEditorRequest(alias: alias) }
                 }
                 Button("Close") { model.sessions.close(session.id, killRemote: false) }
-                if failed, progress.hostKeyChange?.knownHostsFile != nil {
+                if failed, let change = progress.hostKeyChange, model.canRemoveHostKey(change, for: session.descriptor.target) {
                     // Never the default button: accepting a changed key must be a deliberate choice.
                     Button("Remove Old Key…") { confirmRemoveKey = true }
                         .disabled(removingKey)

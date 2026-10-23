@@ -5,7 +5,7 @@ import SessionKit
 
 enum InspectorTab: String, CaseIterable, Identifiable {
     case overview = "Overview", processes = "Processes", gpu = "GPU", services = "Services",
-         containers = "Containers", files = "Files", ports = "Ports", logs = "Logs", connections = "Network",
+         containers = "Containers", kubernetes = "Kubernetes", files = "Files", ports = "Ports", logs = "Logs", connections = "Network",
          sessions = "Sessions"
     var id: String { rawValue }
     var icon: String {
@@ -15,6 +15,7 @@ enum InspectorTab: String, CaseIterable, Identifiable {
         case .gpu: "cpu"
         case .services: "gearshape.2"
         case .containers: "shippingbox"
+        case .kubernetes: "circle.hexagongrid"
         case .files: "folder"
         case .ports: "arrow.left.arrow.right.circle"
         case .logs: "doc.text.magnifyingglass"
@@ -44,6 +45,7 @@ struct InspectorContainer: View {
                     case .gpu: GPUPanel(monitor: monitor)
                     case .services: ServicesPanel(monitor: monitor)
                     case .containers: ContainersPanel(monitor: monitor)
+                    case .kubernetes: KubernetesPanel(monitor: monitor)
                     case .files: FileBrowserView(target: target, standalone: false) { dir in
                         state.connect(target, directory: dir)
                     }

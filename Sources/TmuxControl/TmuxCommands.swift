@@ -30,7 +30,7 @@ public enum TmuxCommands {
 
     /// Asks for the active pane id plus state needed to restore the screen.
     public static let paneInfo =
-        "display-message -p '#{pane_id} #{alternate_on} #{cursor_x} #{cursor_y} #{pane_width} #{pane_height}'\n"
+        "display-message -p '#{pane_id} #{alternate_on} #{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size}'\n"
 
     /// Captures pane content with escape sequences.
     /// - Parameters:
@@ -66,6 +66,8 @@ public struct TmuxPaneInfo: Equatable, Sendable {
     public var cursorY: Int
     public var width: Int
     public var height: Int
+    /// Lines in the pane's scrollback on the server.
+    public var historySize: Int
 
     public init?(line: String) {
         let p = line.split(separator: " ").map(String.init)
@@ -76,5 +78,6 @@ public struct TmuxPaneInfo: Equatable, Sendable {
         cursorY = Int(p[3]) ?? 0
         width = Int(p[4]) ?? 80
         height = Int(p[5]) ?? 24
+        historySize = p.count > 6 ? Int(p[6]) ?? 0 : 0
     }
 }

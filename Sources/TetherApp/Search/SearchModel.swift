@@ -4,6 +4,7 @@ import TetherCore
 import SessionKit
 import RecordingKit
 import SearchKit
+import FileTransferKit
 import TerminalUI
 
 /// Which sessions/transcripts a search covers.
@@ -268,13 +269,15 @@ final class SearchModel {
         guard panel.runModal() == .OK, let dir = panel.url else { return }
         let sources = groups.map(\.source)
         Task.detached {
-            for s in sources {
+            // Existing files are never replaced: a taken name becomes "name 2.txt".
+            let names = sources.map { String((($0.host + " - " + $0.title).replacingOccurrences(of: "/", with: "-")).prefix(120)) + ".txt" }
+            let free = LocalFiles.uniqueNames(in: dir, for: names)
+            for (s, name) in zip(sources, free) {
                 let lines: [String]
                 if let l = s.lines { lines = l }
                 else if case .recording(let url, _) = s.kind { lines = (try? SearchEngine.readLines(url)) ?? [] }
                 else { lines = [] }
-                let name = (s.host + " - " + s.title).replacingOccurrences(of: "/", with: "-").prefix(120)
-                try? Data(lines.joined(separator: "\n").utf8).write(to: dir.appendingPathComponent("\(name).txt"))
+                try? Data(lines.joined(separator: "\n").utf8).write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
             }
         }
     }

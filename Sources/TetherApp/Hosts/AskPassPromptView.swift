@@ -27,6 +27,10 @@ struct AskPassPromptView: View {
                     Text(hostLine).font(.subheadline).foregroundStyle(.secondary)
                 }
             }
+            if prompt.request.isServerText {
+                Label("This question was written by the server, not by ssh.", systemImage: "server.rack")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let key = unknownKey {
                 newHostDetails(key)
             } else {
@@ -59,9 +63,15 @@ struct AskPassPromptView: View {
                 .focused($focused)
                 .onSubmit { submit() }
 
+                if prompt.savedWasRejected {
+                    Label("The saved password was not accepted — it may have changed. Type the current one; it replaces the saved one.",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
                     VStack(alignment: .leading, spacing: 3) {
-                        Toggle("Remember in Keychain", isOn: $save)
+                        Toggle(prompt.savedWasRejected ? "Update the saved password" : "Remember in Keychain", isOn: $save)
                         Text(SecretGate.shared.isRequired
                              ? "Saved in your login keychain. Next time, \(SecretGate.shared.methodName) signs you in."
                              : "Saved in your login keychain and used automatically next time.")
@@ -80,7 +90,10 @@ struct AskPassPromptView: View {
         }
         .padding(24)
         .frame(width: 420)
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            if prompt.savedWasRejected { save = true }   // a changed password replaces the old one
+        }
         .task(id: prompt.id) {
             armed = false
             try? await Task.sleep(for: .seconds(1))
@@ -140,13 +153,13 @@ struct AskPassPromptView: View {
 
     private var icon: String {
         if prompt.request.isConfirmation { return "checkmark.shield" }
-        if prompt.request.prompt.lowercased().contains("passphrase") { return "key.fill" }
+        if prompt.request.isPassphrasePrompt { return "key.fill" }
         return "lock.fill"
     }
 
     private var title: String {
         if prompt.request.isConfirmation { return "Verify Host" }
-        if prompt.request.prompt.lowercased().contains("passphrase") { return "Key Passphrase" }
+        if prompt.request.isPassphrasePrompt { return "Key Passphrase" }
         if prompt.request.isPasswordPrompt { return "Password Required" }
         return "Authentication"
     }

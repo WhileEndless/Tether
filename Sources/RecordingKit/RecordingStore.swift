@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import TetherCore
 
 public struct RecordingInfo: Identifiable, Hashable, Sendable {
@@ -94,8 +95,16 @@ public enum RecordingStore {
         let limit = quota ?? quotaBytes
         let days = retentionDays
         lock.unlock()
+        // Leftovers of an interrupted compression or encryption (possibly plain text) go first.
+        removeStaleTemporaryFiles(in: directory, now: now)
         // Compress first: it frees most of the space without losing anything.
         if quota == nil { compressOld(in: directory, now: now) }
+        // Recordings follow the encryption switch once they are closed: those still open when it was
+        // turned on are encrypted, those still open when it was turned off are decrypted (only while
+        // Tether is unlocked, when the key is there).
+        if quota == nil, let key = RecordingCrypto.key {
+            if RecordingCrypto.encryptNew { encryptAll(with: key, in: directory) } else { decryptAll(in: directory) }
+        }
         let fm = FileManager.default
         var items = all(in: directory).sorted { $0.modified < $1.modified } // oldest first
         var removed: [URL] = []
@@ -131,35 +140,60 @@ public enum RecordingStore {
     /// Reads up to `maxBytes` of a recording centred on `fraction` (0…1) of the file.
     /// Returns the data and where the requested position lies within it (0…1).
     public static func slice(of url: URL, around fraction: Double, maxBytes: Int = 16 * 1024 * 1024) -> (Data, Double) {
-        if RecordingCompression.isCompressed(url) { return RecordingCompression.slice(of: url, around: fraction, maxBytes: maxBytes) }
-        guard let h = try? FileHandle(forReadingFrom: url) else { return (Data(), 0) }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        guard size > UInt64(maxBytes) else {
-            try? h.seek(toOffset: 0)
-            return ((try? h.readToEnd()) ?? Data(), fraction)
-        }
-        let center = Double(size) * min(max(fraction, 0), 1)
-        let start = UInt64(max(0, min(center - Double(maxBytes) / 2, Double(size) - Double(maxBytes))))
-        try? h.seek(toOffset: start)
-        var data = (try? h.read(upToCount: maxBytes)) ?? Data()
-        // Start at a line boundary so the replay does not begin inside an escape sequence.
-        var skipped = 0
-        if start > 0, let nl = data.firstIndex(of: 0x0a) {
-            skipped = nl + 1 - data.startIndex
-            data = data.subdata(in: (nl + 1)..<data.endIndex)
-        }
-        return (data, (center - Double(start) - Double(skipped)) / Double(max(data.count, 1)))
+        RecordingReader.slice(of: url, around: fraction, maxBytes: maxBytes)
     }
 
     /// Reads the tail of a recording (bounded so huge logs stay responsive).
     public static func tail(of url: URL, maxBytes: Int = 16 * 1024 * 1024) -> Data {
-        if RecordingCompression.isCompressed(url) { return RecordingCompression.slice(of: url, around: 1, maxBytes: maxBytes).0 }
-        guard let h = try? FileHandle(forReadingFrom: url) else { return Data() }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        try? h.seek(toOffset: start)
-        return (try? h.readToEnd()) ?? Data()
+        RecordingReader.slice(of: url, around: 1, maxBytes: maxBytes).0
+    }
+
+    // MARK: Encryption
+
+    /// Encrypts every inactive plain recording with `key` (when encryption is switched on, and in
+    /// the regular maintenance pass for recordings that were still open then). Returns how many.
+    @discardableResult
+    public static func encryptAll(with key: SymmetricKey, in directory: URL = AppPaths.recordingsDirectory) -> Int {
+        all(in: directory).filter { !$0.isActive && !RecordingCrypto.isEncrypted($0.url, with: key) }
+            .reduce(0) { $0 + (RecordingCrypto.encryptFile($1.url, key: key) ? 1 : 0) }
+    }
+
+    /// Decrypts every inactive recording the loaded key opens (when encryption is switched off).
+    @discardableResult
+    public static func decryptAll(in directory: URL = AppPaths.recordingsDirectory) -> Int {
+        all(in: directory).filter { !$0.isActive && RecordingCrypto.isEncrypted($0.url) }
+            .reduce(0) { $0 + (RecordingCrypto.decryptFile($1.url) ? 1 : 0) }
+    }
+
+    /// Removes `*.tmp` files older than an hour (from an interrupted compression or encryption).
+    static func removeStaleTemporaryFiles(in directory: URL, now: Date = Date()) {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for case let url as URL in e where url.pathExtension == "tmp" {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if now.timeIntervalSince(modified) > 3600 { try? fm.removeItem(at: url) }
+        }
+    }
+
+    /// Whether any recording is encrypted with the key that has this id.
+    public static func anyEncrypted(keyID: Data, in directory: URL = AppPaths.recordingsDirectory) -> Bool {
+        all(in: directory).contains { RecordingCrypto.keyID(of: $0.url) == keyID }
+    }
+
+    /// Deletes every encrypted recording (its key is gone for good).
+    public static func deleteEncrypted(in directory: URL = AppPaths.recordingsDirectory) {
+        for item in all(in: directory) where !item.isActive && RecordingCrypto.isEncrypted(item.url) {
+            try? FileManager.default.removeItem(at: item.url)
+        }
+    }
+
+    /// How many recordings are encrypted, out of how many.
+    public static func encryptionStatus(in directory: URL = AppPaths.recordingsDirectory) -> (encrypted: Int, total: Int) {
+        let items = all(in: directory)
+        let key = RecordingCrypto.key
+        let encrypted = items.filter { item in
+            key.map { RecordingCrypto.isEncrypted(item.url, with: $0) } ?? RecordingCrypto.isEncrypted(item.url)
+        }
+        return (encrypted.count, items.count)
     }
 }

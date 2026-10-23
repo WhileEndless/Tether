@@ -251,5 +251,6 @@ struct LogSheet: View {
             .background(Color(nsColor: .textBackgroundColor))
         }
         .frame(width: 760, height: 520)
+        .appLockCover()
     }
 }

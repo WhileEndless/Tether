@@ -45,6 +45,17 @@ struct MenuBarContent: View {
     }
 
     var body: some View {
+        if AppLock.shared.isLocked {
+            Button("Unlock Tether…") { open() }
+            Divider()
+            Button("Quit Tether") { NSApp.terminate(nil) }
+        } else {
+            unlockedMenu
+        }
+    }
+
+    @ViewBuilder
+    private var unlockedMenu: some View {
         Button("Open Tether") { open() }
             .keyboardShortcut("o")
         Button("New Connection…") {

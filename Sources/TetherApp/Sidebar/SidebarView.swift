@@ -33,6 +33,19 @@ struct SidebarView: View {
         }
     }
 
+    /// A tab shown in another window was clicked: that window comes forward, and this sidebar keeps
+    /// pointing at this window's own tab instead of a row that is not here.
+    private func keepOwnSelection(_ clicked: UUID) {
+        guard let ws = model.workspaces.workspace(containing: clicked), ws != state.workspaceID else { return }
+        DispatchQueue.main.async {
+            switch state.selectedItem {
+            case .terminal(let s)?: state.sidebarSelection = .session(s.id)
+            case .files(let f)?: state.sidebarSelection = .files(f.id)
+            case nil: state.sidebarSelection = nil
+            }
+        }
+    }
+
     /// Selects a tab's row in the sidebar, unfolding whatever hides it (its group, its host, "Show more").
     private func reveal(_ id: UUID?, proxy: ScrollViewProxy) {
         guard let id, let item = state.item(id) else {
@@ -102,9 +115,9 @@ struct SidebarView: View {
         .onChange(of: state.sidebarSelection) { _, item in
             switch item {
             case .session(let id):
-                if id != state.workspace.selected, let s = model.sessions.session(id) { state.show(s) }
+                if id != state.workspace.selected, let s = model.sessions.session(id) { state.show(s); keepOwnSelection(id) }
             case .files(let id):
-                if id != state.workspace.selected, let t = model.fileTabs.tab(id) { state.show(t) }
+                if id != state.workspace.selected, let t = model.fileTabs.tab(id) { state.show(t); keepOwnSelection(id) }
             case .host:
                 // Clicking a host shows its details in the host panel.
                 state.inspectorTab = .overview
@@ -720,6 +733,7 @@ struct SessionRow: View {
 
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
+        let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID)
         HStack(spacing: 6) {
             Image(systemName: session.phase.isSuspended ? "pause.circle.fill" : inBackground ? "moon.zzz.fill" : "terminal")
                 .font(.caption)
@@ -730,7 +744,8 @@ struct SessionRow: View {
             }
             Text(session.displayTitle)
                 .lineLimit(1)
-                .foregroundStyle(session.phase.isDead ? .secondary : .primary)
+                .foregroundStyle(session.phase.isDead || elsewhere != nil ? .secondary : .primary)
+            if let elsewhere { OtherWindowBadge(name: elsewhere) }
             if inBackground && !session.phase.isSuspended {
                 Text("background").font(.caption2).foregroundStyle(.secondary)
             }
@@ -753,7 +768,8 @@ struct SessionRow: View {
         .padding(.leading, 22)
         .tag(SidebarItem.session(session.id))
         .id(SidebarItem.session(session.id))
-        .help(inBackground ? "In the background — click to open in a tab · double-click to rename" : "Double-click to rename")
+        .help(elsewhere.map { "Open in \($0) — click to go there · right-click to move it here" }
+              ?? (inBackground ? "In the background — click to open in a tab · double-click to rename" : "Double-click to rename"))
     }
 }
 
@@ -842,6 +858,13 @@ struct SessionContextMenu: View {
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
         Button(session.phase.isSuspended ? "Reconnect" : inBackground ? "Open in Tab" : "Show") { state.show(session) }
+        if let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID) {
+            Button("Move from \(elsewhere) to This Window") {
+                let source = model.workspaces.workspace(containing: session.id)
+                model.workspaces.add(session.id, to: state.workspaceID)
+                if let source { model.workspaces.closeIfEmpty(source) }
+            }
+        }
         Button("Browse Files Here") { state.openFiles(session.descriptor.target, path: session.currentDirectory) }
         SearchInSessionButton(session: session)
         Button("Rename…") { state.renamingSession = session }
@@ -867,13 +890,31 @@ struct SessionContextMenu: View {
     }
 }
 
+/// Says which other window shows a tab ("Window 2").
+struct OtherWindowBadge: View {
+    let name: String
+
+    var body: some View {
+        Label(name, systemImage: "macwindow")
+            .labelStyle(.titleAndIcon)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(Capsule().fill(.quaternary))
+            .lineLimit(1)
+            .fixedSize()
+    }
+}
+
 /// A file manager tab under its host (open in a window, or kept in the background).
 struct FileTabRow: View {
     @Environment(AppModel.self) private var model
+    @Environment(WindowState.self) private var state
     let tab: FileTab
 
     var body: some View {
         let open = model.workspaces.workspace(containing: tab.id) != nil
+        let elsewhere = model.workspaces.otherWindowName(of: tab.id, here: state.workspaceID)
         HStack(spacing: 6) {
             Image(systemName: open ? "folder.fill" : "folder")
                 .font(.caption)
@@ -881,6 +922,8 @@ struct FileTabRow: View {
                 .frame(width: 16)
             Text(model.fileTabs.title(of: tab))
                 .lineLimit(1)
+                .foregroundStyle(elsewhere != nil ? .secondary : .primary)
+            if let elsewhere { OtherWindowBadge(name: elsewhere) }
             if !open {
                 Text("background").font(.caption2).foregroundStyle(.secondary)
             }
@@ -888,7 +931,8 @@ struct FileTabRow: View {
         .padding(.leading, 22)
         .tag(SidebarItem.files(tab.id))
         .id(SidebarItem.files(tab.id))
-        .help(open ? "File manager tab" : "File manager in the background — click to open")
+        .help(elsewhere.map { "Open in \($0) — click to go there" }
+              ?? (open ? "File manager tab" : "File manager in the background — click to open"))
     }
 }
 

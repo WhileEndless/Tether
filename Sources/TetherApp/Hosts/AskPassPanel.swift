@@ -10,7 +10,8 @@ final class AskPassPanel {
     private var shownID: UUID?
 
     func update(_ prompt: PendingPrompt?) {
-        guard let prompt else {
+        // Behind the lock screen nothing is asked; the prompt waits and appears after unlocking.
+        guard let prompt, !AppLock.shared.isLocked else {
             panel?.orderOut(nil)
             shownID = nil
             return

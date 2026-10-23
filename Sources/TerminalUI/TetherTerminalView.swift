@@ -1,5 +1,6 @@
 import AppKit
 import SwiftTerm
+import RecordingKit
 import TetherCore
 import SessionKit
 
@@ -132,6 +133,25 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public var cellSize: (cols: Int, rows: Int) {
         let t = getTerminal()
         return (t.cols, t.rows)
+    }
+
+    public func screenTail(maxRows: Int) -> (lines: [String], lastRow: Int)? {
+        let t = getTerminal()
+        guard !t.isCurrentBufferAlternate else { return nil }
+        // The screen itself, wherever the view is scrolled to.
+        var total = t.buffer.totalLinesTrimmed
+        while t.getScrollInvariantLine(row: total) != nil { total += 1 }
+        let top = total - t.rows
+        let rows = (0..<t.rows).map { r in
+            (t.getScrollInvariantLine(row: top + r)?.translateToString(trimRight: true) ?? "").replacingOccurrences(of: "\0", with: "")
+        }.map { line -> String in
+            var s = line
+            while s.last == " " { s.removeLast() }
+            return s
+        }
+        guard let last = rows.lastIndex(where: { !$0.isEmpty }) else { return nil }
+        let first = max(0, last - maxRows + 1)
+        return (Array(rows[first...last]), last)
     }
 
     func sendMapped(_ bytes: [UInt8]) {
@@ -436,31 +456,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         changeScrollback(settings.scrollbackLines)
     }
 
-    /// The last `lines` lines of a file, starting at a line boundary, read backwards in blocks.
+    /// The last `lines` lines of the recording (plain, encrypted or compressed).
     static func tail(of url: URL, lines: Int) -> [UInt8]? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size > 0 else { return nil }
-        let block: UInt64 = 1 << 20
-        var offset = size
-        var newlines = 0
-        var start: UInt64 = 0
-        outer: while offset > 0 {
-            let read = min(block, offset)
-            offset -= read
-            try? handle.seek(toOffset: offset)
-            guard let data = try? handle.read(upToCount: Int(read)) else { return nil }
-            var i = data.count - 1
-            while i >= 0 {
-                if data[data.startIndex + i] == 0x0a {
-                    newlines += 1
-                    if newlines > lines { start = offset + UInt64(i) + 1; break outer }
-                }
-                i -= 1
-            }
-        }
-        try? handle.seek(toOffset: start)
-        return (try? handle.readToEnd()).map { Array($0) }
+        RecordingReader.tail(of: url, lines: lines)
     }
 
     /// Number of lines dropped from memory so far (still available in the recording).
@@ -480,8 +478,12 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         }
     }
 
+    /// OSC 52 from the server. Only the terminal being worked in may set the clipboard: not a tab in
+    /// the background, another window, or anything while Tether is not the active app (or locked,
+    /// when no terminal has the keyboard) — so a server cannot swap what was just copied.
     public func clipboardCopy(source: TerminalView, content: Data) {
-        guard let text = String(data: content, encoding: .utf8) else { return }
+        guard NSApp.isActive, let window, window.isKeyWindow, window.firstResponder === self,
+              let text = String(data: content, encoding: .utf8) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }

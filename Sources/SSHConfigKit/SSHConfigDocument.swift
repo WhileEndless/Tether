@@ -172,12 +172,14 @@ public struct SSHConfigDocument: Sendable {
         case hostNotFound(String)
         case hostExists(String)
         case invalidAlias(String)
+        case invalidValue(String)
 
         public var errorDescription: String? {
             switch self {
             case .hostNotFound(let a): "Host \"\(a)\" was not found in the config file."
             case .hostExists(let a): "A host named \"\(a)\" already exists."
             case .invalidAlias(let a): "\"\(a)\" is not a valid host alias."
+            case .invalidValue(let k): "The value for \(k) must be a single line without control characters."
             }
         }
     }
@@ -194,6 +196,7 @@ public struct SSHConfigDocument: Sendable {
     /// An empty array removes the option.
     public mutating func setOption(_ key: String, values: [String], forHost alias: String) throws {
         guard let entry = host(named: alias) else { throw EditError.hostNotFound(alias) }
+        guard Self.isValidKeyword(key), values.allSatisfy(Self.isValidValue) else { throw EditError.invalidValue(key) }
         let existing = entry.options.filter { $0.key.caseInsensitiveCompare(key) == .orderedSame }
         let indent = indentation(for: entry)
         let keyText = existing.first?.key ?? key
@@ -218,10 +221,20 @@ public struct SSHConfigDocument: Sendable {
         !alias.isEmpty && !alias.contains(where: { $0.isWhitespace || $0 == "\"" || $0 == "#" })
     }
 
+    /// One line, no control characters: a pasted value can never add lines (e.g. a ProxyCommand).
+    public static func isValidValue(_ value: String) -> Bool {
+        !value.unicodeScalars.contains { $0.properties.generalCategory == .control }
+    }
+
+    static func isValidKeyword(_ key: String) -> Bool {
+        !key.isEmpty && key.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+    }
+
     /// Appends a new Host block at the end of the file.
     public mutating func addHost(_ alias: String, options: [(String, String)]) throws {
         guard Self.isValidAlias(alias) else { throw EditError.invalidAlias(alias) }
         guard host(named: alias) == nil else { throw EditError.hostExists(alias) }
+        for (k, v) in options where !Self.isValidKeyword(k) || !Self.isValidValue(v) { throw EditError.invalidValue(k) }
         if let last = lines.last, !last.trimmingCharacters(in: .whitespaces).isEmpty { lines.append("") }
         lines.append("Host \(alias)")
         for (k, v) in options where !v.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -254,6 +267,7 @@ public struct SSHConfigDocument: Sendable {
     /// Replaces the full block body for a host with the given ordered options.
     public mutating func replaceOptions(forHost alias: String, with options: [(String, String)]) throws {
         guard let entry = host(named: alias) else { throw EditError.hostNotFound(alias) }
+        for (k, v) in options where !Self.isValidKeyword(k) || !Self.isValidValue(v) { throw EditError.invalidValue(k) }
         let indent = indentation(for: entry)
         // Keep comment lines inside the block, rewrite option lines.
         let bodyRange = (entry.headerLine + 1)..<entry.endLine

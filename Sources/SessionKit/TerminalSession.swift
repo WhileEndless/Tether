@@ -13,6 +13,7 @@ public struct SessionConfiguration: Sendable {
     public var reconnectBaseDelay: Double
     public var reconnectMaxDelay: Double
     public var historyLinesOnReattach: Int
+    public var serverHistoryLines: Int
     public var recordingEnabled: Bool
     public var stallTimeout: Double
     public var detectPasswordPrompts: Bool
@@ -24,6 +25,7 @@ public struct SessionConfiguration: Sendable {
         reconnectBaseDelay = max(settings.reconnectBaseDelay, 0.5)
         reconnectMaxDelay = max(settings.reconnectMaxDelay, settings.reconnectBaseDelay)
         historyLinesOnReattach = settings.historyLinesOnReattach
+        serverHistoryLines = settings.serverHistoryLines
         recordingEnabled = settings.recordingEnabled
         stallTimeout = max(settings.stallTimeout, 3)
         detectPasswordPrompts = settings.detectPasswordPrompts
@@ -153,7 +155,39 @@ public final class TerminalSession: Identifiable {
 
     // MARK: Public API
 
-    private static let shells: Set<String> = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "-bash", "-zsh", "-sh"]
+    public static let shells: Set<String> = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "-bash", "-zsh", "-sh"]
+
+    /// The program in the foreground of the terminal right now, when tmux can tell (nil otherwise:
+    /// screen, plain shells, or no answer within 2 s).
+    public func foregroundCommand() async -> String? {
+        await tmuxQuery("#{pane_current_command}")
+    }
+
+    /// The process in the terminal's foreground, as the host sees it: the program, the real user who
+    /// started it, and its arguments. For a password prompt this says whose password is meant —
+    /// `sudo` asks for its caller's, `su` for its target user's (both prompts may just say
+    /// "Password:", as on macOS). nil when tmux or `ps` cannot tell.
+    public func foregroundProcess() async -> ForegroundProcess? {
+        guard let command = await foregroundCommand(), !command.isEmpty,
+              let tty = await tmuxQuery("#{pane_tty}"), !tty.isEmpty else { return nil }
+        let name = tty.hasPrefix("/dev/") ? String(tty.dropFirst(5)) : tty
+        let executor = RemoteExecutor(target: descriptor.target, options: sshOptions(configurationProvider()))
+        let r = await executor.run(script: #"ps -t "$1" -o stat=,ruser=,args= 2>/dev/null"#, arguments: [name], timeout: 5, purpose: "monitor")
+        guard r.succeeded, let found = ForegroundProcess.parse(ps: r.output, command: command) else { return nil }
+        return found
+    }
+
+    private func tmuxQuery(_ format: String) async -> String? {
+        guard let tmux else { return nil }
+        return await withTaskGroup(of: String?.self) { group in
+            group.addTask { @MainActor in await tmux.query(format) }
+            group.addTask { try? await Task.sleep(for: .seconds(2)); return nil }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            if first == nil { tmux.answerForegroundQueries(nil) }
+            return first
+        }
+    }
 
     /// Tab title: a custom name if the user set one, otherwise derived from what is running.
     public var displayTitle: String {
@@ -252,7 +286,9 @@ public final class TerminalSession: Identifiable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { process?.terminate() }
         AskPassBridge.shared.revoke(environment: askPassEnv)
         recorder?.mark("Disconnected (suspended) \(Date().formatted(date: .omitted, time: .standard))")
-        display(Array("\r\n\u{1b}[2m[Tether] Disconnected. The session keeps running on the server.\u{1b}[0m\r\n".utf8))
+        if persistence != .tmux {   // tmux: keep the screen as it was (see showLostNotice)
+            display(Array("\r\n\u{1b}[2m[Tether] Disconnected. The session keeps running on the server.\u{1b}[0m\r\n".utf8))
+        }
         attempt = 0
         phase = .suspended
     }
@@ -308,6 +344,13 @@ public final class TerminalSession: Identifiable {
         // Give the kill/detach command a moment to reach the server before dropping the connection.
         let process = self.process
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { process?.terminate() }
+        // Nothing was done in it: keep no recording, only the fact that it was opened.
+        if wasOnline && isUnused {
+            recorder?.discard()
+            recorder = nil
+            finish(reason: "Opened — closed without running anything", archive: true)
+            return
+        }
         finish(reason: killRemote ? "Closed by user" : "Detached by user", archive: wasOnline)
     }
 
@@ -443,17 +486,20 @@ public final class TerminalSession: Identifiable {
         }
         let remote = RemoteBootstrap.command(mode: mode, sessionName: descriptor.remoteSessionName,
                                              attachOnly: attachOnly, size: sink?.cellSize ?? (80, 24),
-                                             directory: attachOnly ? nil : descriptor.initialDirectory)
+                                             directory: attachOnly ? nil : descriptor.initialDirectory,
+                                             historyLimit: config.serverHistoryLines)
         let local = descriptor.target.isLocal
         let executable = local ? "/bin/sh" : sshOptions(config).sshBinary
         let args = local ? ["-c", remote] : sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: remote)
 
         AskPassBridge.shared.revoke(environment: askPassEnv)
         // "prefer" makes password prompts appear as a native sheet (with keychain support),
-        // which also works while input is blocked during a reconnect.
-        askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
+        // which also works while input is blocked during a reconnect. Never for local shells: every
+        // program started there could use the token to ask Tether for saved secrets.
+        askPassEnv = local ? [:] : AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
 
         var env = ProcessInfo.processInfo.environment
+        for key in ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "TETHER_ASKPASS_SOCKET", "TETHER_ASKPASS_TOKEN"] { env[key] = nil }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["TERM_PROGRAM"] = "Tether"
@@ -469,6 +515,7 @@ public final class TerminalSession: Identifiable {
         process.startProcess(executable: executable, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh",
                              currentDirectory: local ? (descriptor.initialDirectory ?? NSHomeDirectory()) : nil)
+        AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
     }
 
     /// Windows hosts: an interactive PowerShell over ssh. There is no tmux or screen on Windows,
@@ -501,6 +548,7 @@ public final class TerminalSession: Identifiable {
         self.process = process
         process.startProcess(executable: sshOptions(config).sshBinary, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: "ssh")
+        AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
         markerResolved = true
         progress?.detail = "Starting PowerShell"
         handleMarker(.plain)
@@ -580,7 +628,12 @@ public final class TerminalSession: Identifiable {
                                     ownSession: descriptor.remoteSessionName.hasPrefix("tether-"))
             driver.write = { [weak self] text in self?.process?.send(data: Array(text.utf8)[...]) }
             driver.display = { [weak self] bytes in self?.display(bytes) }
+            driver.refresh = { [weak self] bytes in self?.sink?.feed(bytes[...]) }
             driver.size = { [weak self] in self?.sink?.cellSize ?? (80, 24) }
+            driver.screenTail = { [weak self] in
+                self?.sink?.screenTail(maxRows: 12).map { HistoryCatchUp.Anchor(lines: $0.lines, lastRow: $0.lastRow) }
+            }
+            driver.catchUpLimit = max(configurationProvider().serverHistoryLines, TmuxDriver.catchUpProbe)
             driver.onReady = { [weak self] in self?.becameOnline() }
             driver.onExit = { [weak self] reason in self?.tmuxExitReason = .some(reason) }
             driver.onActivity = { [weak self] command, path, rtt in
@@ -773,9 +826,12 @@ public final class TerminalSession: Identifiable {
 
     private func showLostNotice() {
         guard wasOnline else { return }
+        recorder?.mark("Connection lost \(Date().formatted(date: .omitted, time: .standard))")
+        // tmux: the banner above the terminal says it; the screen stays exactly as tmux left it, so
+        // what the server prints meanwhile can be added seamlessly on reconnect (HistoryCatchUp).
+        guard persistence != .tmux else { return }
         let notice = "\r\n\u{1b}[2m[Tether] Connection lost. History is kept; input is paused until the session is back.\u{1b}[0m\r\n"
         display(Array(notice.utf8))
-        recorder?.mark("Connection lost \(Date().formatted(date: .omitted, time: .standard))")
     }
 
     private func display(_ raw: [UInt8]) {
@@ -843,3 +899,42 @@ final class ProcessBridge: LocalProcessDelegate {
         MainActor.assumeIsolated { owner?.windowSize ?? winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0) }
     }
 }
+
+/// A process in a terminal's foreground (see `TerminalSession.foregroundProcess`).
+public struct ForegroundProcess: Equatable, Sendable {
+    /// Program name, e.g. "sudo".
+    public var command: String
+    /// The real user who started it (for sudo and su: the one who typed the command).
+    public var user: String
+    /// Its arguments, without the program itself.
+    public var arguments: [String]
+
+    /// For `su`: the account whose password it asks for (`su - bob` → bob, plain `su` → root).
+    public var suTarget: String {
+        var skipNext = false
+        for a in arguments {
+            if skipNext { skipNext = false; continue }
+            if ["-c", "--command", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-w", "--whitelist-environment"].contains(a) { skipNext = true; continue }
+            if a.hasPrefix("-") { continue }
+            return a
+        }
+        return "root"
+    }
+
+    /// Picks the foreground process (`+` in its state) running `command` from `ps -o stat=,ruser=,args=`.
+    public static func parse(ps output: String, command: String) -> ForegroundProcess? {
+        var fallback: ForegroundProcess?
+        for line in output.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).map(String.init)
+            guard f.count == 3, f[0].contains("+") else { continue }
+            let words = f[2].split(separator: " ").map(String.init)
+            guard let first = words.first else { continue }
+            let name = (first as NSString).lastPathComponent.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            let p = ForegroundProcess(command: name, user: f[1], arguments: Array(words.dropFirst()))
+            if name == command { return p }
+            fallback = p
+        }
+        return fallback.map { ForegroundProcess(command: command, user: $0.user, arguments: []) }
+    }
+}
+

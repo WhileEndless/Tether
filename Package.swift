@@ -36,7 +36,7 @@ let package = Package(
 
         // Terminal view, theme and keyboard handling.
         .target(name: "TerminalUI", dependencies: [
-            "TetherCore", "SessionKit",
+            "TetherCore", "SessionKit", "RecordingKit",
             .product(name: "SwiftTerm", package: "SwiftTerm"),
         ]),
 
@@ -68,7 +68,7 @@ let package = Package(
         .testTarget(name: "SSHConfigKitTests", dependencies: ["SSHConfigKit"]),
         .testTarget(name: "TmuxControlTests", dependencies: ["TmuxControl"]),
         .testTarget(name: "MonitorKitTests", dependencies: ["MonitorKit"]),
-        .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore"]),
+        .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore", "SearchKit"]),
         .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore"]),
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
         .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit"]),

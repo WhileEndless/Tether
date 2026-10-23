@@ -82,6 +82,7 @@ public enum ProcessRunner {
             }
             do {
                 try process.run()
+                if let environment { AskPassBridge.shared.bindToken(environment, pid: process.processIdentifier) }
             } catch {
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil

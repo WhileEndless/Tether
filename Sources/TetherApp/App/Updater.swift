@@ -46,7 +46,8 @@ final class Updater {
     static func parse(_ data: Data) -> Release? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tag = json["tag_name"] as? String,
-              let page = (json["html_url"] as? String).flatMap(URL.init(string:)) else { return nil }
+              let page = (json["html_url"] as? String).flatMap(URL.init(string:)),
+              page.scheme == "https", page.host == "github.com" else { return nil }   // only ever a GitHub page
         return Release(version: tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV")), page: page)
     }
 

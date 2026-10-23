@@ -49,7 +49,10 @@ struct SessionPane: View {
                 HostStatusStrip(session: session)
             }
             ZStack(alignment: .top) {
-                TerminalHost(session: session)
+                // No keyboard for terminals behind the lock screen; it comes back on unlock.
+                TerminalHost(session: session, focused: !AppLock.shared.isLocked, isCurrent: { [workspaceID = state.workspaceID] in
+                    AppModel.shared.workspaces.workspace(containing: session.id) == workspaceID
+                })
                     .padding(.leading, 6)
                     .background(TerminalBackground(settings: model.settings))
                 if let progress = session.progress, showsProgressCard {
@@ -93,6 +96,11 @@ struct SessionPane: View {
                 }
             }
             .animation(.snappy, value: session.passwordPrompt)
+            // Keys typed at a password prompt are hidden from other apps (Secure Keyboard Entry).
+            .onChange(of: session.passwordPrompt != nil && model.settings.secureKeyboardAtPasswordPrompts, initial: true) { _, asking in
+                SecureInput.set(asking, for: session.id)
+            }
+            .onDisappear { SecureInput.set(false, for: session.id) }
             .animation(.snappy, value: model.uploadBatches[session.id]?.id)
             .animation(.snappy, value: olderHistoryOnDisk)
             .animation(.smooth(duration: 0.25), value: session.progress == nil)

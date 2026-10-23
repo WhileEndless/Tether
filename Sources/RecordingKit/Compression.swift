@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Compression
 
 /// Compresses old recordings with LZFSE (fast, typically 5–10× smaller for terminal output) and
@@ -9,73 +10,61 @@ public enum RecordingCompression {
     public static func isCompressed(_ url: URL) -> Bool { url.pathExtension == compressedExtension }
 
     /// Compresses `url` into `url.lzfse`, keeps its modification date, then removes the original.
+    /// An encrypted recording (or any, while encryption is on) stays encrypted: compressed, then encrypted.
     @discardableResult
-    public static func compress(_ url: URL) throws -> URL {
+    public static func compress(_ url: URL, key loaded: SymmetricKey? = RecordingCrypto.key,
+                                encryptPlain: Bool = RecordingCrypto.encryptNew) throws -> URL {
         let out = url.appendingPathExtension(compressedExtension)
         let tmp = out.appendingPathExtension("tmp")
         let fm = FileManager.default
+        let key = try RecordingCrypto.readingKey(for: url, loaded: loaded) ?? (encryptPlain ? loaded : nil)
         fm.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600])
-        guard let input = try? FileHandle(forReadingFrom: url), let output = try? FileHandle(forWritingTo: tmp) else {
-            throw CocoaError(.fileReadUnknown)
+        // Never leave a half-written file behind (it may hold the recording in plain text).
+        var finished = false
+        defer { if !finished { try? fm.removeItem(at: tmp) } }
+        guard let output = try? FileHandle(forWritingTo: tmp) else { throw CocoaError(.fileWriteUnknown) }
+        defer { try? output.close() }
+        var pending = Data()
+        let file = key.map(RecordingCrypto.newFile)
+        var index = 0
+        func emit(_ data: Data, final: Bool) throws {
+            guard let sealer = file?.sealer else { try output.write(contentsOf: data); return }
+            pending += data
+            while pending.count >= RecordingCrypto.fileFrameBytes || (final && !pending.isEmpty) {
+                let chunk = pending.prefix(RecordingCrypto.fileFrameBytes)
+                pending.removeFirst(chunk.count)
+                guard let f = RecordingCrypto.frame(Data(chunk), sealer: sealer, index: index) else { throw RecordingCrypto.Failure.corrupt }
+                try output.write(contentsOf: f)
+                index += 1
+            }
         }
-        defer { try? input.close(); try? output.close() }
+        if let file { try output.write(contentsOf: file.header) }
         let filter = try OutputFilter(.compress, using: .lzfse) { data in
-            if let data { try output.write(contentsOf: data) }
+            if let data { try emit(data, final: false) }
         }
-        while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+        try RecordingReader.forEachChunk(of: url, key: loaded) { chunk in
             try filter.write(chunk)
+            return true
         }
         try filter.finalize()
+        try emit(Data(), final: true)
         try output.close()
         let date = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
         try fm.moveItem(at: tmp, to: out)
+        finished = true
         if let date { try? fm.setAttributes([.modificationDate: date], ofItemAtPath: out.path) }
         try fm.removeItem(at: url)
         return out
     }
 
-    /// Calls `body` with successive chunks of the (decompressed) recording. Return false to stop.
+    /// Calls `body` with successive chunks of the (decrypted, decompressed) recording. Return false to stop.
     public static func forEachChunk(of url: URL, _ body: (Data) throws -> Bool) throws {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
-        defer { try? handle.close() }
-        if !isCompressed(url) {
-            while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty {
-                if try !body(chunk) { return }
-            }
-            return
-        }
-        let filter = try InputFilter(.decompress, using: .lzfse) { length in
-            try handle.read(upToCount: length)
-        }
-        while let chunk = try filter.readData(ofLength: 4 << 20), !chunk.isEmpty {
-            if try !body(chunk) { return }
-        }
+        try RecordingReader.forEachChunk(of: url, body)
     }
 
     /// The decompressed contents, keeping at most `maxBytes` around `fraction` (0…1) of the file.
     /// Returns the data and the position of `fraction` inside it.
     public static func slice(of url: URL, around fraction: Double, maxBytes: Int) -> (Data, Double) {
-        var all = Data()
-        var dropped = 0
-        // Without knowing the decompressed size up front, keep a sliding window of 2×maxBytes.
-        try? forEachChunk(of: url) { chunk in
-            all.append(chunk)
-            if all.count > maxBytes * 2 {
-                let cut = all.count - maxBytes * 2
-                all.removeSubrange(0..<cut)
-                dropped += cut
-            }
-            return true
-        }
-        let total = Double(dropped + all.count)
-        let center = total * min(max(fraction, 0), 1) - Double(dropped)
-        let start = max(0, min(Int(center) - maxBytes / 2, all.count - maxBytes))
-        var data = all.subdata(in: start..<min(start + maxBytes, all.count))
-        var skipped = 0
-        if start > 0, let nl = data.firstIndex(of: 0x0a) {
-            skipped = nl + 1 - data.startIndex
-            data = data.subdata(in: (nl + 1)..<data.endIndex)
-        }
-        return (data, (center - Double(start) - Double(skipped)) / Double(max(data.count, 1)))
+        RecordingReader.slice(of: url, around: fraction, maxBytes: maxBytes)
     }
 }

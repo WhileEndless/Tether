@@ -20,8 +20,12 @@ public enum RemoteBootstrap {
     ///   - size: initial terminal size, so a new tmux session starts at the right size instead of
     ///     80x24 followed by a resize (which makes shells like zsh redraw their prompt).
     ///   - directory: start directory for a new session (ignored when re-attaching).
+    ///   - historyLimit: scrollback lines the server keeps for a new session (tmux `history-limit`,
+    ///     screen `defscrollback`), so output printed while Tether is not connected is still there.
+    ///     Set on that session only; the user's own sessions and tmux settings are not touched.
     public static func command(mode: PersistenceMode, sessionName: String, attachOnly: Bool,
-                               size: (cols: Int, rows: Int) = (80, 24), directory: String? = nil) -> String {
+                               size: (cols: Int, rows: Int) = (80, 24), directory: String? = nil,
+                               historyLimit: Int = 100_000) -> String {
         let m: String = switch mode {
         case .auto: "auto"
         case .tmux: "tmux"
@@ -30,7 +34,7 @@ public enum RemoteBootstrap {
         }
         // Kept on a single line: some login shells (csh) reject newlines inside quotes.
         let parts = [
-            "N=\"$1\"", "M=\"$2\"", "A=\"$3\"", "W=\"$4\"", "H=\"$5\"", "D=\"$6\"",
+            "N=\"$1\"", "M=\"$2\"", "A=\"$3\"", "W=\"$4\"", "H=\"$5\"", "D=\"$6\"", "L=\"$7\"",
             "if [ -n \"$D\" ]; then cd \"$D\" 2>/dev/null || D=\"\"; fi",
             "mark() { printf '\\033]7770;%s\\007' \"$1\"; }",
             // tmux >= 3.0 in control mode
@@ -38,15 +42,30 @@ public enum RemoteBootstrap {
                 + "V=$(tmux -V 2>/dev/null | sed 's/^[^0-9]*//;s/[^0-9.].*$//'); MAJ=${V%%.*}; "
                 + "if [ \"${MAJ:-0}\" -ge 3 ] 2>/dev/null; then "
                 + "if [ \"$A\" = 1 ] && ! tmux has-session -t \"=$N\" 2>/dev/null; then mark gone; exit 0; fi; "
-                + "mark \"mode=tmux;v=$V\"; if [ -n \"$D\" ]; then exec tmux -CC new-session -A -s \"$N\" -x \"$W\" -y \"$H\" -c \"$D\"; fi; "
+                + "mark \"mode=tmux;v=$V\"; "
+                // A new session gets its history limit before its window exists (tmux applies the
+                // limit when a pane is created): start with a placeholder window, set the option on
+                // this session only, open the real window, drop the placeholder.
+                + "if ! tmux has-session -t \"=$N\" 2>/dev/null && [ \"${L:-0}\" -gt 0 ] 2>/dev/null "
+                + "&& tmux new-session -d -s \"$N\" -n tether-init -x \"$W\" -y \"$H\" 2>/dev/null; then "
+                + "tmux set-option -t \"=$N:\" history-limit \"$L\" >/dev/null 2>&1; "
+                + "if [ -n \"$D\" ]; then tmux new-window -t \"=$N:\" -c \"$D\" 2>/dev/null; else tmux new-window -t \"=$N:\" 2>/dev/null; fi "
+                + "&& tmux kill-window -t \"=$N:tether-init\" 2>/dev/null; "
+                + "exec tmux -CC attach-session -t \"=$N\"; fi; "
+                + "if [ -n \"$D\" ]; then exec tmux -CC new-session -A -s \"$N\" -x \"$W\" -y \"$H\" -c \"$D\"; fi; "
                 + "exec tmux -CC new-session -A -s \"$N\" -x \"$W\" -y \"$H\"; "
                 + "fi; fi; fi",
             // GNU screen with the alternate screen disabled so local scrollback keeps history
             "if [ \"$M\" = auto ] || [ \"$M\" = screen ]; then if command -v screen >/dev/null 2>&1; then "
                 + "if [ \"$A\" = 1 ] && ! screen -ls 2>/dev/null | grep -q \"[.]$N[[:space:]]\"; then mark gone; exit 0; fi; "
-                + "R=\"${TMPDIR:-/tmp}/.tether-screenrc-$(id -u)\"; "
-                + "printf 'termcapinfo xterm* ti@:te@\\ndefscrollback 10000\\nstartup_message off\\nvbell off\\n' > \"$R\" 2>/dev/null; "
-                + "mark mode=screen; exec screen -c \"$R\" -D -RR -S \"$N\"; "
+                // A private settings file with a random name: /tmp is shared, and a file planted
+                // there by another account must never be read as this user's screen settings.
+                + "R=$(umask 077; mktemp \"${TMPDIR:-/tmp}/.tether-screenrc.XXXXXXXX\" 2>/dev/null) || R=\"\"; "
+                + "if [ -n \"$R\" ] && [ -O \"$R\" ] && [ ! -L \"$R\" ] && "
+                + "printf 'termcapinfo xterm* ti@:te@\\ndefscrollback %s\\nstartup_message off\\nvbell off\\n' \"${L:-10000}\" > \"$R\"; then "
+                + "(sleep 10; rm -f \"$R\") >/dev/null 2>&1 & "
+                + "mark mode=screen; exec screen -c \"$R\" -D -RR -S \"$N\"; fi; "
+                + "mark mode=screen; exec screen -D -RR -S \"$N\"; "
                 + "fi; fi",
             // Plain shell: nothing survives a disconnect, so a re-attach always reports gone.
             "if [ \"$A\" = 1 ]; then mark gone; exit 0; fi",
@@ -55,7 +74,7 @@ public enum RemoteBootstrap {
         ]
         let script = parts.joined(separator: "; ")
         return "sh -c " + script.shellQuoted + " tether " + [sessionName, m, attachOnly ? "1" : "0", String(max(size.cols, 20)), String(max(size.rows, 4)),
-                                                  directory ?? ""]
+                                                  directory ?? "", String(max(historyLimit, 0))]
             .map(\.shellQuoted).joined(separator: " ")
     }
 

@@ -3,9 +3,23 @@ import TetherCore
 import SessionKit
 
 extension AppModel {
-    /// The keychain item for the password prompt showing in `session`, if any.
+    /// The keychain item for the password prompt showing in `session`, if any (with the last known
+    /// foreground program; good enough for showing whether a saved password exists).
     func credentialKey(for session: TerminalSession) -> String? {
-        session.passwordPrompt.map { CredentialKey.remote($0, hostKey: session.descriptor.target.key) }
+        guard let prompt = session.passwordPrompt else { return nil }
+        // Resolved when the prompt appeared (with whose password it is), else a best guess.
+        if let resolved = resolvedCredentials[session.id], resolved.prompt == prompt { return resolved.key }
+        return CredentialKey.remote(prompt, hostKey: session.descriptor.target.key, program: session.activity?.command)
+    }
+
+    /// The keychain item for `prompt`, with the program asking right now (asked fresh from tmux), so
+    /// saving and filling always agree on it.
+    func currentCredentialKey(for prompt: PasswordPrompt, in session: TerminalSession) async -> String {
+        let process = await session.foregroundProcess()
+        let program = process == nil ? await session.foregroundCommand() ?? session.activity?.command : nil
+        let key = CredentialKey.remote(prompt, hostKey: session.descriptor.target.key, process: process, program: program)
+        resolvedCredentials[session.id] = (prompt, key)
+        return key
     }
 
     func hasSavedPassword(for session: TerminalSession) -> Bool {
@@ -15,13 +29,19 @@ extension AppModel {
     /// Types the saved password into the prompt, after Touch ID (if required). The password is
     /// only sent if the same prompt is still waiting afterwards.
     func fillSavedPassword(in session: TerminalSession) {
-        guard let prompt = session.passwordPrompt, let key = credentialKey(for: session),
-              let password = PasswordVault.password(for: key) else { return }
+        guard let prompt = session.passwordPrompt else { return }
         Task {
+            let key = await currentCredentialKey(for: prompt, in: session)
+            guard PasswordVault.hasPassword(for: key) else { return }
             let host = session.descriptor.target.displayName
+            // Touch ID (if enabled) first; the password is read from the keychain only afterwards.
+            guard await !refuseIfShell(prompt, in: session) else { return }
             guard await SecretGate.shared.authorize("enter the \(Self.label(prompt)) on \(host)") else { return }
-            guard session.passwordPrompt == prompt else { return }
+            // Touch ID can take a while: check again that a shell has not come to the foreground meanwhile.
+            guard session.passwordPrompt == prompt, await !refuseIfShell(prompt, in: session),
+                  let password = PasswordVault.password(for: key) else { return }
             session.send(Array((password + "\r").utf8)[...])
+            lastFilled[session.id] = Date()
         }
     }
 
@@ -30,8 +50,22 @@ extension AppModel {
     /// Prompts for *another* host's login (`user@host's password:`) are never filled on their own,
     /// since any server could print one; those wait for ⌥⌘P or a click.
     func passwordPromptAppeared(_ prompt: PasswordPrompt, in session: TerminalSession) {
-        guard settings.autoFillPasswordPrompts, prompt.kind != .login,
-              let key = credentialKey(for: session), PasswordVault.hasPassword(for: key) else { return }
+        Task {
+            // Whose password is it (sudo's caller, su's target user, …)? Also tells the bar whether
+            // one is saved for exactly that.
+            let key = await currentCredentialKey(for: prompt, in: session)
+            // Automatically only for sudo (the user's own password), and only while sudo itself is
+            // waiting — its "[sudo] password for alice:" or, on macOS, plain "Password:". su (often
+            // root) and other prompts are filled with a click: a process name alone proves little.
+            guard settings.autoFillPasswordPrompts, prompt.kind == .sudo || prompt.kind == .generic,
+                  key.hasPrefix("sudo:"), PasswordVault.hasPassword(for: key),
+                  case .waiting = await passwordTarget(for: PasswordPrompt(kind: .sudo, text: prompt.text), in: session),
+                  session.passwordPrompt == prompt else { return }
+            autoFillVerified(prompt, key: key, in: session)
+        }
+    }
+
+    private func autoFillVerified(_ prompt: PasswordPrompt, key: String, in session: TerminalSession) {
         // The same prompt again right after filling means the password was wrong: let the user type.
         if let last = autoFilled[session.id], last.key == key, Date().timeIntervalSince(last.date) < 30 {
             autoFilled[session.id] = nil
@@ -41,16 +75,59 @@ extension AppModel {
         fillSavedPassword(in: session)
     }
 
+    /// What would receive a password typed into the terminal now.
+    enum PasswordTarget {
+        /// A program that asks for this kind of password is in the foreground.
+        case waiting
+        /// Another program; it may be asking (manual entry is allowed, automatic filling is not).
+        case other(String)
+        /// A shell: the password would run as a command and land in the shell history and recording.
+        case shell(String)
+        /// Cannot tell (no tmux): manual entry only.
+        case unknown
+    }
+
+    /// Programs that ask for each kind of password.
+    private static let askers: [PasswordPrompt.Kind: Set<String>] = [
+        .sudo: ["sudo"],
+        .generic: ["su", "sudo", "doas", "login", "passwd", "chsh", "chfn", "pkexec", "runuser"],
+        .passphrase: ["ssh", "scp", "sftp", "ssh-add", "ssh-keygen", "git", "rsync"],
+        .login: ["ssh", "scp", "sftp", "rsync", "git"],
+    ]
+
+    func passwordTarget(for prompt: PasswordPrompt, in session: TerminalSession) async -> PasswordTarget {
+        guard let command = await session.foregroundCommand()?.trimmingCharacters(in: .whitespaces), !command.isEmpty else {
+            return .unknown
+        }
+        if TerminalSession.shells.contains(command) { return .shell(command) }
+        return Self.askers[prompt.kind]?.contains(command) == true ? .waiting : .other(command)
+    }
+
+    /// Manual entry is refused only when a shell is in the foreground; the user is told why.
+    private func refuseIfShell(_ prompt: PasswordPrompt, in session: TerminalSession) async -> Bool {
+        guard case .shell(let shell) = await passwordTarget(for: prompt, in: session) else { return false }
+        let alert = NSAlert()
+        alert.messageText = "The password was not typed"
+        alert.informativeText = "No program is waiting for a password — \(shell) is in the foreground, so the password would have been run as a command and saved in the shell history and the recording."
+        alert.runModal()
+        return true
+    }
+
     /// ⌥⌘P: fill the saved password, or open the secure entry sheet when there is none.
     func fillOrEnterPassword(in session: TerminalSession, state: WindowState?) {
         guard session.passwordPrompt != nil else { return }
-        if hasSavedPassword(for: session) { fillSavedPassword(in: session) } else { state?.passwordEntry = session }
+        let rejected = lastFilled[session.id].map { Date().timeIntervalSince($0) < 60 } == true
+        if hasSavedPassword(for: session) && !rejected { fillSavedPassword(in: session) } else { state?.passwordEntry = session }
     }
 
     /// Types a password the user just entered, optionally saving it for this kind of prompt.
     func enterPassword(_ password: String, in session: TerminalSession, save: Bool) {
-        if save, let key = credentialKey(for: session) { PasswordVault.setPassword(password, for: key) }
-        session.send(Array((password + "\r").utf8)[...])
+        let prompt = session.passwordPrompt
+        Task {
+            if let prompt, await refuseIfShell(prompt, in: session) { return }
+            if save, let prompt { PasswordVault.setPassword(password, for: await currentCredentialKey(for: prompt, in: session)) }
+            session.send(Array((password + "\r").utf8)[...])
+        }
     }
 
     static func label(_ prompt: PasswordPrompt) -> String {
@@ -74,14 +151,21 @@ struct PasswordPromptBar: View {
 
     var body: some View {
         let saved = model.hasSavedPassword(for: session)
+        // Filled moments ago and asked again: the saved password is out of date.
+        let rejected = saved && model.lastFilled[session.id].map { Date().timeIntervalSince($0) < 60 } == true
         GlassPill {
             HStack(spacing: 10) {
-                Image(systemName: prompt.kind == .sudo ? "lock.shield.fill" : "key.fill")
-                    .foregroundStyle(.tint)
+                Image(systemName: rejected ? "exclamationmark.triangle.fill" : prompt.kind == .sudo ? "lock.shield.fill" : "key.fill")
+                    .foregroundStyle(rejected ? AnyShapeStyle(.orange) : AnyShapeStyle(.tint))
                     .symbolEffect(.bounce, value: prompt.text)
-                Text("The terminal is asking for the \(AppModel.label(prompt))")
+                Text(rejected ? "The saved \(AppModel.label(prompt)) was not accepted"
+                              : "The terminal is asking for the \(AppModel.label(prompt))")
                     .lineLimit(1)
-                if saved {
+                if rejected {
+                    Button("Enter New Password…") { state.passwordEntry = session }
+                        .buttonStyle(.glassProminent)
+                        .help("Type the current password; it replaces the saved one")
+                } else if saved {
                     Button {
                         model.fillSavedPassword(in: session)
                     } label: {
@@ -91,8 +175,10 @@ struct PasswordPromptBar: View {
                     .buttonStyle(.glassProminent)
                     .help("Types the saved password into the terminal (⌥⌘P)")
                 }
-                Button(saved ? "Other…" : "Enter…") { state.passwordEntry = session }
-                    .help("Type the password here; you can save it in the keychain")
+                if !rejected {
+                    Button(saved ? "Other…" : "Enter…") { state.passwordEntry = session }
+                        .help("Type the password here; you can save it in the keychain")
+                }
                 Button {
                     withAnimation(.snappy) { dismissed = prompt }
                 } label: { Image(systemName: "xmark") }
@@ -114,6 +200,12 @@ struct PasswordEntrySheet: View {
     @State private var save = false
     @FocusState private var focused: Bool
 
+    /// The saved password was filled in moments ago and the same prompt came back.
+    private var savedWasRejected: Bool {
+        guard let last = model.lastFilled[session.id] else { return false }
+        return Date().timeIntervalSince(last) < 60 && model.hasSavedPassword(for: session)
+    }
+
     var body: some View {
         let prompt = session.passwordPrompt
         VStack(alignment: .leading, spacing: 14) {
@@ -131,8 +223,14 @@ struct PasswordEntrySheet: View {
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)
                 .onSubmit(enter)
+            if savedWasRejected {
+                Label("The saved password was just filled in and not accepted — it may have changed. Type the current one; it replaces the saved one.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             VStack(alignment: .leading, spacing: 3) {
-                Toggle("Save in Keychain for this prompt", isOn: $save)
+                Toggle(savedWasRejected ? "Update the saved password" : "Save in Keychain for this prompt", isOn: $save)
                 Text(SecretGate.shared.isRequired
                      ? "Next time, fill it with \(SecretGate.shared.methodName) (⌥⌘P)."
                      : "Next time, fill it with one click (⌥⌘P).")
@@ -149,7 +247,10 @@ struct PasswordEntrySheet: View {
         }
         .padding(22)
         .frame(width: 420)
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            if savedWasRejected { save = true }   // a changed password replaces the old one
+        }
     }
 
     private func enter() {

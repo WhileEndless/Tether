@@ -34,6 +34,7 @@ struct TetherApp: App {
         // window's tab bar, or use Window ▸ Merge All Windows.
         WindowGroup("Tether", id: "workspace", for: UUID.self) { $workspaceID in
             WorkspaceRoot(workspaceID: $workspaceID)
+                .appLockCover()
                 .environment(model)
                 .frame(minWidth: 640, minHeight: 360)
         }
@@ -43,6 +44,7 @@ struct TetherApp: App {
         WindowGroup("Transcript", id: "transcript", for: TranscriptRequest.self) { $request in
             if let request {
                 TranscriptWindow(request: request)
+                    .appLockCover()
                     .environment(model)
                     .standaloneWindow()
             }
@@ -52,6 +54,7 @@ struct TetherApp: App {
         WindowGroup("Files", id: "files", for: FilesRequest.self) { $request in
             if let request {
                 FilesWindow(request: request)
+                    .appLockCover()
                     .environment(model)
                     .standaloneWindow()
                     .frame(minWidth: 640, minHeight: 400)
@@ -61,6 +64,7 @@ struct TetherApp: App {
 
         Window("Search", id: "search") {
             SearchView()
+                .appLockCover()
                 .environment(model)
                 .frame(minWidth: 760, minHeight: 480)
                 .standaloneWindow()
@@ -83,6 +87,7 @@ struct TetherApp: App {
 
         Settings {
             SettingsView()
+                .appLockCover()
                 .environment(model)
         }
 
@@ -101,10 +106,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWindow.allowsAutomaticWindowTabbing = false
         MainActor.assumeIsolated {
             AppModel.shared.launch()
+            Self.reportTamperedSettings()
             TabBarCenter.shared.start()
             installCloseTabShortcut()
             // After the first window is up, so the notice never blocks starting.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { Updater.shared.checkAtLaunch() }
+        }
+    }
+
+    /// Security settings changed outside Tether were put back at launch: say so once.
+    @MainActor
+    private static func reportTamperedSettings() {
+        let names = AppModel.shared.settingsStore.tamperedSecuritySettings
+        let review = AppModel.shared.settingsStore.unpinnedNonDefaults
+        if names.isEmpty, !review.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let alert = NSAlert()
+                alert.messageText = "Please check your security settings"
+                alert.informativeText = "Tether now keeps a copy of its security settings in your keychain. These differ from the defaults, so make sure you set them yourself: \(review.joined(separator: ", ")). Settings ▸ Security, Passwords and SSH."
+                alert.runModal()
+            }
+            return
+        }
+        guard !names.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Security settings were changed outside Tether"
+            alert.informativeText = "These settings no longer matched the copy kept in your keychain, so Tether put them back: \(names.joined(separator: ", ")). Another program may have edited Tether's preferences. Change them in Settings ▸ Security if you want something else."
+            alert.runModal()
         }
     }
 
@@ -116,6 +146,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func installCloseTabShortcut() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if AppLock.shared.isLocked {
+                // Keys go to lock screens only (windows and sheets show one), never to a hidden panel.
+                if let window = event.window, window is NSPanel, !window.isSheet { return nil }
+                return event
+            }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             guard let window = event.window, let state = AppModel.shared.workspaces.state(of: window) else { return event }
             let model = AppModel.shared

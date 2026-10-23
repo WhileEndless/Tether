@@ -162,6 +162,8 @@ struct Shortcut: Identifiable {
     static let showArchive = Shortcut("Show Archive in Sidebar", .view, k("a", [.command, .option]))
     static let statusBar = Shortcut("Show Host Status Bar", .view, k("s", [.command, .option]))
     static let settings = Shortcut("Settings…", .view, display: "⌘,")
+    static let lockApp = Shortcut("Lock Tether", .view, k("l", [.command, .control]),
+                                  note: "With App Lock on (Settings ▸ Security)")
     static let shortcuts = Shortcut("Keyboard Shortcuts", .view, k("/"))
 
     static let all: [Shortcut] = [
@@ -173,7 +175,7 @@ struct Shortcut: Identifiable {
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
         browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
-        toggleSidebar, hostPanel, showArchive, statusBar, settings, shortcuts,
+        toggleSidebar, hostPanel, showArchive, statusBar, settings, lockApp, shortcuts,
     ]
 }
 

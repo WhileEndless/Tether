@@ -397,6 +397,7 @@ final class ScpJob: TransferJob {
         let p = LocalProcess(delegate: bridge, dispatchQueue: .main)
         process = p
         p.startProcess(executable: executable, args: arguments, environment: env.map { "\($0.key)=\($0.value)" })
+        AskPassBridge.shared.bindToken(environment, pid: p.shellPid)
     }
 
     func cancel() {

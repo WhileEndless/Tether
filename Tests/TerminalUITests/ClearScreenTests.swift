@@ -36,6 +36,21 @@ import TetherCore
         #expect(view.getTerminal().getCursorLocation().y == 0)
     }
 
+    /// Inside tmux and screen, shells clear with "home, erase below" (ESC[H ESC[J): kept the same way.
+    @Test func tmuxStyleClearKeepsScreenInScrollback() {
+        let view = makeView()
+        feed(view, "line one\r\nline two\r\n$ ")
+        feed(view, "\u{1b}[H\u{1b}[J$ ")
+        let text = view.scrollbackText().lines
+        #expect(text.contains("line one") && text.contains("line two"))
+        #expect(screenRow(view, 0) == "$")
+        // Erasing below the cursor elsewhere on the screen is ordinary output, not a clear.
+        let other = makeView()
+        feed(other, "a\r\nb\r\nc\u{1b}[2;1H\u{1b}[J")
+        #expect(!other.scrollbackText().lines.contains("a") || screenRow(other, 0) == "a")
+        #expect(screenRow(other, 0) == "a" && screenRow(other, 1).isEmpty)
+    }
+
     @Test func clearCommandCannotEraseScrollback() {
         let view = makeView()
         for i in 1...30 { feed(view, "output \(i)\r\n") }

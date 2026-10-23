@@ -60,23 +60,24 @@ struct WorkspaceWindow: View {
         }
         .toolbar { WorkspaceToolbar(showInspector: $showInspector) }
         .navigationTitle(windowTitle)
-        .navigationSubtitle(state.selectedItem?.target.displayName ?? "")
+        .navigationSubtitle(windowSubtitle)
         .focusedSceneValue(\.windowState, state)
         .focusedSceneValue(\.activeSessionID, state.session?.id)
         .background(WindowAccessor { window in
             window.tabbingMode = .disallowed
             state.window = window
+            WindowCloseGuard.install(on: window, state: state)
             model.workspaces.register(window, for: workspaceID, state: state)
             WindowLayout.apply(to: window, workspace: workspaceID)
             WindowLayout.watch(window, workspace: workspaceID)
         })
-        .sheet(isPresented: $state.showQuickConnect) { QuickConnectView() }
-        .sheet(item: $state.hostEditor) { HostEditorView(request: $0) }
-        .sheet(item: $state.keySetupTarget) { KeySetupView(request: $0) }
-        .sheet(isPresented: $state.showConfigEditor) { ConfigFileEditorView() }
-        .sheet(isPresented: $state.showSwitcher) { SessionSwitcherView() }
-        .sheet(item: $state.uploadRequest) { UploadSheet(request: $0) }
-        .sheet(item: $state.passwordEntry) { PasswordEntrySheet(session: $0) }
+        .sheet(isPresented: $state.showQuickConnect) { QuickConnectView().appLockCover() }
+        .sheet(item: $state.hostEditor) { HostEditorView(request: $0).appLockCover() }
+        .sheet(item: $state.keySetupTarget) { KeySetupView(request: $0).appLockCover() }
+        .sheet(isPresented: $state.showConfigEditor) { ConfigFileEditorView().appLockCover() }
+        .sheet(isPresented: $state.showSwitcher) { SessionSwitcherView().appLockCover() }
+        .sheet(item: $state.uploadRequest) { UploadSheet(request: $0).appLockCover() }
+        .sheet(item: $state.passwordEntry) { PasswordEntrySheet(session: $0).appLockCover() }
         .alert("Rename", isPresented: Binding(get: { state.renamingSession != nil },
                                               set: { if !$0 { state.renamingSession = nil } })) {
             TextField("Name", text: $renameText)
@@ -123,6 +124,13 @@ struct WorkspaceWindow: View {
         }
         // Outermost, so the toolbar, sheets and alerts see this window's state too.
         .environment(state)
+    }
+
+    /// The host, and "Window 2" while several windows are open (the sidebar names them so).
+    private var windowSubtitle: String {
+        let host = state.selectedItem?.target.displayName ?? ""
+        guard model.workspaces.hasSeveralWindows, let n = model.workspaces.numbers[workspaceID] else { return host }
+        return host.isEmpty ? "Window \(n)" : "\(host) · Window \(n)"
     }
 
     private var windowTitle: String {
@@ -175,6 +183,17 @@ struct WorkspaceToolbar: ToolbarContent {
             }
             .disabled(state.session == nil)
             .help("Open a file manager tab in the terminal's current directory (⇧⌘O)")
+
+            // Only with App Lock on: lock Tether now (sessions keep running). Left of the panel toggle,
+            // which stays last, above the panel it opens.
+            if model.settings.appLockMode != .off {
+                Button {
+                    AppLock.shared.lock()
+                } label: {
+                    Label("Lock", systemImage: "lock")
+                }
+                .help("Lock Tether (⌃⌘L) — sessions keep running")
+            }
 
             Button {
                 state.toggleInspector.toggle()

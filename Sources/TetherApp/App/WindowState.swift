@@ -237,6 +237,64 @@ final class WindowState {
     }
 }
 
+extension WindowState {
+    /// Closing a window (its close button or ⇧⌘W). While another Tether window is open, a window with
+    /// tabs asks first: keep its tabs running in the background (the default — they stay connected and
+    /// listed in the sidebar), or move them all to the other window. The last window just closes;
+    /// Tether keeps everything and brings the window back from the menu bar.
+    func requestCloseWindow() {
+        guard let window else { return }
+        let store = model.workspaces
+        let tabs = workspace.tabs
+        guard !tabs.isEmpty, let other = store.otherOpenWorkspaces(than: workspaceID).first,
+              model.settings.confirmCloseOnlineSessions else {
+            window.close()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = tabs.count == 1 ? "Close this window and its tab?" : "Close this window and its \(tabs.count) tabs?"
+        alert.informativeText = "In the background they keep running and stay connected; they are listed in the sidebar, "
+            + "ready to reopen. Or move them to the other window."
+        alert.addButton(withTitle: "Keep in Background")
+        alert.addButton(withTitle: "Move Tabs to Other Window")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            switch response {
+            case .alertFirstButtonReturn:
+                window.close()   // the workspace's sessions go to the background (WorkspaceStore.windowClosed)
+            case .alertSecondButtonReturn:
+                let selected = self.workspace.selected
+                for id in tabs { store.add(id, to: other, select: id == selected) }
+                window.close()
+                store.activate(other)
+            default:
+                break
+            }
+        }
+    }
+}
+
+/// Sends a window's close button to `WindowState.requestCloseWindow` (SwiftUI owns the window's
+/// delegate, so the button is redirected instead).
+@MainActor
+final class WindowCloseGuard: NSObject {
+    private weak var state: WindowState?
+    private static var key = 0
+
+    static func install(on window: NSWindow, state: WindowState) {
+        guard let button = window.standardWindowButton(.closeButton) else { return }
+        let guardian = WindowCloseGuard()
+        guardian.state = state
+        objc_setAssociatedObject(window, &key, guardian, .OBJC_ASSOCIATION_RETAIN)
+        button.target = guardian
+        button.action = #selector(closeClicked(_:))
+    }
+
+    @objc private func closeClicked(_ sender: Any?) {
+        state?.requestCloseWindow()
+    }
+}
+
 struct WindowStateKey: FocusedValueKey { typealias Value = WindowState }
 
 extension FocusedValues {

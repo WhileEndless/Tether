@@ -15,6 +15,8 @@ struct PendingPrompt: Identifiable {
     let id = UUID()
     let request: AskPassRequest
     let continuation: CheckedContinuation<String?, Never>
+    /// The saved password was just sent and not accepted (it probably changed on the server).
+    var savedWasRejected = false
 }
 
 /// Items in the sidebar.
@@ -119,8 +121,18 @@ final class AppModel {
 
     func launch() {
         watchWindowVisibility()
-        sessions.restoreOpenSessions()
+        // With App Lock, sessions (and their history) come back only after unlocking.
+        AppLock.shared.start { [weak self] in
+            guard let self else { return }
+            self.sessions.restoreOpenSessions()
+            self.sessionsRestored = true
+            self.afterRestore.forEach { $0() }
+            self.afterRestore = []
+        }
     }
+
+    @ObservationIgnored private var sessionsRestored = false
+    @ObservationIgnored private var afterRestore: [() -> Void] = []
 
     @ObservationIgnored private var orphansAdopted = false
 
@@ -128,6 +140,11 @@ final class AppModel {
     /// the background (e.g. after a crash) are opened as tabs of the first window.
     func adoptOrphanSessions(into state: WindowState) {
         guard !orphansAdopted else { return }
+        // Locked at launch: tidy the restored tabs only once the sessions are back.
+        guard sessionsRestored else {
+            afterRestore.append { [weak self, weak state] in if let state { self?.adoptOrphanSessions(into: state) } }
+            return
+        }
         orphansAdopted = true
         // Give the other windows of the last run time to reopen first (they keep their own tabs).
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -394,40 +411,113 @@ final class AppModel {
     /// Passwords typed for direct connections without saving them (kept in memory only).
     @ObservationIgnored var transientPasswords: [String: String] = [:]
 
-    /// Which saved host a password prompt is for. With jump hosts, ssh asks for each hop
-    /// (`user@jump.example.com's password:`), so the prompt — not the tab — decides whose password to use.
+    /// Which saved host a password prompt is for (the name a typed password is saved under, and
+    /// shown in the prompt). With jump hosts, ssh asks for each hop, so the prompt — not the tab —
+    /// decides; only the host name ssh itself writes is used (see `AskPassRequest.sshNamedHost`).
     func passwordKey(for request: AskPassRequest) -> String {
         if request.isPassphrasePrompt { return CredentialKey.passphrase(keyPath: request.keyPath ?? request.prompt) }
-        guard let r = request.prompt.range(of: #"@([^'\s]+)'s password"#, options: .regularExpression) else {
-            return request.targetKey
+        guard let login = request.sshNamedLogin else { return request.targetKey }
+        return key(forHostName: login.host, user: login.user, target: request.targetKey)
+    }
+
+    /// The saved-host name for a host name or alias seen in a prompt. With several saved hosts for
+    /// the same server (different users), only the one for this user matches; otherwise the plain
+    /// `user@host`, which has no saved password unless one was saved for exactly that.
+    private func key(forHostName host: String, user: String? = nil, target: String) -> String {
+        func userMatches(_ alias: String) -> Bool {
+            guard let user, let configured = config.entry(for: alias)?.user else { return true }
+            return configured == user
         }
-        let host = String(request.prompt[r].dropFirst().prefix { $0 != "'" })
-        if host == request.targetKey || aliases.contains(host) { return host }
-        if let entry = hosts.first(where: { $0.hostName == host }), let alias = entry.alias { return alias }
-        // The target itself, addressed by its real host name.
-        if case .alias(let a) = target(forKey: request.targetKey), config.entry(for: a)?.hostName == host { return a }
-        return host
+        if host == target || aliases.contains(host) { return userMatches(host) ? host : "\(user ?? "")@\(host)" }
+        if case .alias(let a) = self.target(forKey: target), config.entry(for: a)?.hostName == host, userMatches(a) { return a }
+        let candidates = hosts.filter { $0.hostName == host }.compactMap(\.alias).filter(userMatches)
+        if candidates.count == 1 { return candidates[0] }
+        return user.map { "\($0)@\(host)" } ?? host
+    }
+
+    /// Every name the connection to `targetKey` goes through: the target and its jump hosts (as
+    /// aliases and host names). `hasJumps` tells whether anything other than the target is involved.
+    func connectionPath(of targetKey: String) -> (names: Set<String>, hasJumps: Bool) {
+        var names: Set<String> = [targetKey]
+        var jumps: [String] = []
+        switch target(forKey: targetKey) {
+        case .alias(let a):
+            if let e = config.entry(for: a) {
+                if let h = e.hostName { names.insert(h) }
+                if let j = e.proxyJump { jumps += j.split(separator: ",").map(String.init) }
+            }
+        case .adhoc(_, let host, _, let jump, _):
+            names.insert(host)
+            if let jump { jumps += jump.split(separator: ",").map(String.init) }
+        case .local:
+            break
+        }
+        var seen = 0
+        while let raw = jumps.first, seen < 8 {
+            jumps.removeFirst(); seen += 1
+            // user@host:port → host
+            var name = raw.trimmingCharacters(in: .whitespaces)
+            if let at = name.lastIndex(of: "@") { name = String(name[name.index(after: at)...]) }
+            if name.hasPrefix("["), let close = name.firstIndex(of: "]") { name = String(name[name.index(after: name.startIndex)..<close]) }
+            else if let colon = name.firstIndex(of: ":") { name = String(name[..<colon]) }
+            guard !name.isEmpty else { continue }
+            names.insert(name)
+            if let e = config.entry(for: name) {
+                if let h = e.hostName { names.insert(h) }
+                if let j = e.proxyJump { jumps += j.split(separator: ",").map(String.init) }
+            }
+        }
+        return (names, seen > 0)
+    }
+
+    /// Whether a "host key changed" report can be acted on: it names a host on this connection's own
+    /// path and a known_hosts file in ~/.ssh. (Text printed by a server before the session starts
+    /// could imitate ssh's warning to get another host's trusted key removed.)
+    func canRemoveHostKey(_ change: HostKeyChange, for target: ConnectionTarget) -> Bool {
+        var host = change.host
+        if host.hasPrefix("["), let close = host.firstIndex(of: "]") { host = String(host[host.index(after: host.startIndex)..<close]) }
+        guard connectionPath(of: target.key).names.contains(host), let file = change.knownHostsFile else { return false }
+        let path = URL(fileURLWithPath: (file as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
+        let ssh = AppPaths.userSSHDirectory.standardizedFileURL.resolvingSymlinksInPath().path + "/"
+        return path.hasPrefix(ssh)
+    }
+
+    /// The saved password that may answer this prompt without asking, or nil. Only for a host on this
+    /// connection's own path, so neither a server's prompt text nor a jump host can obtain the
+    /// password of another host. A prompt that names no host is answered only when there is no
+    /// jump host that could have sent it.
+    func savedPasswordKey(for request: AskPassRequest) -> String? {
+        if request.isPassphrasePrompt { return passwordKey(for: request) }   // local key file
+        let path = connectionPath(of: request.targetKey)
+        guard let login = request.sshNamedLogin else { return path.hasJumps ? nil : request.targetKey }
+        let key = key(forHostName: login.host, user: login.user, target: request.targetKey)
+        return path.names.contains(login.host) || path.names.contains(key) ? key : nil
     }
 
     nonisolated func answer(_ request: AskPassRequest) async -> String? {
         if request.isPasswordPrompt || request.isPassphrasePrompt {
             let (key, transient, tried) = await MainActor.run {
-                let key = self.passwordKey(for: request)
-                return (key, self.transientPasswords[key], self.triedPasswords.contains(request.token + key))
+                let key = self.savedPasswordKey(for: request)
+                return (key, key.flatMap { self.transientPasswords[$0] }, key.map { self.triedPasswords.contains(request.token + $0) } ?? true)
             }
             // Offer a saved password once per hop; a second prompt for the same hop means it was wrong.
-            if !tried, let saved = transient ?? PasswordVault.password(for: key) {
-                // Keychain items need Touch ID (if enabled); cancelling falls back to typing it.
+            // Touch ID (if enabled) comes before the password is even read from the keychain.
+            if let key, !tried, transient != nil || PasswordVault.hasPassword(for: key) {
                 let allowed = transient != nil ? true : await SecretGate.shared.authorize(Self.reason(for: request, key: key))
-                if allowed {
+                if allowed, let saved = transient ?? PasswordVault.password(for: key) {
                     await MainActor.run { _ = self.triedPasswords.insert(request.token + key) }
                     return saved
                 }
             }
         }
+        // Asked again after the saved password was sent: it was not accepted.
+        let rejected = await MainActor.run {
+            guard let key = self.savedPasswordKey(for: request) else { return false }
+            return self.triedPasswords.contains(request.token + key) && PasswordVault.hasPassword(for: key)
+        }
         return await withCheckedContinuation { cont in
             Task { @MainActor in
-                self.prompts.append(PendingPrompt(request: request, continuation: cont))
+                self.prompts.append(PendingPrompt(request: request, continuation: cont, savedWasRejected: rejected))
             }
         }
     }
@@ -438,6 +528,11 @@ final class AppModel {
     }
 
     @ObservationIgnored private var triedPasswords: Set<String> = []
+    /// When a saved password was last typed into each session (automatically or with a click): the
+    /// same prompt coming back right after means it was not accepted.
+    @ObservationIgnored var lastFilled: [UUID: Date] = [:]
+    /// The keychain item each session's current prompt belongs to, worked out when it appeared.
+    var resolvedCredentials: [UUID: (prompt: PasswordPrompt, key: String)] = [:]
     /// Last automatic fill per session (to stop after a wrong password).
     @ObservationIgnored var autoFilled: [UUID: (key: String, date: Date)] = [:]
 

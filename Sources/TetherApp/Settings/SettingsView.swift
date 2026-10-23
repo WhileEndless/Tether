@@ -15,6 +15,7 @@ struct SettingsView: View {
             Tab("Recordings", systemImage: "record.circle") { RecordingSettings() }
             Tab("Transfers", systemImage: "arrow.up.arrow.down.circle") { TransferSettings() }
             Tab("Monitoring", systemImage: "gauge.with.dots.needle.33percent") { MonitoringSettings() }
+            Tab("Security", systemImage: "lock") { SecuritySettingsPane() }
             Tab("Passwords", systemImage: "key") { PasswordSettings() }
             Tab("SSH", systemImage: "lock.shield") { SSHSettings() }
         }
@@ -25,6 +26,8 @@ struct SettingsView: View {
 
 private struct GeneralSettings: View {
     @Environment(AppModel.self) private var model
+    @State private var confirmReset = false
+
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
@@ -47,7 +50,12 @@ private struct GeneralSettings: View {
                 }
             }
             Section {
-                Button("Restore All Settings to Defaults…", role: .destructive) { store.resetToDefaults() }
+                Button("Restore All Settings to Defaults…", role: .destructive) { confirmReset = true }
+                    .confirmationDialog("Restore all settings to their defaults?", isPresented: $confirmReset) {
+                        Button("Restore Defaults", role: .destructive) { store.resetToDefaults() }
+                    } message: {
+                        Text("Security settings (App Lock, encryption, saved-password checks, the ssh program and config) are kept; change those in their own sections.")
+                    }
             }
             Section {
                 HStack {
@@ -275,6 +283,10 @@ private struct SessionSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Stepper("History restored on re-attach: \(store.settings.historyLinesOnReattach.formatted()) lines",
                         value: $store.settings.historyLinesOnReattach, in: 0...50_000, step: 1_000)
+                Stepper("History kept on the server: \(store.settings.serverHistoryLines.formatted()) lines",
+                        value: $store.settings.serverHistoryLines, in: 10_000...1_000_000, step: 10_000)
+                Text("For new tmux and screen sessions Tether starts (only those). Output printed while you are not connected stays on the server up to this limit, and Tether adds what you missed to the terminal and its recording when it reconnects.")
+                    .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Persistence") }
 
             Section("Reconnecting") {
@@ -402,10 +414,10 @@ private struct SSHSettings: View {
         @Bindable var store = model.settingsStore
         Form {
             Section("Configuration") {
-                TextField("Config file", text: $store.settings.sshConfigPath, prompt: Text("~/.ssh/config"))
-                TextField("ssh binary", text: $store.settings.sshBinary)
-                TextField("scp binary", text: $store.settings.scpBinary)
-                Picker("Unknown host keys", selection: $store.settings.hostKeyPolicy) {
+                GuardedPathRow(title: "Config file", keyPath: \.sshConfigPath, placeholder: "~/.ssh/config", defaultValue: "")
+                GuardedPathRow(title: "ssh program", keyPath: \.sshBinary, placeholder: "/usr/bin/ssh", defaultValue: "/usr/bin/ssh")
+                GuardedPathRow(title: "scp program", keyPath: \.scpBinary, placeholder: "/usr/bin/scp", defaultValue: "/usr/bin/scp")
+                Picker("Unknown host keys", selection: model.guardedSetting(\.hostKeyPolicy, reason: "accept new host keys automatically") { _, new in new == .acceptNew }) {
                     ForEach(HostKeyPolicy.allCases) { Text($0.title).tag($0) }
                 }
             }
@@ -427,15 +439,17 @@ private struct SSHSettings: View {
 private struct PasswordSettings: View {
     @Environment(AppModel.self) private var model
     @State private var accounts: [String] = []
+    @State private var replacing: String?
     @State private var locked = false
 
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
             Section {
-                Toggle("Ask for \(SecretGate.shared.methodName) before using a saved password", isOn: $store.settings.requireAuthForSavedPasswords)
+                Toggle("Ask for \(SecretGate.shared.methodName) before using a saved password",
+                       isOn: model.guardedSetting(\.requireAuthForSavedPasswords, reason: "stop asking before saved passwords are used") { _, new in !new })
                 if store.settings.requireAuthForSavedPasswords {
-                    Picker("Ask again after", selection: $store.settings.authGraceSeconds) {
+                    Picker("Ask again after", selection: model.guardedSetting(\.authGraceSeconds, reason: "ask less often before saved passwords are used") { old, new in new > old }) {
                         Text("Every time").tag(0)
                         Text("1 minute").tag(60)
                         Text("5 minutes").tag(300)
@@ -457,12 +471,13 @@ private struct PasswordSettings: View {
             }
             Section {
                 Toggle("Offer to fill passwords in terminals", isOn: $store.settings.detectPasswordPrompts)
-                Toggle("Fill saved passwords automatically", isOn: $store.settings.autoFillPasswordPrompts)
+                Toggle("Fill saved passwords automatically",
+                       isOn: model.guardedSetting(\.autoFillPasswordPrompts, reason: "fill saved passwords automatically") { _, new in new })
                     .disabled(!store.settings.detectPasswordPrompts)
             } header: {
                 Text("sudo, su and other prompts")
             } footer: {
-                Text("When a terminal shows a prompt such as “[sudo] password for alice:”, “Password:” (su) or “alice@host's password:”, a saved password is filled right away (after Touch ID, if required) — or, with automatic filling off, a bar offers it (⌥⌘P). Without a saved password, ⌥⌘P opens a secure field to type one and save it. Another host's login prompt (“alice@host's password:”) is never filled on its own, a wrong password is not retried, and prompts for a new password are ignored. Applies to sessions connected after the change.")
+                Text("When a terminal asks for a password (“[sudo] password for alice:”, “Password:” for su, “alice@host's password:”), a bar offers the saved one (⌥⌘P), or a secure field to type one and save it. Only sudo is filled automatically, and only when sudo itself is waiting; a password is never typed into a shell. A saved password that is not accepted is not sent again: you are asked for the current one, which replaces it. Saved passwords can also be replaced or removed below.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Saved in Keychain") {
@@ -478,6 +493,8 @@ private struct PasswordSettings: View {
                             Text(d.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
+                        // A wrong or outdated password is corrected here (or when it is next rejected).
+                        Button("Replace…") { replacing = a }
                         Button("Remove", role: .destructive) {
                             PasswordVault.deletePassword(for: a)
                             accounts = PasswordVault.allAccounts()
@@ -488,5 +505,48 @@ private struct PasswordSettings: View {
         }
         .formStyle(.grouped)
         .onAppear { accounts = PasswordVault.allAccounts(); locked = false }
+        .sheet(item: Binding(get: { replacing.map(ReplaceTarget.init) }, set: { replacing = $0?.account })) { target in
+            ReplacePasswordSheet(account: target.account).appLockCover()
+        }
+    }
+}
+
+private struct ReplaceTarget: Identifiable {
+    let account: String
+    var id: String { account }
+}
+
+/// Replaces a saved password (typed twice). The old one is never shown.
+private struct ReplacePasswordSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let account: String
+    @State private var password = ""
+    @State private var repeated = ""
+    @State private var failed = false
+
+    var body: some View {
+        let d = CredentialKey.describe(account)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Replace Saved Password").font(.headline)
+            Text("\(d.title) — \(d.detail)").font(.callout).foregroundStyle(.secondary).lineLimit(2)
+            SecureField("New password", text: $password).textFieldStyle(.roundedBorder)
+            SecureField("Repeat it", text: $repeated).textFieldStyle(.roundedBorder)
+            if !repeated.isEmpty && password != repeated {
+                Text("The passwords do not match.").font(.caption).foregroundStyle(.red)
+            }
+            if failed { Text("It could not be saved in the keychain.").font(.caption).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Replace") {
+                    if PasswordVault.setPassword(password, for: account) { dismiss() } else { failed = true }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.glassProminent)
+                .disabled(password.isEmpty || password != repeated)
+            }
+        }
+        .padding(22)
+        .frame(width: 420)
     }
 }

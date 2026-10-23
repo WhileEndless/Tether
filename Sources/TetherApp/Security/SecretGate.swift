@@ -1,6 +1,7 @@
 import AppKit
 import LocalAuthentication
 import TetherCore
+import SSHConfigKit
 import SessionKit
 
 /// Asks for Touch ID (or the Mac's login password, or an Apple Watch) before a saved password
@@ -39,6 +40,8 @@ final class SecretGate {
 
     /// True when the user confirmed (or no confirmation is required right now).
     func authorize(_ reason: String) async -> Bool {
+        // Behind the lock screen nobody should be asked (a reconnect needing a saved password waits).
+        await AppLock.shared.waitUntilUnlocked()
         let settings = AppModel.shared.settings
         guard settings.requireAuthForSavedPasswords else { return true }
         if let last = lastSuccess, Date().timeIntervalSince(last) < Double(settings.authGraceSeconds) { return true }
@@ -75,19 +78,38 @@ enum CredentialKey {
 
     /// The keychain item for a password prompt shown inside a terminal on `hostKey`.
     @MainActor
-    static func remote(_ prompt: PasswordPrompt, hostKey: String) -> String {
+    /// `program` (the one asking, when known) keeps generic "Password:" prompts of different programs
+    /// apart — su's password is never offered to another program's prompt.
+    /// `process` (the one asking, as the host sees it) decides whose password is meant: sudo asks for
+    /// its caller's, su for its target user's — also when the prompt only says "Password:" (macOS) —
+    /// and other programs' "Password:" prompts are kept apart per program and user.
+    static func remote(_ prompt: PasswordPrompt, hostKey: String, process: ForegroundProcess? = nil, program: String? = nil) -> String {
+        if let p = process, prompt.kind == .sudo || prompt.kind == .generic {
+            switch p.command {
+            case "sudo": return "sudo:\(hostKey):\(prompt.user ?? p.user)"
+            case "su": return "su:\(hostKey):\(p.suTarget)"
+            case "doas": return "doas:\(hostKey):\(p.user)"
+            default: break
+            }
+        }
         switch prompt.kind {
         case .sudo: return "sudo:\(hostKey):\(prompt.user ?? "self")"
         case .login:
             // ssh from inside the session: reuse the saved login password of a known host.
             let model = AppModel.shared
             if let host = prompt.host {
-                if model.aliases.contains(host) { return host }
-                if let alias = model.hosts.first(where: { $0.hostName == host })?.alias { return alias }
+                // Only the saved host for this very user (several may point at the same server).
+                func userMatches(_ entry: SSHHostEntry) -> Bool { prompt.user == nil || entry.user == nil || entry.user == prompt.user }
+                if let entry = model.hosts.first(where: { $0.alias == host }), userMatches(entry) { return host }
+                let candidates = model.hosts.filter { $0.hostName == host && userMatches($0) }.compactMap(\.alias)
+                if candidates.count == 1 { return candidates[0] }
             }
             return "login:\(prompt.user ?? "")@\(prompt.host ?? "")"
         case .passphrase: return "passphrase:\(hostKey):\(prompt.text)"
-        case .generic: return "prompt:\(hostKey):\(prompt.user ?? prompt.text)"
+        case .generic:
+            let asker = (process?.command ?? program).flatMap { $0.isEmpty || TerminalSession.shells.contains($0) ? nil : $0 }
+            let user = process.map { ":" + $0.user } ?? ""
+            return "prompt:\(hostKey):\(asker.map { $0 + user + ":" } ?? "")\(prompt.user ?? prompt.text)"
         }
     }
 
@@ -97,6 +119,10 @@ enum CredentialKey {
         switch parts.first {
         case "sudo" where parts.count == 3:
             return ("lock.shield", "sudo on \(parts[1])", parts[2] == "self" ? "your account" : "for \(parts[2])")
+        case "su" where parts.count == 3:
+            return ("person.2.badge.key", "su on \(parts[1])", "to \(parts[2])")
+        case "doas" where parts.count == 3:
+            return ("lock.shield", "doas on \(parts[1])", "for \(parts[2])")
         case "passphrase":
             return ("key.fill", "Key passphrase", parts.dropFirst().joined(separator: ":"))
         case "prompt" where parts.count == 3:

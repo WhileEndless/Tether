@@ -10,9 +10,20 @@ import TetherCore
 /// Runs a real terminal view in an offscreen window against a local fake ssh, then inspects
 /// the rendered screen. Reproduces layout/size problems that headless tests cannot.
 @MainActor
-@Suite(.serialized) struct TerminalWindowTests {
+@Suite(.serialized) final class TerminalWindowTests {
     let dir: URL
     let fakeSSH: URL
+
+    /// Each test leaves nothing behind: its tmux server and its folder (with the fake ssh) go.
+    deinit {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "TMUX= TMUX_TMPDIR=\"$0\" tmux kill-server 2>/dev/null; true", dir.path]
+        p.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"]
+        try? p.run()
+        p.waitUntilExit()
+        try? FileManager.default.removeItem(at: dir)
+    }
 
     init() throws {
         dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tether-ui-\(UUID().uuidString.prefix(6))")
@@ -147,6 +158,79 @@ import TetherCore
         view.selectToMark(up: false)
         let extended = view.getSelection()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         #expect(extended.contains("2b") && extended.hasSuffix("echo three\nthree"), "got: \(extended)")
+        session.close(killRemote: true)
+        window.orderOut(nil)
+        killTmuxServer()
+    }
+
+    /// Ctrl+L moves the screen into the scrollback; ⇧⌘↑ and ⌘↑ must still reach the commands before it.
+    @Test func commandMarksSurviveCtrlL() async throws {
+        let cfg = config()
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        let host = NSHostingView(rootView: TerminalHost(session: session))
+        window.contentView = host
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+        host.layoutSubtreeIfNeeded()
+        try await pump(0.3)
+        session.start()
+        try await pump(10) { session.phase.isOnline }
+        let view = TerminalRegistry.shared.existingView(for: session.id)!
+        for cmd in ["echo one", "echo two"] {
+            view.send(source: view, data: Array((cmd + "\r").utf8)[...])
+            try await pump(0.6)
+        }
+        view.send(source: view, data: [0x0c][...])          // Ctrl+L
+        try await pump(0.8)
+        view.send(source: view, data: Array("echo three\r".utf8)[...])
+        try await pump(0.6)
+        var seen: [String] = []
+        for _ in 0..<3 {
+            view.selectToMark(up: true)
+            seen.append(view.getSelection()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        }
+        #expect(seen[0].hasSuffix("echo three\nthree"), "got: \(seen)")
+        #expect(seen.last?.contains("echo one") == true && seen.last?.contains("echo two") == true, "got: \(seen)")
+        // ⌘↑ walks back past the clear too.
+        view.selection.selectNone()
+        view.jumpCursor = nil
+        var jumps: [String] = []
+        for _ in 0..<3 {
+            view.jumpToMark(up: true)
+            if let row = view.jumpCursor, let line = view.getTerminal().getLine(row: row - view.getTerminal().getTopVisibleRow()) {
+                jumps.append(line.translateToString(trimRight: true))
+            }
+        }
+        #expect(jumps.contains { $0.contains("echo one") }, "jumps: \(jumps)")
+        session.close(killRemote: true)
+        window.orderOut(nil)
+        killTmuxServer()
+    }
+
+    /// The foreground process is read with its real user and arguments (what tells sudo's caller and
+    /// su's target user apart when a prompt only says "Password:").
+    @Test func readsTheForegroundProcess() async throws {
+        // A local session: give it this suite's private tmux server, never the user's.
+        setenv("TMUX_TMPDIR", dir.path, 1)
+        defer { unsetenv("TMUX_TMPDIR") }
+        let cfg = config()
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .local, persistence: .tmux)) { cfg }
+        let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        let host = NSHostingView(rootView: TerminalHost(session: session))
+        window.contentView = host
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+        host.layoutSubtreeIfNeeded()
+        try await pump(0.3)
+        session.start()
+        try await pump(10) { session.phase.isOnline }
+        session.send(Array("sleep 7\r".utf8)[...])
+        try await pump(1.0)
+        let p = await session.foregroundProcess()
+        #expect(p?.command == "sleep" && p?.user == NSUserName() && p?.arguments == ["7"], "got: \(String(describing: p))")
         session.close(killRemote: true)
         window.orderOut(nil)
         killTmuxServer()

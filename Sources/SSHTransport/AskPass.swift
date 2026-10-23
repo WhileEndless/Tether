@@ -17,18 +17,47 @@ public struct AskPassRequest: Sendable {
 
     public var isPasswordPrompt: Bool { prompt.lowercased().contains("password") }
 
-    /// `Enter passphrase for key '/path/to/key':`
-    public var isPassphrasePrompt: Bool { prompt.lowercased().contains("passphrase") }
-
-    /// The key file a passphrase prompt is about.
-    public var keyPath: String? {
-        guard let open = prompt.firstIndex(of: "'"), let close = prompt.lastIndex(of: "'"), open < close else { return nil }
-        return String(prompt[prompt.index(after: open)..<close])
+    /// ssh puts `(user@host) ` before every keyboard-interactive prompt: what follows was written by
+    /// the server, so it is never treated as ssh's own key-passphrase or host-key question.
+    public var isServerText: Bool {
+        prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefixMatch(of: #/\([^@\s()]+@[^)\s]+\) /#) != nil
     }
 
+    /// `Enter passphrase for key '/path/to/key':` exactly as ssh writes it (never server text), for a
+    /// key file that exists on this Mac.
+    public var isPassphrasePrompt: Bool {
+        guard !isServerText, let path = keyPath else { return false }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath, isDirectory: &isDir) && !isDir.boolValue
+    }
+
+    /// The key file named by ssh's own passphrase prompt.
+    public var keyPath: String? {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = p.wholeMatch(of: #/Enter passphrase for (?:key )?'(.+)': ?/#) else { return nil }
+        return String(m.1)
+    }
+
+    /// ssh's own host-key question (`… continue connecting (yes/no/[fingerprint])?`), not server text.
     public var isConfirmation: Bool {
+        guard !isServerText else { return false }
         let p = prompt.lowercased()
-        return p.contains("(yes/no") || p.contains("continue connecting")
+        return p.contains("continue connecting") && p.contains("(yes/no")
+    }
+
+    /// The host this prompt is for, taken only from text the local ssh writes itself — never from
+    /// text a server can choose. ssh asks `user@host's password:` for password authentication and
+    /// puts `(user@host) ` before every keyboard-interactive prompt, whose remaining text comes from
+    /// the server (which could otherwise write "root@other-host's password:" to obtain the saved
+    /// password of another host). nil when the prompt does not say.
+    public var sshNamedHost: String? { sshNamedLogin?.host }
+
+    /// The user and host ssh names in the prompt (same rules as `sshNamedHost`).
+    public var sshNamedLogin: (user: String, host: String)? {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let m = p.wholeMatch(of: #/([^@\s'()]+)@([^'\s()]+)'s password:/#) { return (String(m.1), String(m.2)) }
+        if let m = p.prefixMatch(of: #/\(([^@\s()]+)@([^)\s]+)\) /#) { return (String(m.1), String(m.2)) }
+        return nil
     }
 }
 
@@ -43,7 +72,16 @@ public typealias AskPassHandler = @Sendable (AskPassRequest) async -> String?
 public final class AskPassBridge: @unchecked Sendable {
     public static let shared = AskPassBridge()
 
-    private struct Context { var targetKey: String; var purpose: String; var count: Int }
+    private struct Context {
+        var targetKey: String
+        var purpose: String
+        var count: Int
+        /// Answered without asking (a passphrase Tether hands to ssh-keygen / ssh-add itself).
+        var fixedAnswer: String? = nil
+        /// The processes this token was given to: only they (and what they start, e.g. the ssh for a
+        /// jump host, then the helper) may use it.
+        var pids: Set<pid_t> = []
+    }
 
     private let lock = NSLock()
     private var contexts: [String: Context] = [:]
@@ -97,6 +135,28 @@ public final class AskPassBridge: @unchecked Sendable {
         ]
     }
 
+    /// An environment whose prompts are all answered with `answer` (for ssh-keygen and ssh-add, so a
+    /// passphrase never appears in a process's arguments). Revoke it when the process has finished.
+    public func environment(answering answer: String, purpose: String) -> [String: String] {
+        guard isAvailable, let helperPath else { return [:] }
+        let token = UUID().uuidString
+        lock.lock(); contexts[token] = Context(targetKey: "", purpose: purpose, count: 0, fixedAnswer: answer); lock.unlock()
+        return [
+            "SSH_ASKPASS": helperPath,
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
+            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
+            "TETHER_ASKPASS_TOKEN": token,
+        ]
+    }
+
+    /// Ties a token to the process it was given to, right after that process started. A token read
+    /// from the environment of a running ssh by some other program is then useless to it.
+    public func bindToken(_ env: [String: String], pid: pid_t) {
+        guard pid > 0, let token = env["TETHER_ASKPASS_TOKEN"] else { return }
+        lock.lock(); contexts[token]?.pids.insert(pid); lock.unlock()
+    }
+
     /// Forgets a token once its process has finished.
     public func revoke(environment env: [String: String]) {
         guard let token = env["TETHER_ASKPASS_TOKEN"] else { return }
@@ -107,14 +167,48 @@ public final class AskPassBridge: @unchecked Sendable {
         while true {
             let client = accept(fd, nil, nil)
             if client < 0 { if errno == EINTR { continue }; return }
-            // Only accept peers running as the same user.
+            // Only accept peers running as the same user, and only processes Tether started (ssh runs
+            // the helper): another program of the same user that read a token from a process
+            // environment cannot ask for a saved password.
             var uid: uid_t = 0, gid: gid_t = 0
-            if getpeereid(client, &uid, &gid) != 0 || uid != getuid() { close(client); continue }
-            Thread.detachNewThread { [weak self] in self?.serve(client) }
+            guard getpeereid(client, &uid, &gid) == 0, uid == getuid(), let peer = Self.peerPID(client),
+                  Self.isDescendant(peer, of: getpid()) else { close(client); continue }
+            Thread.detachNewThread { [weak self] in self?.serve(client, peer: peer) }
         }
     }
 
-    private func serve(_ fd: Int32) {
+    /// The connecting process descends from Tether (Tether → ssh → [ssh for a jump host …] → helper).
+    static func peerIsOurs(_ fd: Int32) -> Bool {
+        guard let pid = peerPID(fd) else { return false }
+        return isDescendant(pid, of: getpid())
+    }
+
+    static func peerPID(_ fd: Int32) -> pid_t? {
+        var pid: pid_t = 0
+        var len = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0, pid > 0 else { return nil }
+        return pid
+    }
+
+    static func isDescendant(_ pid: pid_t, of ancestor: pid_t) -> Bool {
+        var current = pid
+        for _ in 0..<16 {
+            guard let parent = parentPID(of: current), parent > 1 else { return false }
+            if parent == ancestor { return true }
+            current = parent
+        }
+        return false
+    }
+
+    private static func parentPID(of pid: pid_t) -> pid_t? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info.kp_eproc.e_ppid
+    }
+
+    private func serve(_ fd: Int32, peer: pid_t) {
         defer { close(fd) }
         var data = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
@@ -126,12 +220,24 @@ public final class AskPassBridge: @unchecked Sendable {
         guard let obj = try? JSONSerialization.jsonObject(with: data.prefix(while: { $0 != 0x0a })) as? [String: String],
               let token = obj["token"], let prompt = obj["prompt"] else { return }
 
+        // The peer must descend from a process this token was given to. Binding happens right after
+        // launch; a prompt that comes even earlier waits a moment for it.
+        var bound: Set<pid_t> = []
+        for _ in 0..<60 {
+            lock.lock(); let known = contexts[token]; lock.unlock()
+            bound = known?.pids ?? []
+            if !bound.isEmpty || known == nil { break }
+            usleep(50_000)
+        }
+        guard bound.contains(where: { $0 == peer || Self.isDescendant(peer, of: $0) }) else { reply(fd, nil); return }
+
         lock.lock()
         guard var ctx = contexts[token] else { lock.unlock(); reply(fd, nil); return }
         ctx.count += 1
         contexts[token] = ctx
         let handler = self.handler
         lock.unlock()
+        if let fixed = ctx.fixedAnswer { reply(fd, fixed); return }
 
         let request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
                                      prompt: prompt, sequence: ctx.count)

@@ -16,7 +16,9 @@ extension FocusedValues {
 
 struct TetherCommands: Commands {
     let model: AppModel
-    @FocusedValue(\.windowState) private var window
+    @FocusedValue(\.windowState) private var focusedWindow
+    /// No window while Tether is locked, so menu commands do nothing behind the lock screen.
+    private var window: WindowState? { AppLock.shared.isLocked ? nil : focusedWindow }
     @Environment(\.openWindow) private var openWindow
 
     private var active: TerminalSession? { window?.session }
@@ -24,6 +26,11 @@ struct TetherCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About Tether") { openWindow(id: "about") }
+        }
+        CommandGroup(after: .appSettings) {
+            Button("Lock Tether") { AppLock.shared.lock() }
+                .shortcut(.lockApp)
+                .disabled(model.settings.appLockMode == .off || AppLock.shared.isLocked)
         }
         CommandGroup(replacing: .help) {
             Button("Keyboard Shortcuts") { openWindow(id: "shortcuts") }
@@ -80,7 +87,10 @@ struct TetherCommands: Commands {
                 .shortcut(.editConfig)
         }
         CommandGroup(after: .saveItem) {
-            Button("Close Window") { NSApp.keyWindow?.performClose(nil) }
+            Button("Close Window") {
+                if let window, window.window === NSApp.keyWindow { window.requestCloseWindow() }
+                else { NSApp.keyWindow?.performClose(nil) }
+            }
                 .shortcut(.closeWindow)
         }
 

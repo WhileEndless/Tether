@@ -22,6 +22,8 @@ struct Workspace: Codable, Identifiable, Equatable {
 @Observable
 final class WorkspaceStore {
     private(set) var all: [UUID: Workspace] = [:]
+    /// "Window 1", "Window 2", … for the open windows, so the sidebar can say where a tab is.
+    private(set) var numbers: [UUID: Int] = [:]
     @ObservationIgnored private var windows: [UUID: WeakWindow] = [:]
     @ObservationIgnored private var states: [UUID: WeakState] = [:]
     private struct WeakState { weak var state: WindowState? }
@@ -104,6 +106,7 @@ final class WorkspaceStore {
         let closingWindow = windows[id]?.window
         let isLast = windows.filter { $0.key != id && $0.value.window?.isVisible == true }.isEmpty
         windows[id] = nil
+        numbers[id] = nil
         if isLast, !AppModel.shared.isTerminating {
             // The last window keeps its workspace (tabs, selection): the next window — from the menu
             // bar, the Dock or after relaunch — opens it again, with the same size and position.
@@ -137,11 +140,50 @@ final class WorkspaceStore {
 
     func register(_ window: NSWindow, for id: UUID, state: WindowState) {
         if windows[id]?.window !== window { windows[id] = WeakWindow(window: window) }
+        if numbers[id] == nil {
+            let used = Set(numbers.values)
+            numbers[id] = (1...).first { !used.contains($0) }
+        }
         states[id] = WeakState(state: state)
         if all[id] == nil { all[id] = Workspace(id: id) }
     }
 
     func window(of id: UUID) -> NSWindow? { windows[id]?.window }
+
+    /// More than one window is open (only then are windows told apart by number).
+    var hasSeveralWindows: Bool { numbers.count > 1 }
+
+    /// "Window 2" for the window showing a tab, when it is not `here` and several windows are open.
+    func otherWindowName(of tab: UUID, here: UUID) -> String? {
+        guard hasSeveralWindows, let ws = workspace(containing: tab), ws != here, let n = numbers[ws] else { return nil }
+        return "Window \(n)"
+    }
+
+    /// Other visible Tether windows, frontmost first.
+    func otherOpenWorkspaces(than id: UUID) -> [UUID] {
+        NSApp.orderedWindows.compactMap { w in
+            guard w.isVisible, let ws = workspace(of: w), ws != id else { return nil }
+            return ws
+        }
+    }
+
+    /// Brings a window to the front and makes it the one that gets the keyboard.
+    func activate(_ id: UUID) {
+        NSApp.activate()
+        window(of: id)?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Closes a window whose tabs were all moved away — once another window is on screen, so Tether
+    /// never looks like it closed its last window (which would send it to the menu bar).
+    func closeIfEmpty(_ id: UUID, attempts: Int = 20) {
+        guard all[id]?.tabs.isEmpty ?? true, let window = window(of: id) else { return }
+        if otherOpenWorkspaces(than: id).isEmpty {
+            guard attempts > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.closeIfEmpty(id, attempts: attempts - 1) }
+            return
+        }
+        window.close()
+    }
 
     func state(ofWorkspace id: UUID) -> WindowState? { states[id]?.state }
 

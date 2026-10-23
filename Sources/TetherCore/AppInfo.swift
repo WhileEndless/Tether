@@ -4,7 +4,7 @@ import Foundation
 public enum AppInfo {
     public static let name = "Tether"
     /// Marketing version; keep in sync with the VERSION file used by scripts/build-app.sh.
-    public static let version = "0.2.4"
+    public static let version = "0.3.0"
     public static let repository = URL(string: "https://github.com/WhileEndless/tether")!
     public static let issues = URL(string: "https://github.com/WhileEndless/tether/issues")!
     public static let releases = URL(string: "https://github.com/WhileEndless/tether/releases")!
