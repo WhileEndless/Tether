@@ -74,7 +74,7 @@ struct ConnectionCard: View {
 
     private func hostDescription(_ entry: SSHHostEntry?) -> String {
         switch target {
-        case .local: ProcessInfo.processInfo.hostName
+        case .local: localMachineName
         case .alias(let a): "\(entry?.hostName ?? a):\(entry?.port ?? 22)"
         case .adhoc(_, let h, let p, _, _): "\(h):\(p ?? 22)"
         }
@@ -132,9 +132,12 @@ struct MetricGrid: View {
                        tint: .blue, series: history.map(\.cpu))
             MetricTile(title: "Memory", value: s.memFraction, detail: "\(s.memUsed.byteString) / \(s.memTotal.byteString)",
                        tint: .purple, series: history.map(\.memory))
-            MetricTile(title: "Load", value: min((s.load.first ?? 0) / Double(max(s.cpuCount, 1)), 1),
-                       detail: s.load.prefix(3).map { String(format: "%.2f", $0) }.joined(separator: "  "),
-                       tint: .teal, series: [], valueText: String(format: "%.2f", s.load.first ?? 0))
+            // Windows has no load average.
+            if !s.load.isEmpty {
+                MetricTile(title: "Load", value: min((s.load.first ?? 0) / Double(max(s.cpuCount, 1)), 1),
+                           detail: s.load.prefix(3).map { String(format: "%.2f", $0) }.joined(separator: "  "),
+                           tint: .teal, series: [], valueText: String(format: "%.2f", s.load.first ?? 0))
+            }
             if let root {
                 MetricTile(title: "Disk \(root.mount)", value: root.fraction,
                            detail: "\((root.availableKB * 1024).byteString) free", tint: .orange, series: [])

@@ -39,7 +39,7 @@ struct PortsPanel: View {
                 Section("Listening on the server") {
                     ForEach(monitor.listeningPorts.filter { $0.proto == "tcp" }) { p in
                         HStack {
-                            Text("\(p.port)").font(.callout.monospacedDigit()).frame(width: 56, alignment: .leading)
+                            Text(verbatim: String(p.port)).font(.callout.monospacedDigit()).frame(width: 56, alignment: .leading)
                             Text([p.container.map { "🐳 \($0)" }, p.process.isEmpty ? nil : p.process, p.address]
                                     .compactMap { $0 }.joined(separator: " · "))
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)

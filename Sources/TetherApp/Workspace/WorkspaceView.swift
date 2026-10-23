@@ -29,6 +29,7 @@ struct SessionPane: View {
     @Environment(\.openWindow) private var openWindow
     let session: TerminalSession
     @State private var olderHistoryOnDisk = false
+    @State private var dismissedPrompt: PasswordPrompt?
 
     /// The full progress card for first connections, re-attaching after relaunch and failures;
     /// quick reconnects of an established session use the small banner instead.
@@ -87,8 +88,11 @@ struct SessionPane: View {
             .overlay(alignment: .bottom) {
                 if let batch = model.uploadBatches[session.id] {
                     UploadBatchPill(batch: batch).padding(.bottom, 14)
+                } else if let prompt = session.passwordPrompt, prompt != dismissedPrompt {
+                    PasswordPromptBar(session: session, prompt: prompt, dismissed: $dismissedPrompt).padding(.bottom, 14)
                 }
             }
+            .animation(.snappy, value: session.passwordPrompt)
             .animation(.snappy, value: model.uploadBatches[session.id]?.id)
             .animation(.snappy, value: olderHistoryOnDisk)
             .animation(.smooth(duration: 0.25), value: session.progress == nil)

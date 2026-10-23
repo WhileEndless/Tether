@@ -20,7 +20,10 @@ struct LogsPanel: View {
             VStack(spacing: 8) {
                 HStack {
                     Picker("Source", selection: $source) {
-                        ForEach(LogSource.allCases) { Text($0.title).tag($0) }
+                        // Windows: the System, Security and Application event logs.
+                        ForEach(LogSource.allCases) { s in
+                            Text(monitor.platform?.isWindows == true ? WindowsProbeScripts.logName(s) : s.title).tag(s)
+                        }
                         Text("File…").tag(LogSource.file(customPath))
                     }
                     .labelsHidden()

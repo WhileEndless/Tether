@@ -121,3 +121,11 @@ struct EmptyStateView: View {
 extension Array {
     subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
+
+/// This Mac's network name, as shown in the sidebar and host panel.
+var localMachineName: String {
+    #if DEBUG
+    if let demo = DemoMode.localMachineName { return demo }
+    #endif
+    return ProcessInfo.processInfo.hostName
+}

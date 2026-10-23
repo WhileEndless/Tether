@@ -69,7 +69,7 @@ let package = Package(
         .testTarget(name: "TmuxControlTests", dependencies: ["TmuxControl"]),
         .testTarget(name: "MonitorKitTests", dependencies: ["MonitorKit"]),
         .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore"]),
-        .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport"]),
+        .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore"]),
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
         .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit"]),
         .testTarget(name: "SessionKitTests", dependencies: ["SessionKit", "TetherCore"]),

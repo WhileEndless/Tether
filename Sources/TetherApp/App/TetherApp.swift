@@ -79,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppModel.shared.launch()
             TabBarCenter.shared.start()
             installCloseTabShortcut()
+            // After the first window is up, so the notice never blocks starting.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { Updater.shared.checkAtLaunch() }
         }
     }
 

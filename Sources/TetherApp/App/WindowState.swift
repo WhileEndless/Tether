@@ -53,6 +53,8 @@ final class WindowState {
     var renamingSession: TerminalSession?
     /// Files dropped on a terminal, waiting for a destination.
     var uploadRequest: UploadRequest?
+    /// Session whose password prompt the user wants to type into (secure sheet).
+    var passwordEntry: TerminalSession?
 
     let workspaceID: UUID
     @ObservationIgnored weak var window: NSWindow?

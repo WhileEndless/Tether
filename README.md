@@ -2,11 +2,28 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.1.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Changelog](CHANGELOG.md)
+Version 0.2.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
-Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host.
+Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
-> Requires macOS 26 or later. Tether is an early release (0.1.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+![Terminal with the host panel](docs/screenshots/terminal.png)
+
+> Requires macOS 26 or later. Tether is an early release (0.2.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+
+## Screenshots
+
+All screenshots use synthetic demo data (`make demo`); no real hosts are shown.
+
+| | |
+| --- | --- |
+| ![GPU server](docs/screenshots/gpu.png) | ![Containers](docs/screenshots/containers.png) |
+| GPU server with a training run | Docker containers with their published ports |
+| ![Listening ports](docs/screenshots/ports.png) | ![File manager](docs/screenshots/files.png) |
+| Listening ports, one click to forward | File manager tab with services |
+
+![Search](docs/screenshots/search.png)
+
+Search across every terminal, the archive and recordings.
 
 ## Features
 
@@ -17,6 +34,16 @@ Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, witho
   - **Neither** → a plain login shell, with automatic reconnects and a local transcript.
 - **Clear states.** *Online*, *Waiting* (connection lost: history stays visible, input is paused) and *Dead* (the remote session is confirmed gone: read-only and archived). A lost network is detected immediately, and a stalled server within seconds. Tabs reattach when the network returns, and also after the app is quit or crashes.
 - **Background sessions.** Close a tab and keep its session running in the background. Your own tmux sessions on a server are listed too, and you can attach to them. Leftover sessions can be cleaned up.
+
+**Passwords, Touch ID and sudo**
+- Saving passwords is optional: tick *Remember in Keychain* when signing in (works for every jump host and for SSH key passphrases).
+- Saved passwords stay in the macOS login keychain. Optionally Touch ID (or your Mac's password) is asked before one is used, then not again for a time you choose; locking the screen always asks again.
+- When a terminal asks for a password — `sudo`, `su`, `ssh` to another host, a key passphrase — a bar offers to fill a saved one with Touch ID (⌥⌘P) or to type one in a secure field and save it. Nothing is typed without your click.
+
+**Windows servers**
+- Windows 10/11 and Windows Server with OpenSSH (cmd or PowerShell as the default shell) are detected automatically. Nothing is installed.
+- PowerShell terminals, the file manager (drives, upload/download, rename, move, copy, delete), transfers, and the host panel: system, processes, services, network, listening ports, connections, event logs, NVIDIA GPUs and containers.
+- Windows has no tmux or screen, so a shell there ends with its connection (its output stays in the recording).
 
 **Terminal**
 - xterm-256color and true color, mouse reporting, alternate screen, Option as Meta, and key mappings. vim, htop, fzf and emacs work as expected.
@@ -68,7 +95,7 @@ Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, witho
 - Remote file browser as a tab, a panel or a full window, with drag and drop in both directions, Quick Look and details.
 - Directories you have visited open instantly from a cache and refresh in the background, keeping scroll position and selection.
 - *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*.
-- Transfers show speed, amount transferred and ETA.
+- Transfers show what went where, speed, amount transferred and ETA. Many files travel as one packed stream (tar on both ends, nothing written to disk in between); others are copied several at a time. Both are configurable.
 - **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead.
 - Copy files in the file manager and paste them in Finder (and the other way round). Bulk move, copy, permissions, compress, rename and delete.
 
@@ -98,6 +125,7 @@ Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option as M
 | Tab 1…8 / last tab · go to any session | ⌘1…⌘8 / ⌘9 · ⌘P |
 | Move tab to background / disconnect to background | ⇧⌘B / ⌥⇧⌘B |
 | Terminate session | ⌥⇧⌘W |
+| Fill a saved password (sudo, su, ssh prompt) | ⌥⌘P |
 | Jump between commands / select a command's output | ⌘↑ ⌘↓ / ⇧⌘↑ ⇧⌘↓ |
 | Find in terminal / search all sessions | ⌘F (⌘G, ⇧⌘G, ⌘E) / ⇧⌘F |
 | Browse files here / file manager window / transfers | ⇧⌘O / ⌥⌘O / ⌥⌘L |
@@ -108,27 +136,74 @@ Menu shortcuts can be changed in System Settings ▸ Keyboard ▸ Keyboard Short
 
 ## Install
 
-There are no signed builds yet. Build from source:
+### Requirements
+
+- macOS 26 or later. Release downloads are built for Apple silicon; on an Intel Mac, build from source.
+- To build: Xcode 26 or the matching Command Line Tools (Swift 6.2). Check with `swift --version`.
+- On servers: nothing. tmux or GNU screen make sessions persistent if they are there; `tar` (present almost everywhere) speeds up transfers of many files.
+
+### From a release
+
+1. Download `Tether-<version>.zip` from [Releases](https://github.com/WhileEndless/tether/releases) and unzip it.
+2. Move `Tether.app` to `/Applications`.
+3. The app is not notarized yet, so macOS blocks the first launch. Either **right-click Tether.app ▸ Open ▸ Open**, or allow it in **System Settings ▸ Privacy & Security ▸ Open Anyway**. From a terminal you can instead run:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Tether.app
+   ```
+
+### From source
 
 ```sh
 git clone https://github.com/WhileEndless/tether.git
 cd tether
-scripts/build-app.sh
-open dist/Tether.app
+make install          # builds a release and copies it to /Applications
 ```
 
-Requires Xcode 26 (Swift 6.2) on macOS 26.
+Or `make run` to build and open it from `dist/` without installing. A build made on your own Mac is not quarantined, so it opens without the warning.
+
+### Updating
+
+Quit Tether, then install the new version over the old one (`git pull && make install` from source). Settings, hosts, sessions and recordings are kept. Sessions that were open reattach on the next launch.
+
+### Uninstalling
+
+```sh
+make uninstall        # or drag /Applications/Tether.app to the Trash
+```
+
+Your data stays until you remove it:
+
+| What | Where |
+| --- | --- |
+| Settings, host groups, session list, recordings | `~/Library/Application Support/Tether` |
+| Saved passwords | Login keychain (search for "Tether" in Keychain Access) |
+| Your SSH config | `~/.ssh/config` — Tether edits it only when you save a host, and keeps a backup |
+
+Tether sessions that are still running on servers can be ended from the sidebar (*Terminate*) before uninstalling, or later with `tmux kill-session -t tether-…` on the server.
+
+### First steps
+
+1. **⌘N** to connect: pick a host from your ssh config or type `user@host:port`, optionally with a jump host.
+2. Hosts from `~/.ssh/config` appear in the sidebar. Click one to see its status; double-click to open a terminal.
+3. **⌥⌘I** shows the host panel (system, processes, services, containers, ports, logs). **⇧⌘O** opens a file manager in the terminal's current folder.
+4. **⌘/** lists every keyboard shortcut.
 
 ## Building
 
 ```sh
-swift build                      # build everything
-swift test                       # unit + local integration tests
-scripts/build-app.sh             # release build → dist/Tether.app
-open dist/Tether.app
+make                  # build the app → dist/Tether.app
+make help             # list all targets
+make build            # compile (debug)
+make test             # unit and local integration tests — no server needed
+make app              # release build → dist/Tether.app
+make debug            # debug build → dist/Tether.app
+make zip              # dist/Tether-<version>.zip for a release
+make demo             # open the app with synthetic data (SHOTS=1 saves screenshots)
+make check            # privacy scan + release notes + tests
+make clean            # remove build products
 ```
 
-The app is ad-hoc signed. To distribute it, sign and notarize with your own Developer ID.
+`make` only wraps `swift build`, `swift test` and `scripts/build-app.sh`; you can run those directly. The app is ad-hoc signed. To distribute it without the first-launch warning, sign and notarize it with your own Developer ID.
 
 ## Architecture
 
@@ -160,11 +235,11 @@ When a terminal connects, Tether runs a short POSIX `sh` script on the server. I
 
 Tether talks only to the hosts you connect to. Settings, host groups and recordings stay in `~/Library/Application Support/Tether`. Passwords stay in your login keychain.
 
-Nothing is sent anywhere else: no analytics, no telemetry, no update checks.
+Nothing else is sent anywhere: no analytics, no telemetry. At launch Tether asks GitHub once whether a newer release exists (Settings ▸ General can turn this off); if GitHub cannot be reached, nothing happens.
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and the project rules in [CLAUDE.md](CLAUDE.md) (privacy, English only, one release-notes file per version).
 
 ## License
 

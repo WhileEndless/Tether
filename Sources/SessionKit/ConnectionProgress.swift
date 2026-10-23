@@ -144,9 +144,10 @@ final class MasterConnector {
         FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         let p = Process()
         p.executableURL = URL(fileURLWithPath: options.sshBinary)
-        // `true` runs once; with ControlMaster=auto + ControlPersist the connection stays up as master.
+        // `exit` runs once (it works in sh, cmd and PowerShell alike); with ControlMaster=auto +
+        // ControlPersist the connection stays up as master.
         p.arguments = options.commonOptions() + ["-v", "-E", logURL.path, "-o", "ConnectTimeout=20", "-T"]
-            + SSHOptions.destinationArguments(for: target) + ["true"]
+            + SSHOptions.destinationArguments(for: target) + ["exit"]
         p.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice

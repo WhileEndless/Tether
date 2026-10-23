@@ -40,7 +40,7 @@ struct ProcessesPanel: View {
             .padding(10)
 
             Table(rows, selection: $selection, sortOrder: $sort) {
-                TableColumn("PID", value: \.pid) { Text("\($0.pid)").monospacedDigit() }.width(min: 44, ideal: 56)
+                TableColumn("PID", value: \.pid) { Text(verbatim: String($0.pid)).monospacedDigit() }.width(min: 44, ideal: 56)
                 TableColumn("Name", value: \.name) { p in Text(p.name).help(p.command) }.width(min: 80, ideal: 140)
                 TableColumn("CPU %", value: \.cpu) { Text(String(format: "%.1f", $0.cpu)).monospacedDigit() }.width(min: 44, ideal: 54)
                 TableColumn("Mem %", value: \.mem) { Text(String(format: "%.1f", $0.mem)).monospacedDigit() }.width(min: 44, ideal: 54)

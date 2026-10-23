@@ -13,7 +13,9 @@ struct SettingsView: View {
             Tab("Keyboard", systemImage: "keyboard") { KeyboardSettings() }
             Tab("Sessions", systemImage: "arrow.triangle.2.circlepath") { SessionSettings() }
             Tab("Recordings", systemImage: "record.circle") { RecordingSettings() }
+            Tab("Transfers", systemImage: "arrow.up.arrow.down.circle") { TransferSettings() }
             Tab("Monitoring", systemImage: "gauge.with.dots.needle.33percent") { MonitoringSettings() }
+            Tab("Passwords", systemImage: "key") { PasswordSettings() }
             Tab("SSH", systemImage: "lock.shield") { SSHSettings() }
         }
         .frame(width: 620, height: 520)
@@ -26,8 +28,14 @@ private struct GeneralSettings: View {
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
-            Section("Startup") {
+            Section {
                 Toggle("Re-attach persistent sessions on launch", isOn: $store.settings.restoreSessionsOnLaunch)
+                Toggle("Check for a new version at launch", isOn: $store.settings.checkForUpdates)
+            } header: {
+                Text("Startup")
+            } footer: {
+                Text("One request to GitHub when Tether starts. If a newer release exists, Tether tells you and links to it; nothing is downloaded or sent.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Tabs & Windows") {
                 Toggle("Open new sessions in a separate window", isOn: $store.settings.openNewSessionsInWindow)
@@ -216,6 +224,40 @@ enum KeyCaptureWindow {
     }
 }
 
+private struct TransferSettings: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var store = model.settingsStore
+        Form {
+            Section {
+                Picker("Pack many files into one stream", selection: $store.settings.transferArchiveMode) {
+                    ForEach(TransferArchiveMode.allCases) { Text($0.title).tag($0) }
+                }
+                if store.settings.transferArchiveMode == .auto {
+                    Stepper("Pack when a transfer has \(store.settings.transferArchiveThreshold) or more files",
+                            value: $store.settings.transferArchiveThreshold, in: 2...10_000, step: 5)
+                }
+                Toggle("Compress packed transfers", isOn: $store.settings.transferCompress)
+            } header: {
+                Text("Many Files")
+            } footer: {
+                Text("Packed transfers are made with tar on one side and unpacked on the other in a single stream — no temporary archive is written, and nothing at the destination is overwritten. This is much faster than copying many small files one by one. Compression helps on slow connections; turn it off on fast local networks. The server needs tar (it almost always has it). You can also choose per upload.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Stepper("Transfer \(store.settings.transferParallel) item\(store.settings.transferParallel == 1 ? "" : "s") at the same time",
+                        value: $store.settings.transferParallel, in: 1...8)
+            } header: {
+                Text("Parallel Transfers")
+            } footer: {
+                Text("Items that are not packed are copied with scp, several at once, in the order they were added. All of them share one authenticated connection to the host.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
 private struct SessionSettings: View {
     @Environment(AppModel.self) private var model
     var body: some View {
@@ -351,7 +393,6 @@ private struct MonitoringSettings: View {
 
 private struct SSHSettings: View {
     @Environment(AppModel.self) private var model
-    @State private var accounts: [String] = []
 
     var body: some View {
         @Bindable var store = model.settingsStore
@@ -374,14 +415,62 @@ private struct SSHSettings: View {
                 Text("Terminals, file transfers and monitoring reuse one authenticated connection, so you log in (and pass jump hosts) only once.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Saved Passwords") {
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct PasswordSettings: View {
+    @Environment(AppModel.self) private var model
+    @State private var accounts: [String] = []
+    @State private var locked = false
+
+    var body: some View {
+        @Bindable var store = model.settingsStore
+        Form {
+            Section {
+                Toggle("Ask for \(SecretGate.shared.methodName) before using a saved password", isOn: $store.settings.requireAuthForSavedPasswords)
+                if store.settings.requireAuthForSavedPasswords {
+                    Picker("Ask again after", selection: $store.settings.authGraceSeconds) {
+                        Text("Every time").tag(0)
+                        Text("1 minute").tag(60)
+                        Text("5 minutes").tag(300)
+                        Text("15 minutes").tag(900)
+                        Text("1 hour").tag(3600)
+                    }
+                    HStack {
+                        Text("Locking the screen or sleeping always asks again.").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(locked ? "Locked" : "Lock Now") { SecretGate.shared.lock(); locked = true }
+                            .disabled(locked)
+                    }
+                }
+            } header: {
+                Text("Touch ID")
+            } footer: {
+                Text("Saving is always optional: tick “Remember in Keychain” when signing in, or save a password from the bar that appears when a terminal asks for one. Passwords stay in your login keychain, encrypted by macOS, and are sent only to the host they belong to.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Offer to fill passwords in terminals", isOn: $store.settings.detectPasswordPrompts)
+            } header: {
+                Text("sudo, su and other prompts")
+            } footer: {
+                Text("When a terminal shows a prompt such as “[sudo] password for alice:”, “Password:” (su) or “alice@host's password:”, a bar offers to fill a saved password (⌥⌘P) or to type one in a secure field and save it. Nothing is typed without your click, and prompts for a new password are ignored. Applies to sessions connected after the change.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Saved in Keychain") {
                 if accounts.isEmpty {
                     Text("No passwords saved").foregroundStyle(.secondary)
                 }
                 ForEach(accounts, id: \.self) { a in
+                    let d = CredentialKey.describe(a)
                     HStack {
-                        Image(systemName: "key.fill").foregroundStyle(.secondary)
-                        Text(a)
+                        Image(systemName: d.symbol).foregroundStyle(.secondary).frame(width: 20)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(d.title)
+                            Text(d.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
                         Spacer()
                         Button("Remove", role: .destructive) {
                             PasswordVault.deletePassword(for: a)
@@ -392,6 +481,6 @@ private struct SSHSettings: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { accounts = PasswordVault.allAccounts() }
+        .onAppear { accounts = PasswordVault.allAccounts(); locked = false }
     }
 }

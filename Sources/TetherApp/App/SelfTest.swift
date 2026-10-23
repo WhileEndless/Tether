@@ -42,6 +42,7 @@ enum SelfTest {
         model.settings.showStatusStrip = env["TETHER_SELFTEST_NOSTRIP"] == nil
         model.settings.cursorBlink = env["TETHER_SELFTEST_NOBLINK"] == nil ? model.settings.cursorBlink : false
         model.settings.showSidebarArchive = false
+        model.settings.requireAuthForSavedPasswords = false
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
 
@@ -107,6 +108,16 @@ enum SelfTest {
             try? await Task.sleep(for: .seconds(1))
             snapshot(help, "07-shortcuts")
             help.close()
+            // A sudo-style prompt in the terminal shows the password bar; entering clears it.
+            if let s = state.session, let view = TerminalRegistry.shared.existingView(for: s.id) {
+                view.send(source: view, data: Array("printf '[sudo] password for demo: '; stty -echo; read x; stty echo; echo \"got ${#x}\"\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(1.5))
+                say("prompt kind=\(s.passwordPrompt?.kind.rawValue ?? "none") user=\(s.passwordPrompt?.user ?? "-") saved=\(model.hasSavedPassword(for: s))")
+                snapshot(state.window, "09-password-bar")
+                model.enterPassword("selftest-pw", in: s, save: false)
+                try? await Task.sleep(for: .seconds(1))
+                say("prompt after enter=\(s.passwordPrompt == nil ? "cleared" : "still there")")
+            }
             // Pasted image → upload sheet (private pasteboard; the user's clipboard is not touched).
             let pb = NSPasteboard(name: NSPasteboard.Name("tether-selftest"))
             pb.clearContents()
@@ -122,6 +133,28 @@ enum SelfTest {
                 say("paste image failed")
             }
             pb.releaseGlobally()
+            // Transfers popover: sizes to its rows; removing a row keeps the layout intact.
+            let tdir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-selftest-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: tdir.appendingPathComponent("out"), withIntermediateDirectories: true)
+            let tfiles = (1...3).map { tdir.appendingPathComponent("sample-\($0).txt") }
+            for f in tfiles { try? Data("hello".utf8).write(to: f) }
+            model.transfers.uploadGroup(tfiles, names: tfiles.map(\.lastPathComponent), to: tdir.appendingPathComponent("out").path,
+                                        target: .local, fileCount: 3, totalBytes: 15, pack: false)
+            try? await Task.sleep(for: .seconds(1.5))
+            let host = NSHostingView(rootView: TransfersView().environment(model))
+            let tw = NSWindow(contentRect: NSRect(origin: .zero, size: host.fittingSize), styleMask: [.titled], backing: .buffered, defer: false)
+            tw.contentView = host
+            tw.orderFront(nil)
+            try? await Task.sleep(for: .seconds(0.5))
+            say("transfers size \(host.fittingSize) items=\(model.transfers.items.map { "\($0.state)" })")
+            snapshot(tw, "09-transfers")
+            if let first = model.transfers.items.first { model.transfers.remove(first) }
+            try? await Task.sleep(for: .seconds(0.8))
+            tw.setContentSize(host.fittingSize)
+            say("transfers size after remove \(host.fittingSize)")
+            snapshot(tw, "10-transfers-removed")
+            tw.close()
+            try? FileManager.default.removeItem(at: tdir)
             say("phases \(model.sessions.sessions.map { "\($0.phase)" })")
             say("windows \(NSApp.windows.filter(\.isVisible).count) tabs \(state.workspace.tabs.count)")
             // File manager tab: open, list, switch away and back, move to background.

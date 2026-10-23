@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import SSHTransport
+import TetherCore
 
 /// Live system information for one host, shared by every view that shows it.
 ///
@@ -36,12 +37,16 @@ public final class RemoteMonitor {
     public private(set) var isStreaming = false
     /// Latency of short commands over the shared connection (for hosts without a tmux session).
     public private(set) var commandLatency: Double?
+    /// The host's platform, once known (Windows hosts have no load average, tmux, etc.).
+    public private(set) var platform: RemotePlatform?
 
     @ObservationIgnored private var stream: RemoteStream?
     @ObservationIgnored private var interest = 0
     @ObservationIgnored private var interval: TimeInterval = 3
     @ObservationIgnored private var restartTask: Task<Void, Never>?
     @ObservationIgnored private var lastFrameAt: Date?
+    /// Demo data loaded: never contact the host.
+    @ObservationIgnored private var frozen = false
 
     public init(executor: RemoteExecutor) {
         self.executor = executor
@@ -53,7 +58,7 @@ public final class RemoteMonitor {
     public func retain(interval: TimeInterval) {
         interest += 1
         self.interval = max(interval, 1)
-        if stream == nil { startStream() }
+        if stream == nil && !frozen { startStream() }
     }
 
     /// A view stops showing it. The stream ends shortly after the last one goes away.
@@ -68,6 +73,7 @@ public final class RemoteMonitor {
     }
 
     private func startStream() {
+        guard !frozen else { return }
         restartTask?.cancel()
         let s = RemoteStream(separator: "@@end\n")
         s.onRecord = { [weak self] text in self?.ingest(text) }
@@ -89,7 +95,15 @@ public final class RemoteMonitor {
         }
         stream = s
         isStreaming = true
-        s.start(executor: executor, script: ProbeScripts.systemStream, arguments: [String(Int(interval))], purpose: "monitor")
+        let executor = self.executor
+        let interval = self.interval
+        Task { [weak self] in
+            let platform = await executor.resolvedPlatform()
+            guard let self, self.stream === s else { return }
+            self.platform = platform
+            s.start(executor: executor, script: RemoteScript(ProbeScripts.systemStream, windows: WindowsProbeScripts.systemStream),
+                    platform: platform, arguments: [String(Int(interval))], purpose: "monitor")
+        }
     }
 
     private func stopStream() {
@@ -113,9 +127,10 @@ public final class RemoteMonitor {
 
     /// One-off refresh (e.g. the Retry button).
     public func refresh(firstSample: Bool = false) async {
+        guard !frozen else { return }
         do {
             let start = Date()
-            let text = try await executor.output(script: ProbeScripts.system, arguments: ["1"], timeout: 20, purpose: "monitor")
+            let text = try await executor.output(RemoteScript(ProbeScripts.system, windows: WindowsProbeScripts.system), arguments: ["1"], timeout: 20, purpose: "monitor")
             commandLatency = Date().timeIntervalSince(start)
             ingest(text)
         } catch {
@@ -127,26 +142,30 @@ public final class RemoteMonitor {
     // MARK: On-demand data
 
     public func refreshProcesses() async {
-        if let text = try? await executor.output(script: ProbeScripts.processes, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.processes, windows: WindowsProbeScripts.processes), timeout: 20, purpose: "monitor") {
             processes = ProbeParser.processes(text)
         }
     }
 
     public func refreshListeningPorts() async {
-        if let text = try? await executor.output(script: ProbeScripts.listening, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.listening, windows: WindowsProbeScripts.listening), timeout: 20, purpose: "monitor") {
             if containers.isEmpty { await refreshContainers() }
             listeningPorts = ProbeParser.listening(text, containers: containers)
         }
     }
 
     public func refreshGPUProcesses() async {
-        if let text = try? await executor.output(script: ProbeScripts.gpuProcesses, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.gpuProcesses, windows: WindowsProbeScripts.gpuProcesses), timeout: 20, purpose: "monitor") {
             gpuProcesses = ProbeParser.gpuProcesses(text)
         }
     }
 
     public func refreshConnections() async {
-        if let text = try? await executor.output(script: ProbeScripts.connections, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.connections, windows: WindowsProbeScripts.connections), timeout: 20, purpose: "monitor") {
             let parsed = ProbeParser.connections(text)
             logins = parsed.logins
             connections = parsed.connections
@@ -154,29 +173,36 @@ public final class RemoteMonitor {
     }
 
     public func refreshServices() async {
-        if let text = try? await executor.output(script: ProbeScripts.services, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.services, windows: WindowsProbeScripts.services), timeout: 20, purpose: "monitor") {
             services = ProbeParser.services(text)
         }
     }
 
     public func refreshContainers() async {
-        if let text = try? await executor.output(script: ProbeScripts.containers, timeout: 20, purpose: "monitor") {
+        guard !frozen else { return }
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.containers, windows: WindowsProbeScripts.containers), timeout: 20, purpose: "monitor") {
             containers = ProbeParser.containers(text)
         }
     }
 
     public func refreshRemoteSessions() async {
+        guard !frozen else { return }
         let start = Date()
-        if let text = try? await executor.output(script: ProbeScripts.remoteSessions, timeout: 20, purpose: "monitor") {
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.remoteSessions, windows: WindowsProbeScripts.remoteSessions), timeout: 20, purpose: "monitor") {
             commandLatency = Date().timeIntervalSince(start)
             remoteSessions = ProbeParser.remoteSessions(text)
         }
     }
 
     public func loadLogs(_ source: LogSource, lines: Int) async {
+        guard !frozen else { return }
         let (script, args) = ProbeScripts.logs(source, lines: lines)
+        let windowsArgs = [WindowsProbeScripts.logName(source), String(max(lines, 10))]
         do {
-            logText = try await executor.output(script: script, arguments: args, timeout: 30, purpose: "logs")
+            let platform = await executor.resolvedPlatform()
+            logText = try await executor.output(RemoteScript(script, windows: WindowsProbeScripts.logs),
+                                                arguments: platform.isWindows ? windowsArgs : args, timeout: 30, purpose: "logs")
         } catch {
             logText = ""
             self.error = error.localizedDescription
@@ -184,13 +210,14 @@ public final class RemoteMonitor {
     }
 
     public func serviceLogs(_ unit: String, lines: Int) async -> String {
-        (try? await executor.output(script: #"journalctl -u "$1" -n "$2" --no-pager -o short-iso 2>&1"#,
+        (try? await executor.output(RemoteScript(#"journalctl -u "$1" -n "$2" --no-pager -o short-iso 2>&1"#,
+                                                 windows: WindowsProbeScripts.serviceLogs),
                                     arguments: [unit, String(lines)], timeout: 30, purpose: "logs")) ?? ""
     }
 
     /// Sends a signal to a remote process. Returns an error message on failure.
     public func signal(_ pid: Int, signal: String) async -> String? {
-        let r = await executor.run(script: ProbeScripts.kill, arguments: [signal, String(pid)], timeout: 15, purpose: "kill")
+        let r = await executor.run(RemoteScript(ProbeScripts.kill, windows: WindowsProbeScripts.kill), arguments: [signal, String(pid)], timeout: 15, purpose: "kill")
         if r.succeeded {
             await refreshProcesses()
             return nil
@@ -201,7 +228,7 @@ public final class RemoteMonitor {
 
     /// start / stop / restart a service. Returns an error message on failure.
     public func service(_ action: String, _ unit: String) async -> String? {
-        let r = await executor.run(script: ProbeScripts.serviceAction, arguments: [action, unit], timeout: 60, purpose: "service")
+        let r = await executor.run(RemoteScript(ProbeScripts.serviceAction, windows: WindowsProbeScripts.serviceAction), arguments: [action, unit], timeout: 60, purpose: "service")
         await refreshServices()
         if r.succeeded { return nil }
         let msg = r.errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -211,7 +238,7 @@ public final class RemoteMonitor {
 
     /// start / stop / restart / logs for a container. Returns output (logs) or an error.
     public func container(_ action: String, _ c: ContainerEntry) async -> (ok: Bool, output: String) {
-        let r = await executor.run(script: ProbeScripts.containerAction, arguments: [c.engine, action, c.id],
+        let r = await executor.run(RemoteScript(ProbeScripts.containerAction, windows: WindowsProbeScripts.containerAction), arguments: [c.engine, action, c.id],
                                    timeout: 60, purpose: "containers")
         if action != "logs" { await refreshContainers() }
         return (r.succeeded, r.output + r.errorOutput)
@@ -233,4 +260,52 @@ public final class RemoteMonitor {
         await refreshRemoteSessions()
         return orphans.count
     }
+
+    #if DEBUG
+    /// Debug builds only: fills the monitor with prepared probe output (in the real probe formats,
+    /// so the real parsers run) and stops it from contacting the host. Used for demo screenshots.
+    public func loadDemo(_ demo: DemoData) {
+        frozen = true
+        stopStream()
+        var snap = ProbeParser.system(demo.systemFrame, previous: nil)
+        for i in snap.interfaces.indices {
+            if let r = demo.rates[snap.interfaces[i].name] { snap.interfaces[i].rxRate = r.rx; snap.interfaces[i].txRate = r.tx }
+        }
+        snap.cpuUsage = demo.history.last?.cpu
+        snapshot = snap
+        let now = Date()
+        history = demo.history.enumerated().map { i, h in
+            Sample(date: now.addingTimeInterval(Double(i - demo.history.count) * 5), cpu: h.cpu, memory: h.memory,
+                   gpu: h.gpu, rx: h.rx, tx: h.tx)
+        }
+        containers = ProbeParser.containers(demo.containers)
+        processes = ProbeParser.processes(demo.processes)
+        services = ProbeParser.services(demo.services)
+        listeningPorts = ProbeParser.listening(demo.listening, containers: containers)
+        let parsed = ProbeParser.connections(demo.connections)
+        logins = parsed.logins
+        connections = parsed.connections
+        remoteSessions = ProbeParser.remoteSessions(demo.remoteSessions)
+        gpuProcesses = ProbeParser.gpuProcesses(demo.gpuProcesses)
+        logText = demo.logs
+        commandLatency = demo.latency
+        error = nil
+    }
+
+    public struct DemoData {
+        public var systemFrame = ""
+        public var rates: [String: (rx: Double, tx: Double)] = [:]
+        public var history: [(cpu: Double, memory: Double, gpu: Double?, rx: Double?, tx: Double?)] = []
+        public var processes = ""
+        public var services = ""
+        public var containers = ""
+        public var listening = ""
+        public var connections = ""
+        public var remoteSessions = ""
+        public var gpuProcesses = ""
+        public var logs = ""
+        public var latency: Double?
+        public init() {}
+    }
+    #endif
 }

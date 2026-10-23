@@ -57,6 +57,7 @@ struct WorkspaceWindow: View {
         .sheet(isPresented: $state.showConfigEditor) { ConfigFileEditorView() }
         .sheet(isPresented: $state.showSwitcher) { SessionSwitcherView() }
         .sheet(item: $state.uploadRequest) { UploadSheet(request: $0) }
+        .sheet(item: $state.passwordEntry) { PasswordEntrySheet(session: $0) }
         .alert("Rename", isPresented: Binding(get: { state.renamingSession != nil },
                                               set: { if !$0 { state.renamingSession = nil } })) {
             TextField("Name", text: $renameText)
@@ -75,6 +76,7 @@ struct WorkspaceWindow: View {
             model.adoptOrphanSessions(into: state)
             #if DEBUG
             SelfTest.runIfRequested(state: state)
+            DemoMode.runIfRequested(state: state)
             #endif
         }
         .onDisappear {
@@ -132,7 +134,7 @@ struct WorkspaceToolbar: ToolbarContent {
             .badge(model.transfers.activeCount)
             .help("File transfers (⌥⌘L)")
             .popover(isPresented: Bindable(state).showTransfers, arrowEdge: .bottom) {
-                TransfersView().frame(width: 380, height: 360)
+                TransfersView()
             }
 
             Button {

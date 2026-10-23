@@ -15,6 +15,7 @@ public struct SessionConfiguration: Sendable {
     public var historyLinesOnReattach: Int
     public var recordingEnabled: Bool
     public var stallTimeout: Double
+    public var detectPasswordPrompts: Bool
 
     public init(settings: AppSettings) {
         ssh = SSHOptions(settings: settings)
@@ -25,6 +26,7 @@ public struct SessionConfiguration: Sendable {
         historyLinesOnReattach = settings.historyLinesOnReattach
         recordingEnabled = settings.recordingEnabled
         stallTimeout = max(settings.stallTimeout, 3)
+        detectPasswordPrompts = settings.detectPasswordPrompts
     }
 }
 
@@ -46,6 +48,13 @@ public final class TerminalSession: Identifiable {
     public private(set) var activity: (command: String, path: String)?
     /// Step-by-step progress while connecting or re-attaching (nil once online).
     public private(set) var progress: ConnectionProgress?
+    /// A password prompt currently waiting in the terminal (sudo, su, ssh, …), if any.
+    public private(set) var passwordPrompt: PasswordPrompt?
+    @ObservationIgnored private var promptDetector = PasswordPromptDetector()
+    /// Whether to look for password prompts (from the settings; updated on connect and by the app).
+    @ObservationIgnored public var detectPrompts = true
+    /// The host's platform as detected when connecting (Windows hosts get PowerShell, no persistence).
+    public private(set) var platform: RemotePlatform = .posix
 
     /// Round-trip latency to the server, as shown in the UI. Updated only when what is displayed
     /// would change (10 ms steps, quality) or every 30 s, so frequent samples do not redraw views.
@@ -143,6 +152,10 @@ public final class TerminalSession: Identifiable {
 
     /// User input from the terminal view. Dropped unless the session can accept it.
     public func send(_ bytes: ArraySlice<UInt8>) {
+        if passwordPrompt != nil, bytes.contains(0x0d) || bytes.contains(0x0a) || bytes.contains(0x03) {
+            passwordPrompt = nil
+            promptDetector.reset()
+        }
         switch phase {
         case .online:
             if let tmux { tmux.sendInput(bytes) } else { process?.send(data: bytes) }
@@ -256,6 +269,7 @@ public final class TerminalSession: Identifiable {
     /// the terminal then attaches to it instantly.
     private func launch(attachOnly: Bool) {
         let config = configurationProvider()
+        detectPrompts = config.detectPasswordPrompts
         intentionalStop = false
         markerBuffer = []
         markerResolved = false
@@ -279,6 +293,7 @@ public final class TerminalSession: Identifiable {
         connectTask?.cancel()
         let target = descriptor.target
         guard !target.isLocal, config.ssh.useControlMaster else {
+            platform = target.isLocal ? .posix : (PlatformCache.shared.cached(target.key) ?? .posix)
             startTerminal(attachOnly: attachOnly)
             return
         }
@@ -303,6 +318,9 @@ public final class TerminalSession: Identifiable {
                 }
             }
             guard !Task.isCancelled, !self.intentionalStop else { return }
+            self.progress?.detail = "Checking the server's shell"
+            self.platform = await executor.resolvedPlatform()
+            guard !Task.isCancelled, !self.intentionalStop else { return }
             self.startTerminal(attachOnly: attachOnly)
         }
     }
@@ -326,6 +344,10 @@ public final class TerminalSession: Identifiable {
         progress?.step = .startSession
         progress?.detail = descriptor.target.isLocal ? "Starting a local shell" : "Starting the session on the server"
 
+        if platform.isWindows {
+            startWindowsTerminal(attachOnly: attachOnly, config: config)
+            return
+        }
         let mode: PersistenceMode
         switch persistence {
         case .tmux: mode = .tmux
@@ -359,6 +381,41 @@ public final class TerminalSession: Identifiable {
         if local { env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin") }
         process.startProcess(executable: executable, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh")
+    }
+
+    /// Windows hosts: an interactive PowerShell over ssh. There is no tmux or screen on Windows,
+    /// so the shell ends with the connection (like a plain shell on other systems).
+    private func startWindowsTerminal(attachOnly: Bool, config: SessionConfiguration) {
+        if attachOnly {
+            progress?.failure = "Windows sessions end when the connection drops."
+            progress?.hint = "Windows has no tmux or screen to keep the shell running. Open a new session to continue."
+            intentionalStop = true
+            finish(reason: "The Windows shell ended with the connection", archive: wasOnline)
+            return
+        }
+        var command: String?
+        if let dir = descriptor.initialDirectory, !dir.isEmpty {
+            let quoted = "'" + dir.replacingOccurrences(of: "'", with: "''") + "'"
+            command = "powershell -NoLogo -NoExit -Command \"Set-Location -LiteralPath \(quoted)\""
+        } else if platform == .windowsCmd {
+            command = "powershell -NoLogo"
+        }
+        let args = config.ssh.interactiveArguments(target: descriptor.target, remoteCommand: command)
+        AskPassBridge.shared.revoke(environment: askPassEnv)
+        askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
+        var env = ProcessInfo.processInfo.environment
+        env["TERM"] = "xterm-256color"
+        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        for (k, v) in askPassEnv { env[k] = v }
+        let bridge = ProcessBridge(owner: self)
+        self.bridge = bridge
+        let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
+        self.process = process
+        process.startProcess(executable: config.ssh.sshBinary, args: args,
+                             environment: env.map { "\($0.key)=\($0.value)" }, execName: "ssh")
+        markerResolved = true
+        progress?.detail = "Starting PowerShell"
+        handleMarker(.plain)
     }
 
     /// Cancels a connection attempt in progress.
@@ -617,6 +674,10 @@ public final class TerminalSession: Identifiable {
         fedAnything = true
         sink?.feed(bytes[...])
         recorder?.append(bytes)
+        if detectPrompts {
+            let prompt = promptDetector.feed(bytes)
+            if prompt != passwordPrompt { passwordPrompt = prompt }
+        }
     }
 
     private func rememberStderr(_ bytes: [UInt8]) {

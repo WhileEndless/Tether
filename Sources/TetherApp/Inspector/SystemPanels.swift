@@ -15,7 +15,7 @@ struct GPUPanel: View {
                     }
                     ForEach(monitor.gpuProcesses) { p in
                         HStack {
-                            Text("\(p.pid)").font(.callout.monospacedDigit()).frame(width: 60, alignment: .leading)
+                            Text(verbatim: String(p.pid)).font(.callout.monospacedDigit()).frame(width: 60, alignment: .leading)
                             Text((p.name as NSString).lastPathComponent).lineLimit(1).help(p.name)
                             Spacer()
                             Text(p.memoryUsed?.byteString ?? "—").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
@@ -213,7 +213,7 @@ private struct PortChips: View {
                 HStack(spacing: 3) {
                     Image(systemName: m.exposure == .allInterfaces ? "globe" : m.exposure == .localOnly ? "lock" : "network")
                         .foregroundStyle(m.exposure == .allInterfaces ? .orange : .secondary)
-                    Text(m.hostPort.map { "\($0) → \(m.containerPort)/\(m.proto)" } ?? "\(m.containerPort)/\(m.proto) (not published)")
+                    Text(verbatim: m.hostPort.map { "\(String($0)) → \(String(m.containerPort))/\(m.proto)" } ?? "\(String(m.containerPort))/\(m.proto) (not published)")
                     if m.isPublished && m.proto == "tcp" && container.isRunning {
                         Button { forward(m) } label: { Image(systemName: "arrow.left.arrow.right.circle") }
                             .buttonStyle(.borderless)

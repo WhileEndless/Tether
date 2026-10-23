@@ -57,10 +57,12 @@ struct HostStatusStrip: View {
                 if let root = s.disks.first(where: { $0.mount == "/" }) ?? s.disks.first {
                     meter("Disk", "internaldrive", root.fraction, tab: .overview, density)
                 }
-                Button { open(.overview) } label: {
-                    item(density == .full ? "Load" : nil, "chart.line.uptrend.xyaxis", String(format: "%.2f", s.load.first ?? 0))
+                if let load = s.load.first {
+                    Button { open(.overview) } label: {
+                        item(density == .full ? "Load" : nil, "chart.line.uptrend.xyaxis", String(format: "%.2f", load))
+                    }
+                    .help("Load average (1 min)")
                 }
-                .help("Load average (1 min)")
                 if let net = s.networkRates {
                     Button { open(.overview) } label: {
                         HStack(spacing: 4) {

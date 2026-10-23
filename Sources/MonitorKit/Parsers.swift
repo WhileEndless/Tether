@@ -309,6 +309,18 @@ public enum ProbeParser {
                                     sub: running ? "running" : "dead", description: running ? "pid \(f[0])" : "exit \(f[1])")
             }
         }
+        if let win = s["winsvc"] {
+            // name|status|start type|display name (Windows services)
+            return win.compactMap { line in
+                let f = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+                guard f.count >= 4 else { return nil }
+                let running = f[1] == "Running"
+                let state: (String, String) = running ? ("active", "running")
+                    : f[1] == "Stopped" ? ("inactive", "dead") : ("activating", f[1].lowercased())
+                return ServiceEntry(name: f[0], load: f[2] == "Disabled" ? "disabled" : "loaded", active: state.0, sub: state.1,
+                                    description: f[3])
+            }
+        }
         if let sysv = s["sysv"] {
             return sysv.compactMap { line in
                 // " [ + ]  ssh"

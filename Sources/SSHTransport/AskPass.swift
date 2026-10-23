@@ -17,6 +17,15 @@ public struct AskPassRequest: Sendable {
 
     public var isPasswordPrompt: Bool { prompt.lowercased().contains("password") }
 
+    /// `Enter passphrase for key '/path/to/key':`
+    public var isPassphrasePrompt: Bool { prompt.lowercased().contains("passphrase") }
+
+    /// The key file a passphrase prompt is about.
+    public var keyPath: String? {
+        guard let open = prompt.firstIndex(of: "'"), let close = prompt.lastIndex(of: "'"), open < close else { return nil }
+        return String(prompt[prompt.index(after: open)..<close])
+    }
+
     public var isConfirmation: Bool {
         let p = prompt.lowercased()
         return p.contains("(yes/no") || p.contains("continue connecting")
@@ -62,7 +71,7 @@ public final class AskPassBridge: @unchecked Sendable {
         addr.sun_family = sa_family_t(AF_UNIX)
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
         guard path.utf8.count < maxLen else { close(fd); return }
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        _ = withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: maxLen) { strncpy($0, path, maxLen - 1) }
         }
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)

@@ -111,6 +111,8 @@ struct Shortcut: Identifiable {
                                            note: "Keeps the session running and connected")
     static let disconnect = Shortcut("Disconnect & Move to Background", .session, k("b", [.command, .option, .shift]),
                                      note: "Drops the connection; tmux/screen keeps running on the server")
+    static let fillPassword = Shortcut("Fill Saved Password", .session, k("p", [.command, .option]),
+                                       note: "When the terminal asks for a password (sudo, su, ssh); asks for Touch ID")
     static let terminate = Shortcut("Terminate Session…", .session, k("w", [.command, .option, .shift]),
                                     note: "Stops the shell on the server (asks first)")
 
@@ -160,7 +162,7 @@ struct Shortcut: Identifiable {
         newConnection, newTab, newLocalTerminal, newWindow, addHost, editConfig,
         closeTab, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
-        reconnect, moveToBackground, disconnect, terminate,
+        reconnect, moveToBackground, disconnect, fillPassword, terminate,
         clearScrollback, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,

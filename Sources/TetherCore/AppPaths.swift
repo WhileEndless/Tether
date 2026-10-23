@@ -41,8 +41,12 @@ public enum AppPaths {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh", isDirectory: true)
     }
 
+    /// ~/.ssh/config (overridable with TETHER_SSH_CONFIG for tests and the demo).
     public static var defaultSSHConfig: URL {
-        userSSHDirectory.appendingPathComponent("config")
+        if let custom = ProcessInfo.processInfo.environment["TETHER_SSH_CONFIG"] {
+            return URL(fileURLWithPath: custom)
+        }
+        return userSSHDirectory.appendingPathComponent("config")
     }
 
     @discardableResult

@@ -21,6 +21,38 @@ public enum PersistenceMode: String, Codable, CaseIterable, Identifiable, Sendab
     }
 }
 
+/// The kind of shell a host gives us, detected on first contact and remembered.
+public enum RemotePlatform: String, Codable, Sendable {
+    /// Linux, macOS, BSD and other Unix-like systems (POSIX `sh` available).
+    case posix
+    /// Windows with OpenSSH and cmd.exe as the default shell.
+    case windowsCmd
+    /// Windows with OpenSSH and PowerShell as the default shell.
+    case windowsPowerShell
+
+    public var isWindows: Bool { self != .posix }
+
+    public var title: String {
+        switch self {
+        case .posix: "Unix-like"
+        case .windowsCmd: "Windows (cmd)"
+        case .windowsPowerShell: "Windows (PowerShell)"
+        }
+    }
+
+    /// Remote command whose output tells the shells apart:
+    /// sh prints `TETHER:%OS%::`, cmd expands `%OS%` to `Windows_NT`, PowerShell expands `$PSHOME`.
+    public static let probeCommand = #"echo "TETHER:%OS%:$PSHOME:""#
+
+    public static func parse(probeOutput: String) -> RemotePlatform? {
+        guard let line = probeOutput.split(whereSeparator: \.isNewline).first(where: { $0.contains("TETHER:") }) else { return nil }
+        if line.contains("Windows_NT") { return .windowsCmd }
+        guard let r = line.range(of: "TETHER:%OS%:") else { return .posix }
+        let rest = line[r.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "\" \r"))
+        return rest == ":" || rest.isEmpty || rest.hasPrefix("$PSHOME") ? .posix : .windowsPowerShell
+    }
+}
+
 /// A label colour for hosts, groups and tabs.
 public enum TagColor: String, Codable, CaseIterable, Identifiable, Sendable {
     case none, red, orange, yellow, green, mint, teal, blue, indigo, purple, pink, gray
@@ -56,6 +88,8 @@ public struct HostMetadata: Codable, Hashable, Sendable {
     public var keyLoginWorks: Bool?
     /// Saved port forwards for this host.
     public var forwards: [PortForward]?
+    /// Detected shell/OS family (nil = not detected yet).
+    public var platform: RemotePlatform?
 
     public init(groupID: UUID? = nil, color: TagColor = .none, persistence: PersistenceMode? = nil,
                 favorite: Bool = false, notes: String = "", lastRemoteDirectory: String? = nil) {

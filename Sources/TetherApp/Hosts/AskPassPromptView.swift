@@ -47,8 +47,14 @@ struct AskPassPromptView: View {
                 .focused($focused)
                 .onSubmit { submit() }
 
-                if prompt.request.isPasswordPrompt {
-                    Toggle("Remember in Keychain", isOn: $save)
+                if prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Toggle("Remember in Keychain", isOn: $save)
+                        Text(SecretGate.shared.isRequired
+                             ? "Saved in your login keychain. Next time, \(SecretGate.shared.methodName) signs you in."
+                             : "Saved in your login keychain and used automatically next time.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     Spacer()

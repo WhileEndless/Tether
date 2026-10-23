@@ -17,19 +17,38 @@ public final class RemoteStream: @unchecked Sendable {
     public var onEnd: ((Int32, String) -> Void)?
 
     private let separator: Data
+    /// Windows hosts write CRLF; records are normalized to LF.
+    private var normalizeLineEndings = false
 
     public init(separator: String) {
         self.separator = Data(separator.utf8)
     }
 
     public func start(executor: RemoteExecutor, script: String, arguments: [String], purpose: String) {
+        start(executor: executor, script: RemoteScript(script), platform: .posix, arguments: arguments, purpose: purpose)
+    }
+
+    /// Starts the variant of `script` for `platform` (resolve it first with `resolvedPlatform()`).
+    public func start(executor: RemoteExecutor, script remoteScript: RemoteScript, platform: RemotePlatform,
+                      arguments: [String], purpose: String) {
+        var stdinData: Data
         if executor.target.isLocal {
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
             process.arguments = ["-s", "--"] + arguments
+            stdinData = Data(remoteScript.posix.utf8)
+            stdinData.append(0x0a)
         } else {
-            let remote = (["sh", "-s", "--"] + arguments.map(\.shellQuoted)).joined(separator: " ")
+            let call: (command: String, input: Data)
+            do {
+                call = try executor.invocation(remoteScript, arguments: arguments, platform: platform, extra: nil)
+            } catch {
+                DispatchQueue.main.async { self.onEnd?(127, error.localizedDescription) }
+                return
+            }
+            stdinData = call.input
+            normalizeLineEndings = platform.isWindows
             process.executableURL = URL(fileURLWithPath: executor.options.sshBinary)
-            process.arguments = executor.options.batchArguments(target: executor.target, remoteCommand: remote)
+            process.arguments = executor.options.batchArguments(target: executor.target, remoteCommand: call.command)
         }
         env = AskPassBridge.shared.environment(targetKey: executor.target.key, purpose: purpose)
         process.environment = ProcessInfo.processInfo.environment.merging(env) { $1 }
@@ -60,8 +79,7 @@ public final class RemoteStream: @unchecked Sendable {
         }
         do {
             try process.run()
-            var data = Data(script.utf8)
-            data.append(0x0a)
+            let data = stdinData
             // Keep stdin open: closing it would end `sh -s` once the script has been read anyway,
             // but some shells read lazily, so the pipe stays open until stop().
             try input.fileHandleForWriting.write(contentsOf: data)
@@ -74,6 +92,8 @@ public final class RemoteStream: @unchecked Sendable {
     private func consume(_ chunk: Data) {
         lock.lock()
         buffer.append(chunk)
+        // Normalized as a whole, so a CR at the end of one chunk still pairs with the LF of the next.
+        if normalizeLineEndings { buffer = PowerShell.normalize(buffer) }
         var records: [String] = []
         while let r = buffer.range(of: separator) {
             records.append(String(decoding: buffer[..<r.upperBound], as: UTF8.self))

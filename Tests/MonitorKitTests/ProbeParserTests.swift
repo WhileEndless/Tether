@@ -205,3 +205,54 @@ import Testing
         #expect(l.last?.exposure == .localOnly)
     }
 }
+
+@Suite struct WindowsParserTests {
+    @Test func windowsServices() {
+        let text = "@@winsvc\nsshd|Running|Automatic|OpenSSH SSH Server\nSpooler|Stopped|Disabled|Print Spooler\nW32Time|StartPending|Manual|Windows Time\n"
+        let s = ProbeParser.services(text)
+        #expect(s.count == 3)
+        #expect(s[0].name == "sshd" && s[0].active == "active" && s[0].description == "OpenSSH SSH Server")
+        #expect(s[1].active == "inactive" && s[1].load == "disabled")
+        #expect(s[2].active == "activating")
+    }
+
+    @Test func windowsListeningSocketsWithIPv6() {
+        let text = "tcp\t0.0.0.0:22\tsshd\t3120\ntcp\t[::]:22\tsshd\t3120\ntcp\t127.0.0.1:5432\tpostgres\t880\nudp\t[::1]:53\tdns\t9\n"
+        let l = ProbeParser.listening(text)
+        #expect(l.contains { $0.port == 22 && $0.process == "sshd" })
+        #expect(l.first { $0.port == 5432 }?.address == "127.0.0.1")
+    }
+
+    @Test func windowsSystemFrame() {
+        let frame = """
+        @@uname
+        WIN-DEMO
+        10.0.20348
+        AMD64
+        @@os
+        Microsoft Windows Server 2022 Datacenter
+        @@osinfo
+        id=windows
+        version=10.0.20348
+        @@uptime
+        86400
+        @@ncpu
+        8
+        @@cpupct
+        CPU usage: 25% user, 0% sys, 75% idle
+        @@meminfo
+        MemTotal: 16777216 kB
+        MemAvailable: 8388608 kB
+        SwapTotal: 4194304 kB
+        SwapFree: 4194304 kB
+        @@disk
+        C: 104857600 52428800 52428800 50% C:/
+        """
+        let s = ProbeParser.system(frame, previous: nil)
+        #expect(s.hostname == "WIN-DEMO" && s.osName.contains("Windows"))
+        #expect(abs((s.cpuUsage ?? 0) - 0.25) < 0.001)
+        #expect(abs(s.memFraction - 0.5) < 0.001)
+        #expect(s.load.isEmpty)
+        #expect(s.disks.first?.mount == "C:/")
+    }
+}

@@ -69,7 +69,8 @@ mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
 touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
 if grep -qF "$1" "$HOME/.ssh/authorized_keys" 2>/dev/null; then echo exists; else printf '%s\n' "$1 $2" >> "$HOME/.ssh/authorized_keys" && echo added; fi
 """#
-        _ = try await executor.output(script: script, arguments: [key.publicKey, key.comment], timeout: 60, purpose: "key-install")
+        _ = try await executor.output(RemoteScript(script, windows: windowsInstallScript),
+                                      arguments: [key.publicKey, key.comment], timeout: 60, purpose: "key-install")
     }
 
     /// Verifies that the key alone can log in (no multiplexing, no password).
@@ -79,8 +80,30 @@ if grep -qF "$1" "$HOME/.ssh/authorized_keys" 2>/dev/null; then echo exists; els
         let args = opts.commonOptions(multiplex: false)
             + ["-o", "BatchMode=yes", "-o", "PasswordAuthentication=no", "-o", "IdentitiesOnly=yes",
                "-i", key.privateKeyURL.path, "-o", "ConnectTimeout=15"]
-            + SSHOptions.destinationArguments(for: target) + ["true"]
+            + SSHOptions.destinationArguments(for: target) + ["exit"]
         let r = await ProcessRunner.run(opts.sshBinary, arguments: args, timeout: 30)
         return r.status == 0
     }
+
+    /// Windows OpenSSH: the user's `~/.ssh/authorized_keys`, and for administrators also
+    /// `%ProgramData%/ssh/administrators_authorized_keys` (which sshd uses for them by default,
+    /// and which must only be accessible to Administrators and SYSTEM).
+    static let windowsInstallScript = #"""
+$line = "$($A[0]) $($A[1])"
+function AddKey($file) {
+  $dir = Split-Path -Parent $file
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  if (-not (Test-Path -LiteralPath $file) -or -not (Select-String -LiteralPath $file -SimpleMatch $A[0] -Quiet)) {
+    Add-Content -LiteralPath $file -Value $line -Encoding ascii
+  }
+}
+AddKey (Join-Path $HOME '.ssh\authorized_keys')
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  $admin = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+  AddKey $admin
+  icacls $admin /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+}
+'added'
+"""#
 }

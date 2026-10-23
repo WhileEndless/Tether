@@ -320,7 +320,7 @@ private struct LocalSection: View {
                 Image(systemName: "laptopcomputer").foregroundStyle(.tint).frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("This Mac")
-                    Text(ProcessInfo.processInfo.hostName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(localMachineName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
                 Button {
@@ -398,10 +398,6 @@ private struct SidebarBottomBar: View {
                 model.settings.showSidebarArchive.toggle()
             }
 
-            BarButton(symbol: "text.magnifyingglass", help: "Search all sessions and the archive (⇧⌘F)") {
-                openWindow(id: "search")
-            }
-
             Spacer(minLength: 4)
 
             if !sessions.isEmpty {
@@ -415,6 +411,20 @@ private struct SidebarBottomBar: View {
                 .help("\(online) of \(sessions.count) sessions online")
             }
 
+            if let update = Updater.shared.available {
+                Button {
+                    NSWorkspace.shared.open(update.page)
+                } label: {
+                    Text("Update")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.2)))
+                        .foregroundStyle(.tint)
+                        .fixedSize()
+                }
+                .buttonStyle(.plain)
+                .help("Tether \(update.version) is available — open the release page")
+            }
             Button {
                 openWindow(id: "about")
             } label: {

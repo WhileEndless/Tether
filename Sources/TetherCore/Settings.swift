@@ -132,6 +132,25 @@ public struct KeyMapping: Codable, Identifiable, Hashable, Sendable {
     ]
 }
 
+/// Whether many files travel as one tar stream (packed here, unpacked on the other side).
+public enum TransferArchiveMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// Pack when a transfer has many files (see `transferArchiveThreshold`).
+    case auto
+    case always
+    /// Always send files one by one (in parallel).
+    case never
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .auto: "When there are many files"
+        case .always: "Always"
+        case .never: "Never (send files one by one)"
+        }
+    }
+}
+
 /// All user preferences. Persisted as JSON in UserDefaults.
 public struct AppSettings: Codable, Equatable, Sendable {
     // General
@@ -185,6 +204,28 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var showStatusStrip = true
     public var confirmKill = true
     public var logLines = 300
+
+    // Transfers
+    /// Files sent at the same time (each with its own scp).
+    public var transferParallel = 3
+    /// When several files are packed into one tar stream instead of being sent one by one.
+    public var transferArchiveMode: TransferArchiveMode = .auto
+    /// `.auto` packs transfers with at least this many files.
+    public var transferArchiveThreshold = 20
+    /// Compress packed transfers on the wire (ssh -C). Helps on slow links, costs CPU on fast ones.
+    public var transferCompress = true
+
+    // Updates
+    /// At launch, ask GitHub once whether a newer release exists (one request to api.github.com).
+    public var checkForUpdates = true
+
+    // Passwords
+    /// Ask for Touch ID (or the Mac's password) before a saved password is used.
+    public var requireAuthForSavedPasswords = true
+    /// After a successful check, saved passwords can be used without asking again for this long (seconds).
+    public var authGraceSeconds = 300
+    /// Notice password prompts in terminals (sudo, su, ssh, …) and offer to fill a saved password.
+    public var detectPasswordPrompts = true
 
     // SSH
     public var sshConfigPath: String = ""     // empty = ~/.ssh/config
@@ -260,6 +301,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.showStatusStrip, &showStatusStrip)
         d(.confirmKill, &confirmKill)
         d(.logLines, &logLines)
+        d(.transferParallel, &transferParallel)
+        d(.transferArchiveMode, &transferArchiveMode)
+        d(.transferArchiveThreshold, &transferArchiveThreshold)
+        d(.transferCompress, &transferCompress)
+        d(.checkForUpdates, &checkForUpdates)
+        d(.requireAuthForSavedPasswords, &requireAuthForSavedPasswords)
+        d(.authGraceSeconds, &authGraceSeconds)
+        d(.detectPasswordPrompts, &detectPasswordPrompts)
         d(.sshConfigPath, &sshConfigPath)
         d(.sshBinary, &sshBinary)
         d(.scpBinary, &scpBinary)

@@ -86,7 +86,7 @@ struct ListeningCard: View {
 
     private func row(_ s: ListeningSocket) -> some View {
         HStack(spacing: 8) {
-            Text("\(s.port)").font(.callout.monospacedDigit().weight(.medium)).frame(width: 52, alignment: .leading)
+            Text(verbatim: String(s.port)).font(.callout.monospacedDigit().weight(.medium)).frame(width: 52, alignment: .leading)
             Text(s.proto.uppercased()).font(.caption2).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
@@ -169,8 +169,13 @@ struct RemoteSessionsPanel: View {
         }
         .overlay {
             if monitor.remoteSessions.isEmpty {
-                EmptyStateView(symbol: "rectangle.stack", title: "No Persistent Sessions",
-                               message: "tmux or screen sessions created by Tether will appear here.")
+                if monitor.platform?.isWindows == true {
+                    EmptyStateView(symbol: "rectangle.stack", title: "Not Available on Windows",
+                                   message: "Windows has no tmux or screen, so shells end when the connection drops. Recordings still keep their output.")
+                } else {
+                    EmptyStateView(symbol: "rectangle.stack", title: "No Persistent Sessions",
+                                   message: "tmux or screen sessions created by Tether will appear here.")
+                }
             }
         }
         .task { await monitor.refreshRemoteSessions() }

@@ -29,6 +29,7 @@ struct HostEditorView: View {
     @State private var auth: AuthMethod = .agent
     @State private var identityFile = ""
     @State private var password = ""
+    @State private var hasSavedPassword = false
     @State private var forwardAgent = false
     @State private var identifyByName = false
     @State private var extras: [ExtraOption] = []
@@ -85,7 +86,8 @@ struct HostEditorView: View {
                             }
                         }
                     case .password:
-                        SecureField("Password", text: $password, prompt: Text("Stored in your keychain"))
+                        SecureField("Password", text: $password,
+                                    prompt: Text(hasSavedPassword ? "Saved — type to replace" : "Stored in your keychain"))
                         Text("The password is kept in the macOS keychain and offered to ssh automatically. It is never written to the config file.")
                             .font(.caption).foregroundStyle(.secondary)
                         if !keyAlreadyWorks {
@@ -185,7 +187,8 @@ struct HostEditorView: View {
                 .filter { !Self.managedKeys.contains($0.key.lowercased()) }
                 .map { ExtraOption(key: $0.key, value: $0.value) }
             if !identityFile.isEmpty { auth = .key }
-            else if PasswordVault.hasPassword(for: a) { auth = .password; password = PasswordVault.password(for: a) ?? "" }
+            // The saved password is never read into the form (it would bypass Touch ID); typing a new one replaces it.
+            else if PasswordVault.hasPassword(for: a) { auth = .password; hasSavedPassword = true }
             let meta = model.metadata(for: a)
             groupID = meta.groupID
             color = meta.color

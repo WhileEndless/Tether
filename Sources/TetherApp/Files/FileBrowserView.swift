@@ -3,6 +3,7 @@ import QuickLook
 import UniformTypeIdentifiers
 import TetherCore
 import FileTransferKit
+import SSHTransport
 import TerminalUI
 
 @MainActor
@@ -100,7 +101,10 @@ final class FileBrowserModel {
     }
 
     var parent: String {
+        // Windows: C:/Users → C:/, and a drive root goes up to the list of drives (/).
+        if directory.range(of: #"^[A-Za-z]:/?$"#, options: .regularExpression) != nil { return "/" }
         let p = (directory as NSString).deletingLastPathComponent
+        if p.range(of: #"^[A-Za-z]:$"#, options: .regularExpression) != nil { return p + "/" }
         return p.isEmpty ? "/" : p
     }
 }
@@ -332,6 +336,7 @@ struct FileBrowserView: View {
                 bulk = BulkAction(kind: .permissions, items: items,
                                   value: items.count == 1 ? String(items[0].permissions, radix: 8) : "644")
             }
+            .disabled(PlatformCache.shared.cached(target.key)?.isWindows == true)
             Button("Compress to .tar.gz") { compress(items, b) }
             if items.count == 1, let f = items.first {
                 Button("Rename…") { renameText = f.name; renaming = f }
@@ -419,9 +424,45 @@ struct FileBrowserView: View {
 
     private func download(_ items: [RemoteFile]) {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        for f in items {
-            model.transfers.download(f.path, to: downloads.appendingPathComponent(f.name), target: target) { item in
-                if item.state == .completed { NSWorkspace.shared.activateFileViewerSelecting([item.localURL]) }
+        show("Downloading \(items.count) item(s) to Downloads…")
+        downloadItems(items, to: downloads) { urls, failed in
+            if !urls.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(urls) }
+            if failed > 0 { show("\(failed) item(s) could not be downloaded — see Transfers", isError: true) }
+        }
+    }
+
+    /// Downloads items into a local folder without replacing anything there (Finder-style
+    /// "name 2" names). Many files travel as one packed stream (see Settings ▸ Transfers).
+    private func downloadItems(_ items: [RemoteFile], to local: URL, completion: @escaping ([URL], Int) -> Void) {
+        guard !items.isEmpty else { return }
+        let names = LocalFiles.uniqueNames(in: local, for: items.map(\.name))
+        let parents = Set(items.map { ($0.path as NSString).deletingLastPathComponent })
+        let fs = RemoteFileSystem(executor: model.executor(for: target))
+        let transfers = model.transfers
+        let target = self.target
+        Task {
+            // Only folders need counting; plain files are counted as they are.
+            var size = TransferSize(files: items.count, bytes: items.reduce(0) { $0 + $1.size })
+            if items.contains(where: \.isDirectory), transfers.policy.archiveMode != .never {
+                size = (try? await fs.measure(items.map(\.path))) ?? size
+            }
+            let finish: ([TransferItem]) -> Void = { made in
+                let ok = made.filter { $0.state == .completed }
+                let urls = ok.flatMap { $0.entries.map { URL(fileURLWithPath: $0.to) } }
+                completion(urls, made.count - ok.count)
+            }
+            if parents.count == 1, let parent = parents.first {
+                transfers.downloadGroup(items.map(\.name), from: parent, to: local, as: names, target: target,
+                                        fileCount: size.files, totalBytes: size.bytes, completion: finish)
+            } else {
+                var made: [TransferItem] = []
+                var remaining = items.count
+                for (f, name) in zip(items, names) {
+                    made.append(transfers.download(f.path, to: local.appendingPathComponent(name), target: target) { _ in
+                        remaining -= 1
+                        if remaining == 0 { finish(made) }
+                    })
+                }
             }
         }
     }
@@ -451,22 +492,24 @@ struct FileBrowserView: View {
     }
 
     /// Uploads into the current folder without overwriting: clashing names get a suffix.
+    /// Many files travel as one packed stream (see Settings ▸ Transfers).
     private func uploadSafely(_ urls: [URL], into b: FileBrowserModel) {
         guard !urls.isEmpty else { return }
         let dir = b.directory
         Task {
             do {
                 let names = try await b.fs.uniqueNames(in: dir, for: urls.map(\.lastPathComponent))
-                var remaining = urls.count
-                for (url, name) in zip(urls, names) {
-                    model.transfers.upload(url, to: dir, as: name, target: target) { _ in
-                        remaining -= 1
-                        if remaining == 0 { Task { await b.reload() } }
-                    }
+                let size = await Task.detached { LocalFiles.measure(urls) }.value
+                let made = model.transfers.uploadGroup(urls, names: names, to: dir, target: target,
+                                                       fileCount: size.files, totalBytes: size.bytes) { items in
+                    Task { await b.reload() }
+                    let failed = items.filter { $0.state != .completed }.count
+                    if failed > 0 { show("\(failed) upload(s) did not finish — see Transfers", isError: true) }
                 }
                 let renamed = zip(urls, names).filter { $0.0.lastPathComponent != $0.1 }.count
-                show(renamed > 0 ? "Uploading \(urls.count) item(s) — \(renamed) renamed to avoid overwriting"
-                                 : "Uploading \(urls.count) item(s) to \((dir as NSString).lastPathComponent)")
+                let how = made.first?.method == .archive ? " as one stream" : ""
+                show(renamed > 0 ? "Uploading \(size.files.formatted()) file(s)\(how) — \(renamed) renamed to avoid overwriting"
+                                 : "Uploading \(size.files.formatted()) file(s)\(how) to \((dir as NSString).lastPathComponent)")
             } catch {
                 show(error.localizedDescription, isError: true)
             }
@@ -488,20 +531,11 @@ struct FileBrowserView: View {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("TetherClipboard/\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         show("Preparing \(items.count) item(s) for the clipboard…")
-        var remaining = items.count
-        var failed = 0
-        var urls: [URL] = []
-        for f in items {
-            let dest = dir.appendingPathComponent(f.name)
-            model.transfers.download(f.path, to: dest, target: target) { item in
-                remaining -= 1
-                if item.state == .completed { urls.append(dest) } else { failed += 1 }
-                guard remaining == 0 else { return }
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.writeObjects(urls as [NSURL])
-                show(failed == 0 ? "\(urls.count) item(s) copied — paste them in Finder (⌘V)"
-                                 : "\(urls.count) copied, \(failed) failed", isError: failed > 0)
-            }
+        downloadItems(items, to: dir) { urls, failed in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects(urls as [NSURL])
+            show(failed == 0 ? "\(urls.count) item(s) copied — paste them in Finder (⌘V)"
+                             : "\(urls.count) copied, \(failed) failed", isError: failed > 0)
         }
     }
 

@@ -23,6 +23,8 @@ final class UploadBatch: Identifiable {
     var paths: [String] = []
     var error: String?
     var finished = false
+    var pastePaths = true
+    var fileCount = 0
 
     init(sessionID: UUID, directory: String) {
         self.sessionID = sessionID
@@ -37,42 +39,47 @@ final class UploadBatch: Identifiable {
 
 extension AppModel {
     /// Uploads files next to each other in `directory` (never overwriting: clashing names get a
-    /// suffix), then types their full paths into the terminal if asked to.
-    func upload(_ files: [URL], for session: TerminalSession, to directory: String, pastePaths: Bool) {
-        let dir = directory.isEmpty ? "/tmp" : directory
+    /// suffix), then types their full paths into the terminal if asked to. Many files are packed
+    /// into one stream unless `pack` is false.
+    func upload(_ files: [URL], for session: TerminalSession, to directory: String, pastePaths: Bool,
+                pack: Bool? = nil, size: TransferSize? = nil) {
+        var dir = directory.isEmpty ? "/tmp" : directory
         let batch = UploadBatch(sessionID: session.id, directory: dir)
+        batch.pastePaths = pastePaths
         uploadBatches[session.id] = batch
         let target = session.descriptor.target
         Task {
             let fs = RemoteFileSystem(executor: executor(for: target))
             let names: [String]
+            let measured: TransferSize
             do {
+                // On Windows, ~ and /tmp become the user's real folders.
+                dir = try await fs.resolveDirectory(dir)
                 names = try await fs.uniqueNames(in: dir, for: files.map(\.lastPathComponent))
+                if let size { measured = size } else { measured = await Task.detached { LocalFiles.measure(files) }.value }
             } catch {
                 batch.error = error.localizedDescription
                 batch.finished = true
                 return
             }
             batch.paths = names.map { (dir.hasSuffix("/") ? dir : dir + "/") + $0 }
-            var remaining = files.count
-            for (file, name) in zip(files, names) {
-                let item = transfers.upload(file, to: dir, as: name, target: target) { item in
-                    remaining -= 1
+            batch.fileCount = measured.files
+            batch.items = transfers.uploadGroup(files, names: names, to: dir, target: target, fileCount: measured.files,
+                                                totalBytes: measured.bytes, pack: pack) { items in
+                for item in items {
                     if case .failed(let message) = item.state { batch.error = message }
-                    if item.state == .cancelled { batch.error = "Upload cancelled" }
-                    guard remaining == 0 else { return }
-                    batch.finished = true
-                    if batch.error == nil && pastePaths {
-                        let text = batch.paths.map(\.shellQuoted).joined(separator: " ") + " "
-                        session.send(Array(text.utf8)[...])
-                    }
-                    FileBrowserModel.invalidate(target)
-                    // Keep the confirmation visible for a moment.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + (batch.error == nil ? 3 : 8)) {
-                        if self.uploadBatches[session.id] === batch { self.uploadBatches[session.id] = nil }
-                    }
+                    if item.state == .cancelled, batch.error == nil { batch.error = "Upload cancelled" }
                 }
-                batch.items.append(item)
+                batch.finished = true
+                if batch.error == nil && pastePaths {
+                    let text = batch.paths.map(\.shellQuoted).joined(separator: " ") + " "
+                    session.send(Array(text.utf8)[...])
+                }
+                FileBrowserModel.invalidate(target)
+                // Keep the confirmation visible for a moment.
+                DispatchQueue.main.asyncAfter(deadline: .now() + (batch.error == nil ? 3 : 8)) {
+                    if self.uploadBatches[session.id] === batch { self.uploadBatches[session.id] = nil }
+                }
             }
         }
     }
@@ -97,12 +104,9 @@ struct UploadSheet: View {
     @State private var directory = ""
     @AppStorage("upload.pastePaths") private var pastePaths = true
     @FocusState private var focused: Bool
+    @State private var size: TransferSize?
+    @State private var pack = false
 
-    private var totalSize: Int64 {
-        request.files.reduce(0) { sum, url in
-            sum + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -111,7 +115,12 @@ struct UploadSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Upload \(request.files.count) item\(request.files.count == 1 ? "" : "s") to \(request.session.descriptor.target.displayName)")
                         .font(.headline)
-                    Text(totalSize.byteString).font(.caption).foregroundStyle(.secondary)
+                    if let size {
+                        Text("\(size.files.formatted()) file\(size.files == 1 ? "" : "s") · \(size.bytes.byteString)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Counting files…").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             VStack(alignment: .leading, spacing: 3) {
@@ -140,6 +149,7 @@ struct UploadSheet: View {
                 Text("Files with the same name are kept: new copies get a suffix (name-1.ext).")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            TransferMethodPicker(fileCount: size?.files, pack: $pack)
             Toggle("Type the uploaded paths into the terminal", isOn: $pastePaths)
             HStack {
                 Spacer()
@@ -152,11 +162,18 @@ struct UploadSheet: View {
         .padding(22)
         .frame(width: 460)
         .onAppear { focused = true }
+        .task {
+            let files = request.files
+            let measured = await Task.detached { LocalFiles.measure(files) }.value
+            size = measured
+            pack = model.transfers.policy.packs(fileCount: measured.files)
+        }
     }
 
     private func upload() {
         let dir = directory.trimmingCharacters(in: .whitespaces)
-        model.upload(request.files, for: request.session, to: dir.isEmpty ? "/tmp" : dir, pastePaths: pastePaths)
+        model.upload(request.files, for: request.session, to: dir.isEmpty ? "/tmp" : dir, pastePaths: pastePaths,
+                     pack: size == nil ? nil : pack, size: size)
         dismiss()
     }
 }
@@ -173,10 +190,11 @@ struct UploadBatchPill: View {
                     Text("Upload failed: \(error)").lineLimit(2)
                 } else if batch.finished {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Uploaded to \(batch.directory) — path\(batch.paths.count == 1 ? "" : "s") typed into the terminal")
+                    Text("Uploaded to \(batch.directory)" + (batch.pastePaths ? " — path\(batch.paths.count == 1 ? "" : "s") typed into the terminal" : ""))
                 } else {
                     ProgressView(value: batch.progress).frame(width: 90)
-                    Text("Uploading \(batch.items.count) item\(batch.items.count == 1 ? "" : "s") to \(batch.directory)…")
+                    Text("Uploading \(batch.fileCount > 0 ? batch.fileCount.formatted() + " file" + (batch.fileCount == 1 ? "" : "s") : "…") to \(batch.directory)"
+                         + (batch.items.first?.method == .archive ? " as one stream" : ""))
                     if let speed = batch.items.first(where: { $0.state == .running })?.speed, !speed.isEmpty {
                         Text(speed).foregroundStyle(.secondary).monospacedDigit()
                     }
@@ -185,5 +203,30 @@ struct UploadBatchPill: View {
             .font(.callout)
         }
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+}
+
+/// Lets the user choose between one packed stream and parallel file-by-file copies.
+struct TransferMethodPicker: View {
+    @Environment(AppModel.self) private var model
+    let fileCount: Int?
+    @Binding var pack: Bool
+
+    var body: some View {
+        if let fileCount, fileCount > 1 {
+            VStack(alignment: .leading, spacing: 4) {
+                Picker("Send", selection: $pack) {
+                    Text("As one stream").tag(true)
+                    Text("File by file").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                Text(pack
+                     ? "Packed with tar here and unpacked on the other side in a single stream — much faster for many small files. Nothing is overwritten."
+                     : "Each item is copied with scp, \(model.transfers.policy.parallel) at a time.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }

@@ -60,9 +60,15 @@ final class AppModel {
     }
 
     private init() {
+        #if DEBUG
+        DemoMode.prepareIfRequested()
+        #endif
         let store = SettingsStore.shared
         sessions = SessionManager(settings: store)
-        transfers = TransferManager { SSHOptions(settings: store.settings) }
+        transfers = TransferManager(options: { SSHOptions(settings: store.settings) }, policy: {
+            TransferPolicy(parallel: store.settings.transferParallel, archiveMode: store.settings.transferArchiveMode,
+                           archiveThreshold: store.settings.transferArchiveThreshold, compress: store.settings.transferCompress)
+        })
         forwards = ForwardManager { SSHOptions(settings: store.settings) }
         config = SSHConfigLibrary(mainURL: store.settings.resolvedSSHConfigURL)
         library = libraryStore.load() ?? HostLibrary()
@@ -89,6 +95,17 @@ final class AppModel {
         // Compress old recordings now and then once a day.
         Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { _ in RecordingStore.requestQuotaEnforcement() }
         watchConfigFile()
+        // Platforms detected earlier (Windows or Unix-like) are known before the first connection;
+        // newly detected ones are remembered per host.
+        PlatformCache.shared.seed(library.metadata.compactMapValues(\.platform))
+        PlatformCache.shared.onDetected = { key, platform in
+            MainActor.assumeIsolated {
+                let model = AppModel.shared
+                if model.metadata(for: key).platform != platform {
+                    model.updateMetadata(for: key) { $0.platform = platform }
+                }
+            }
+        }
     }
 
     func launch() {
@@ -276,7 +293,7 @@ final class AppModel {
         options.useControlMaster = false
         let args = options.commonOptions(multiplex: false)
             + ["-o", "BatchMode=yes", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
-               "-o", "ConnectTimeout=10"] + SSHOptions.destinationArguments(for: target) + ["true"]
+               "-o", "ConnectTimeout=10"] + SSHOptions.destinationArguments(for: target) + ["exit"]
         Task {
             let r = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 20)
             updateMetadata(for: alias) { $0.keyLoginWorks = r.status == 0 }
@@ -335,6 +352,7 @@ final class AppModel {
     /// Which saved host a password prompt is for. With jump hosts, ssh asks for each hop
     /// (`user@jump.example.com's password:`), so the prompt — not the tab — decides whose password to use.
     func passwordKey(for request: AskPassRequest) -> String {
+        if request.isPassphrasePrompt { return CredentialKey.passphrase(keyPath: request.keyPath ?? request.prompt) }
         guard let r = request.prompt.range(of: #"@([^'\s]+)'s password"#, options: .regularExpression) else {
             return request.targetKey
         }
@@ -347,15 +365,19 @@ final class AppModel {
     }
 
     nonisolated func answer(_ request: AskPassRequest) async -> String? {
-        if request.isPasswordPrompt {
+        if request.isPasswordPrompt || request.isPassphrasePrompt {
             let (key, transient, tried) = await MainActor.run {
                 let key = self.passwordKey(for: request)
                 return (key, self.transientPasswords[key], self.triedPasswords.contains(request.token + key))
             }
             // Offer a saved password once per hop; a second prompt for the same hop means it was wrong.
             if !tried, let saved = transient ?? PasswordVault.password(for: key) {
-                await MainActor.run { _ = self.triedPasswords.insert(request.token + key) }
-                return saved
+                // Keychain items need Touch ID (if enabled); cancelling falls back to typing it.
+                let allowed = transient != nil ? true : await SecretGate.shared.authorize(Self.reason(for: request, key: key))
+                if allowed {
+                    await MainActor.run { _ = self.triedPasswords.insert(request.token + key) }
+                    return saved
+                }
             }
         }
         return await withCheckedContinuation { cont in
@@ -365,11 +387,16 @@ final class AppModel {
         }
     }
 
+    nonisolated static func reason(for request: AskPassRequest, key: String) -> String {
+        if request.isPassphrasePrompt { return "unlock your SSH key \((request.keyPath.map { ($0 as NSString).lastPathComponent }) ?? "")" }
+        return "sign in to \(key)"
+    }
+
     @ObservationIgnored private var triedPasswords: Set<String> = []
 
     func resolvePrompt(_ prompt: PendingPrompt, answer: String?, save: Bool) {
         prompts.removeAll { $0.id == prompt.id }
-        if save, let answer, prompt.request.isPasswordPrompt {
+        if save, let answer, prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
             PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request))
         }
         prompt.continuation.resume(returning: answer)

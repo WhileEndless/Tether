@@ -68,7 +68,7 @@ fi
 
     /// Lists a directory. Pass nil for the home directory.
     public func list(_ path: String?) async throws -> (directory: String, files: [RemoteFile]) {
-        let text = try await executor.output(script: Self.listScript, arguments: [path ?? ""], timeout: 30, purpose: "files")
+        let text = try await executor.output(RemoteScript(Self.listScript, windows: WindowsFileScripts.list), arguments: [path ?? ""], timeout: 30, purpose: "files")
         return Self.parseListing(text)
     }
 
@@ -119,10 +119,31 @@ $c"
 ' "$c"
 done
 """#
-        let out = try await executor.output(script: script, arguments: [directory] + names, timeout: 30, purpose: "files")
-        let result = out.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let platform = await executor.resolvedPlatform()
+        let out = try await executor.output(RemoteScript(script, windows: WindowsFileScripts.uniqueNames),
+                                            arguments: [directory] + names, timeout: 30, purpose: "files")
+        var result = out.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        // The Windows variant first prints the folder it resolved (e.g. ~ or /tmp).
+        if platform.isWindows, !result.isEmpty { result.removeFirst() }
         guard result.count == names.count else { throw RemoteError("Could not choose file names in \(directory).") }
         return result
+    }
+
+    /// Counts the files under the given remote paths and their total size, to plan a download.
+    public func measure(_ paths: [String]) async throws -> TransferSize {
+        let script = #"""
+files=0; kb=0
+for p in "$@"; do
+  if [ -d "$p" ]; then n=$(find "$p" ! -type d 2>/dev/null | wc -l); else n=1; fi
+  k=$(du -sk -- "$p" 2>/dev/null | cut -f1)
+  files=$((files + n)); kb=$((kb + ${k:-0}))
+done
+echo "$files $kb"
+"""#
+        let out = try await executor.output(RemoteScript(script, windows: WindowsFileScripts.measure), arguments: paths, timeout: 60, purpose: "files")
+        let parts = out.split(whereSeparator: \.isWhitespace).compactMap { Int64($0) }
+        guard parts.count == 2 else { throw RemoteError("Could not measure \(paths.count) item(s).") }
+        return TransferSize(files: Int(parts[0]), bytes: parts[1] * 1024)
     }
 
     // MARK: Bulk operations (all refuse to overwrite existing files)
@@ -149,7 +170,11 @@ for p in "$@"; do
   CMD -- "$p" "$d/$n" || exit 1
 done
 """#.replacingOccurrences(of: "CMD", with: command)
-        let out = try await executor.output(script: script, arguments: [directory] + paths, timeout: 600, purpose: "files")
+        let windowsCommand = command == "mv" ? "Move-Item" : "Copy-Item"
+        let platform = await executor.resolvedPlatform()
+        let out = try await executor.output(RemoteScript(script, windows: WindowsFileScripts.transfer),
+                                            arguments: (platform.isWindows ? [windowsCommand] : []) + [directory] + paths,
+                                            timeout: 600, purpose: "files")
         return out.split(separator: "\n").map(String.init)   // names skipped because they exist
     }
 
@@ -160,25 +185,36 @@ done
                                       arguments: [mode, recursive ? "1" : "0"] + paths, timeout: 120, purpose: "files")
     }
 
+    /// Where `directory` really is on the host. On Windows, `~` and `/tmp` map to the user's
+    /// home and temp folders (so the default upload folder works there too).
+    public func resolveDirectory(_ directory: String) async throws -> String {
+        let platform = await executor.resolvedPlatform()
+        guard platform.isWindows else { return directory }
+        let out = try await executor.output(RemoteScript("", windows: WindowsFileScripts.pathHelper + "Slash (WinPath $A[0])\n"),
+                                            arguments: [directory], purpose: "files")
+        return out.split(separator: "\n").first.map(String.init) ?? directory
+    }
+
     /// Packs items of one folder into a .tar.gz next to them; returns the archive's path.
     public func compress(_ names: [String], in directory: String, archiveName: String) async throws -> String {
         let unique = try await uniqueNames(in: directory, for: [archiveName]).first ?? archiveName
-        _ = try await executor.output(script: #"d="$1"; a="$2"; shift 2; cd -- "$d" && tar -czf "$a" -- "$@""#,
+        _ = try await executor.output(RemoteScript(#"d="$1"; a="$2"; shift 2; cd -- "$d" && tar -czf "$a" -- "$@""#,
+                                                   windows: WindowsFileScripts.compress),
                                       arguments: [directory, unique] + names, timeout: 1800, purpose: "files")
         return (directory == "/" ? "" : directory) + "/" + unique
     }
 
     public func makeDirectory(_ path: String) async throws {
-        _ = try await executor.output(script: #"mkdir -p -- "$1""#, arguments: [path], purpose: "files")
+        _ = try await executor.output(RemoteScript(#"mkdir -p -- "$1""#, windows: WindowsFileScripts.makeDirectory), arguments: [path], purpose: "files")
     }
 
     public func rename(_ path: String, to newPath: String) async throws {
-        _ = try await executor.output(script: #"mv -- "$1" "$2""#, arguments: [path, newPath], purpose: "files")
+        _ = try await executor.output(RemoteScript(#"mv -- "$1" "$2""#, windows: WindowsFileScripts.rename), arguments: [path, newPath], purpose: "files")
     }
 
     public func delete(_ path: String) async throws {
         guard path != "/" && !path.isEmpty else { throw RemoteError("Refusing to delete the root directory.") }
-        _ = try await executor.output(script: #"rm -rf -- "$1""#, arguments: [path], timeout: 120, purpose: "files")
+        _ = try await executor.output(RemoteScript(#"rm -rf -- "$1""#, windows: WindowsFileScripts.delete), arguments: [path], timeout: 120, purpose: "files")
     }
 
     /// Extra details for the inspector: `file` type description and directory size.
@@ -188,7 +224,8 @@ export LC_ALL=C
 file -b -- "$1" 2>/dev/null | head -n1
 if [ -d "$1" ]; then du -sk -- "$1" 2>/dev/null | cut -f1; fi
 """#
-        guard let text = try? await executor.output(script: script, arguments: [file.path], timeout: 30, purpose: "files") else {
+        guard let text = try? await executor.output(RemoteScript(script, windows: WindowsFileScripts.details), arguments: [file.path],
+                                                    timeout: 30, purpose: "files") else {
             return (nil, nil)
         }
         let lines = text.split(separator: "\n").map(String.init)
@@ -199,6 +236,6 @@ if [ -d "$1" ]; then du -sk -- "$1" 2>/dev/null | cut -f1; fi
 
     /// Reads a small text file (for previews). Limited to `maxBytes`.
     public func readHead(_ path: String, maxBytes: Int = 256 * 1024) async throws -> String {
-        try await executor.output(script: #"head -c "$2" -- "$1""#, arguments: [path, String(maxBytes)], purpose: "files")
+        try await executor.output(RemoteScript(#"head -c "$2" -- "$1""#, windows: WindowsFileScripts.readHead), arguments: [path, String(maxBytes)], purpose: "files")
     }
 }
