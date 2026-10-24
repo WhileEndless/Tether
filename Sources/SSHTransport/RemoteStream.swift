@@ -51,7 +51,7 @@ public final class RemoteStream: @unchecked Sendable {
             process.arguments = executor.options.batchArguments(target: executor.target, remoteCommand: call.command)
         }
         env = AskPassBridge.shared.environment(targetKey: executor.target.key, purpose: purpose)
-        process.environment = ProcessInfo.processInfo.environment.merging(env) { $1 }
+        process.environment = ChildEnvironment.base.merging(env) { $1 }
         let out = Pipe(), err = Pipe(), input = Pipe()
         process.standardOutput = out
         process.standardError = err

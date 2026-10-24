@@ -37,6 +37,13 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         registerForDraggedTypes([.fileURL] + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
         apply(settings: settings)
         KeyboardRouter.shared.install()
+        // Notifications from programs (OSC 9, 777, 99) — never while old output is replayed.
+        for code in [9, 777, 99] {
+            getTerminal().registerOscHandler(code: code) { [weak self] payload in
+                guard let self, !self.loadingHistory else { return }
+                self.session?.terminalOSC(code: code, payload: Array(payload))
+            }
+        }
     }
 
     public required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -133,6 +140,28 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public var cellSize: (cols: Int, rows: Int) {
         let t = getTerminal()
         return (t.cols, t.rows)
+    }
+
+    /// Laid out in a window at least once with a usable size (see `sizeChanged`).
+    public var hasRealSize: Bool { lastSentSize != nil }
+
+    /// In a window, the size the view really has is reported — also when the emulator worked it
+    /// out before the view was in a window (then the column count does not change on the way in, and
+    /// SwiftTerm does not call `sizeChanged` again).
+    private func reportSizeIfNeeded() {
+        guard window != nil, bounds.width > 0, bounds.height > 0 else { return }
+        let size = cellSize
+        if lastSentSize.map({ $0 != size }) ?? true { sizeChanged(source: self, newCols: size.cols, newRows: size.rows) }
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { DispatchQueue.main.async { [weak self] in self?.reportSizeIfNeeded() } }
+    }
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        reportSizeIfNeeded()
     }
 
     public func screenTail(maxRows: Int) -> (lines: [String], lastRow: Int)? {
@@ -301,6 +330,32 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         return (base, lines, logical)
     }
 
+    /// A full-screen program (vim, less, htop) has the alternate screen up: what is shown is only
+    /// that screen, the history is in the normal buffer and the recording.
+    public var showsAlternateScreen: Bool { isAlternateScreen }
+
+    /// The scrollback and screen as logical lines (wrapped rows joined, as the program wrote them),
+    /// whether older lines were dropped from memory, and how many logical lines the buffer holds.
+    public func logicalText() -> (trimmed: Bool, lines: [String], logicalLines: Int) {
+        let t = getTerminal()
+        let base = t.buffer.totalLinesTrimmed
+        var lines: [String] = []
+        var row = base
+        while let line = t.getScrollInvariantLine(row: row) {
+            let text = line.translateToString(trimRight: false).replacingOccurrences(of: "\0", with: " ")
+            if line.isWrapped, !lines.isEmpty { lines[lines.count - 1] += text } else { lines.append(text) }
+            row += 1
+        }
+        let logical = lines.count
+        lines = lines.map { l in
+            var s = Substring(l)
+            while s.last == " " { s = s.dropLast() }
+            return String(s)
+        }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return (base > 0, lines, logical)
+    }
+
     /// Scrolls to a scroll-invariant row and selects the given column range (e.g. a search match).
     public func reveal(invariantRow: Int, columns: Range<Int>?) {
         let row = invariantRow - getTerminal().buffer.totalLinesTrimmed
@@ -343,7 +398,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
         // Ignore transient tiny sizes during layout, and coalesce bursts (window resizing)
         // so the remote shell receives one final size instead of dozens of SIGWINCHs.
-        guard newCols >= 20, newRows >= 4 else { return }
+        // A view in no window has its initial frame, not a real size: a tab restored in the
+        // background must not resize its program (it would redraw now and again when shown).
+        guard newCols >= 20, newRows >= 4, window != nil else { return }
         pendingResize?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -471,6 +528,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     public func bell(source: TerminalView) {
+        if !loadingHistory { session?.bellRang() }
         switch settings.bell {
         case .none: break
         case .sound: NSSound.beep()

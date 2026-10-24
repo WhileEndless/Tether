@@ -23,8 +23,11 @@ This file is public: it is committed to GitHub like everything else.
    ssh (after the Touch ID check when enabled) or when the user clicks "Fill"; never prefill forms.
 7. **Tests never touch the user's real data.** Unit tests, self-tests and the demo must not read or
    write the real keychain (it is in-memory under tests and `TETHER_DEFAULTS_SUITE`), the real
-   preferences, the real tmux server (set `TMUX_TMPDIR` to a private folder), or the shared
-   `/tmp/tether-<uid>` sockets; and they remove the temporary files they create.
+   preferences, the real tmux server (set `TMUX_TMPDIR` to a private folder **and unset `TMUX`** —
+   with `$TMUX` set, as when tests run inside tmux, tmux ignores `TMUX_TMPDIR` and talks to that
+   server), or the shared `/tmp/tether-<uid>` sockets; and they remove the temporary files they
+   create, also when a test fails. Child processes in tests run through `TestSupport.BoundedProcess`
+   (never wait without a timeout), and a process a test stops (SIGSTOP) is always resumed.
 8. **Keys without ⌘ belong to the terminal.** App shortcuts always use ⌘ and are declared in
    `Sources/TetherApp/App/Shortcuts.swift` (menus and the Keyboard Shortcuts window read it).
 

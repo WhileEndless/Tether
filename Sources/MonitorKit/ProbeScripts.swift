@@ -224,6 +224,68 @@ echo "@@end"
     public static let remoteSessions = #"""
 export LC_ALL=C
 echo "@@tmux"; tmux ls -F '#{session_name}|#{session_created}|#{session_attached}|#{session_windows}|#{session_activity}' 2>/dev/null
+panes=$(tmux list-panes -a -F '#{session_name}|#{window_index}|#{window_name}|#{window_active}|#{pane_active}|#{pane_id}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null)
+echo "@@tmuxpanes"; printf '%s\n' "$panes"
+echo "@@tmuxtitles"; [ -n "$panes" ] && tmux list-panes -a -F '#{pane_id}|#{host}|#{pane_title}' 2>/dev/null
+# Foreground processes of tmux panes only (not every process on the host).
+fg=
+if [ -n "$panes" ]; then
+  TTYS=$(printf '%s\n' "$panes" | awk -F'|' '{ t = $7; sub(/^\/dev\//, "", t); sub(/^tty/, "", t); print t }')
+  fg=$(ps -A -o pid=,tty=,stat=,args= 2>/dev/null | TTYS="$TTYS" awk '
+    BEGIN { n = split(ENVIRON["TTYS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+    $3 ~ /\+/ { t = $2; sub(/^tty/, "", t); if (t in want) print }')
+fi
+echo "@@fg"; [ -n "$fg" ] && printf '%s\n' "$fg"
+# Coding agents (Claude Code, Codex, opencode) in the foreground: the name of their session.
+# Only names and states are printed; nothing is read beyond the agent's own session index.
+echo "@@agents"
+set -f
+sq() { printf '%s' "$1" | sed "s/'/''/g"; }
+pcwd() { readlink "/proc/$1/cwd" 2>/dev/null || lsof -n -P -w -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; }
+[ -n "$fg" ] && printf '%s\n' "$fg" | while read -r pid tty stat args; do
+  [ -n "$args" ] || continue
+  set -- $args
+  prog=${1##*/}
+  case "$prog" in node|bun|sh|bash|python|python3) prog=${2:-}; prog=${prog##*/}; full=${2:-} ;; *) full=$1 ;; esac
+  case "$prog|$full" in
+    claude*|*/claude-code/*) kind=claude ;;
+    codex*|*/codex/*) kind=codex ;;
+    opencode*|.opencode*|*/opencode*) kind=opencode ;;
+    *) continue ;;
+  esac
+  case $kind in
+  claude)
+    f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/$pid.json"
+    [ -r "$f" ] && awk '{ for (i = 1; i <= 4; i++) { k = (i == 1 ? "name" : i == 2 ? "nameSource" : i == 3 ? "status" : "tmux")
+        if (match($0, "\"" k "\":\"([^\"\\\\]|\\\\.)*\"")) o = o (o == "" ? "" : ",") substr($0, RSTART, RLENGTH) } }
+        END { print "'"$pid"'|claude|json|{" o "}" }' "$f"
+    echo "$pid|claude|found|" ;;
+  codex)
+    d="${CODEX_HOME:-$HOME/.codex}"
+    id=$(printf '%s\n' "$args" | sed -n 's/.*resume \([0-9a-f-]\{36\}\).*/\1/p')
+    [ -n "$id" ] || id=$( { ls -l "/proc/$pid/fd" 2>/dev/null || lsof -n -P -w -p "$pid" -Fn 2>/dev/null; } |
+      sed -n 's/.*rollout-.*\([0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}\)\.jsonl.*/\1/p' | head -n 1)
+    [ -n "$id" ] && grep -h "\"$id\"" "$d/session_index.jsonl" 2>/dev/null | tail -n 1 | sed "s/^/$pid|codex|index|/"
+    db=$(ls -t "$d" 2>/dev/null | grep '^state_[0-9]*\.sqlite$' | head -n 1)
+    if [ -n "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+      db="$d/$db"
+      if [ -n "$id" ]; then w="id = '$(sq "$id")'"; else w="cwd = '$(sq "$(pcwd "$pid")")' AND archived = 0 ORDER BY updated_at DESC LIMIT 1"; fi
+      sqlite3 -readonly "$db" "SELECT replace(coalesce(nullif(name, ''), title), char(10), ' ') FROM threads WHERE $w" 2>/dev/null |
+        head -n 1 | sed "s/^/$pid|codex|title|/"
+    fi
+    echo "$pid|codex|found|" ;;
+  opencode)
+    db="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+    id=$(printf '%s\n' "$args" | awk '{ for (i = 1; i <= NF; i++) { if (($i == "-s" || $i == "--session") && i < NF) print $(i + 1); else if ($i ~ /^--session=/) print substr($i, 11) } }' | head -n 1)
+    if [ -r "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+      if [ -n "$id" ]; then w="id = '$(sq "$id")'"; else w="directory = '$(sq "$(pcwd "$pid")")' AND parent_id IS NULL AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 1"; fi
+      sqlite3 -readonly "$db" "SELECT replace(title, char(10), ' ') FROM session WHERE $w" 2>/dev/null |
+        head -n 1 | sed "s/^/$pid|opencode|title|/"
+    fi
+    echo "$pid|opencode|found|" ;;
+  esac
+done
+set +f
 echo "@@screen"; screen -ls 2>/dev/null
 echo "@@end"
 """#

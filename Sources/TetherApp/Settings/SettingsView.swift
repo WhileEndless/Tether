@@ -43,6 +43,13 @@ private struct GeneralSettings: View {
             }
             Section("Tabs & Windows") {
                 Toggle("Open new sessions in a separate window", isOn: $store.settings.openNewSessionsInWindow)
+                Picker("New tabs open", selection: $store.settings.newTabPosition) {
+                    ForEach(NewTabPosition.allCases) { Text($0.title).tag($0) }
+                }
+                Picker("New tabs to the same host start in", selection: $store.settings.newTabDirectory) {
+                    ForEach(NewTabDirectory.allCases) { Text($0.title).tag($0) }
+                }
+                .help("⌘T and New Session to Same Host: the folder the current tab's shell is in, or the home folder")
                 Toggle("Ask before closing an online session", isOn: $store.settings.confirmCloseOnlineSessions)
                 Toggle("Show archive in sidebar", isOn: $store.settings.showSidebarArchive)
                 Picker("Sort sessions under a host", selection: $store.settings.sessionSortOrder) {
@@ -109,6 +116,10 @@ private struct TerminalSettings: View {
                 Picker("Bell", selection: $store.settings.bell) {
                     ForEach(BellMode.allCases) { Text($0.title).tag($0) }
                 }
+                Toggle("Show notifications from programs (Claude Code, builds…)", isOn: $store.settings.notifyFromPrograms)
+                Toggle("Notify when the bell rings in a tab you are not looking at", isOn: $store.settings.notifyOnBell)
+                Text("Programs can ask for attention — Claude Code when it finishes or has a question, `printf '\\e]9;Done\\a'` after a long job. Tether understands the common sequences (OSC 9, OSC 777, OSC 99 and the bell), marks the tab with a bell and, when you are not looking at it, shows a macOS notification. In Claude Code, any of its notification channels works (`/config` ▸ Notifications).")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Allow programs to use the mouse (vim, htop, tmux…)", isOn: $store.settings.allowMouseReporting)
                 Text("Hold ⌥ while selecting to select text even when a program captures the mouse.")
                     .font(.caption).foregroundStyle(.secondary)

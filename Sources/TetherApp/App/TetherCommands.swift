@@ -54,7 +54,9 @@ struct TetherCommands: Commands {
                 if case .files(let f)? = window.selectedItem {
                     let dir = model.fileTabs.browser(for: f).directory
                     window.openFiles(f.target, path: dir.isEmpty ? f.path : dir)
-                } else if let t = active?.descriptor.target ?? window.inspectedTarget {
+                } else if let active {
+                    window.newSession(like: active)
+                } else if let t = window.inspectedTarget {
                     window.connect(t, mode: .tab)
                 } else {
                     window.showQuickConnect = true
@@ -87,6 +89,9 @@ struct TetherCommands: Commands {
                 .shortcut(.editConfig)
         }
         CommandGroup(after: .saveItem) {
+            Button("Save Session…") { if let active { SessionSave.run(active) } }
+                .shortcut(.saveSession)
+                .disabled(active == nil)
             Button("Close Window") {
                 if let window, window.window === NSApp.keyWindow { window.requestCloseWindow() }
                 else { NSApp.keyWindow?.performClose(nil) }
@@ -99,7 +104,7 @@ struct TetherCommands: Commands {
                 .shortcut(.reconnect)
                 .disabled(active.map { if case .waiting = $0.phase { false } else { true } } ?? true)
             Button("New Session to Same Host in New Window") {
-                if let t = active?.descriptor.target { window?.connect(t, mode: .window) }
+                if let active { window?.newSession(like: active, mode: .window) }
             }
             .disabled(active == nil)
             Divider()

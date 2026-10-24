@@ -119,6 +119,8 @@ struct Shortcut: Identifiable {
                                        note: "When the terminal asks for a password: fills the saved one (Touch ID) or opens a secure field")
     static let terminate = Shortcut("Terminate Session…", .session, k("w", [.command, .option, .shift]),
                                     note: "Stops the shell on the server (asks first)")
+    static let saveSession = Shortcut("Save Session…", .session, k("s"),
+                                      note: "The whole session, including output no longer on screen, to a file you choose")
 
     // MARK: Terminal
     static let clearScrollback = Shortcut("Clear Scrollback", .terminal, k("k"))
@@ -170,7 +172,7 @@ struct Shortcut: Identifiable {
         newConnection, quickConnect, newTab, newLocalTerminal, newWindow, addHost, editConfig,
         closeTab, middleClick, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
-        reconnect, moveToBackground, disconnect, fillPassword, terminate,
+        reconnect, moveToBackground, disconnect, fillPassword, terminate, saveSession,
         clearScrollback, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TestSupport
 @testable import MonitorKit
 
 @Suite struct KubernetesTests {
@@ -11,16 +12,8 @@ import Testing
         let fake = dir.appendingPathComponent("kubectl")
         try kubectl.write(to: fake, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", script, "sh"] + args
-        p.environment = ["PATH": dir.path + ":/usr/bin:/bin"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = out
-        try p.run()
-        p.waitUntilExit()
-        return String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let r = BoundedProcess.run("/bin/sh", ["-c", script, "sh"] + args, environment: ["PATH": dir.path + ":/usr/bin:/bin"], timeout: 20)
+        return r.output + r.errorOutput
     }
 
     static let cluster = #"""

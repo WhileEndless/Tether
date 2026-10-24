@@ -44,6 +44,10 @@ public final class RemoteMonitor {
     public private(set) var platform: RemotePlatform?
 
     @ObservationIgnored private var stream: RemoteStream?
+    @ObservationIgnored private var sessionsRefreshing = false
+    /// A fresh look was asked for while one was running (e.g. right after ending a session).
+    @ObservationIgnored private var sessionsRefreshAgain = false
+    @ObservationIgnored private var sessionsRefreshedAt: Date?
     @ObservationIgnored private var interest = 0
     @ObservationIgnored private var interval: TimeInterval = 3
     @ObservationIgnored private var restartTask: Task<Void, Never>?
@@ -219,12 +223,32 @@ public final class RemoteMonitor {
         return (r.succeeded, r.output + r.errorOutput)
     }
 
-    public func refreshRemoteSessions() async {
+    /// Lists the host's tmux/screen sessions and what runs in them. One look at a time per host;
+    /// with `maxAge`, a list younger than that is kept (several views ask on their own schedules).
+    public func refreshRemoteSessions(maxAge: TimeInterval = 0) async {
         guard !frozen else { return }
+        if sessionsRefreshing {
+            // The running look may have started before the change the caller knows about.
+            if maxAge == 0 { sessionsRefreshAgain = true }
+            return
+        }
+        if maxAge > 0, let at = sessionsRefreshedAt, Date().timeIntervalSince(at) < maxAge { return }
+        sessionsRefreshing = true
+        repeat {
+            sessionsRefreshAgain = false
+            await lookAtRemoteSessions()
+        } while sessionsRefreshAgain && !frozen
+        sessionsRefreshing = false
+    }
+
+    private func lookAtRemoteSessions() async {
         let start = Date()
         if let text = try? await executor.output(RemoteScript(ProbeScripts.remoteSessions, windows: WindowsProbeScripts.remoteSessions), timeout: 20, purpose: "monitor") {
             commandLatency = Date().timeIntervalSince(start)
-            remoteSessions = ProbeParser.remoteSessions(text)
+            sessionsRefreshedAt = Date()
+            // Unchanged lists are not assigned: observers (the sidebar) are not redrawn for nothing.
+            let found = ProbeParser.remoteSessions(text)
+            if found != remoteSessions { remoteSessions = found }
         }
     }
 

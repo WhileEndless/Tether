@@ -212,6 +212,21 @@ private struct RemoteSessionRow: View {
                 }
             }
                 Text(detail).font(.caption).foregroundStyle(.secondary)
+                let windows = entry.panes.filter(\.paneActive)
+                ForEach(windows.prefix(6), id: \.windowIndex) { pane in
+                    HStack(spacing: 4) {
+                        Image(systemName: pane.windowActive ? "chevron.right.circle.fill" : "chevron.right")
+                            .font(.caption2)
+                            .foregroundStyle(pane.windowActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                            .frame(width: 12)
+                        Text("\(pane.windowIndex): \(pane.windowName)").font(.caption.monospaced())
+                        PaneSummary(pane: pane)
+                    }
+                    .help(pane.summary)
+                }
+                if windows.count > 6 {
+                    Text("+\(windows.count - 6) more").font(.caption2).foregroundStyle(.tertiary)
+                }
             }
             Spacer()
             Button(role: .destructive) {

@@ -45,11 +45,18 @@ final class WorkspaceStore {
         all.values.first { $0.tabs.contains(session) }?.id
     }
 
-    /// Adds a session as a tab (moving it out of any other window) and optionally selects it.
-    func add(_ session: UUID, to id: UUID, select: Bool = true, before: UUID? = nil) {
+    /// Adds a session as a tab (moving it out of any other window) and optionally selects it:
+    /// before or after a given tab, or at the end.
+    func add(_ session: UUID, to id: UUID, select: Bool = true, before: UUID? = nil, after: UUID? = nil) {
         detach(session)
         var w = workspace(id)
-        if let before, let i = w.tabs.firstIndex(of: before) { w.tabs.insert(session, at: i) } else { w.tabs.append(session) }
+        if let before, let i = w.tabs.firstIndex(of: before) {
+            w.tabs.insert(session, at: i)
+        } else if let after, let i = w.tabs.firstIndex(of: after) {
+            w.tabs.insert(session, at: i + 1)
+        } else {
+            w.tabs.append(session)
+        }
         if select || w.selected == nil { w.selected = session }
         all[id] = w
         AppModel.shared.sessions.setBackground(session, false)

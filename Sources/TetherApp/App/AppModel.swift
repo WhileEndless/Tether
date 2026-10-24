@@ -78,6 +78,7 @@ final class AppModel {
         sessions.prepare = { session in
             _ = TerminalRegistry.shared.view(for: session)
             session.onPasswordPrompt = { s, prompt in AppModel.shared.passwordPromptAppeared(prompt, in: s) }
+            session.onAttention = { s, attention in Notifier.shared.attention(attention, in: s) }
             session.onOnline = { s in
                 let model = AppModel.shared
                 model.forwards.sessionConnected(to: s.descriptor.target,
@@ -319,6 +320,12 @@ final class AppModel {
         let center = NotificationCenter.default
         visibilityObserver = center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: nil,
                                                 queue: .main) { _ in refresh() }
+        // Back in Tether: the tabs on screen have been seen.
+        _ = center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                for s in AppModel.shared.sessions.sessions where s.isOnScreen && s.attention != nil { Notifier.shared.seen(s) }
+            }
+        }
         _ = center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
             DispatchQueue.main.async { refresh() }
         }
@@ -332,6 +339,19 @@ final class AppModel {
         Task {
             try? await Task.sleep(for: .seconds(1.5))
             await m.refreshRemoteSessions()
+        }
+    }
+
+    /// The sidebar's refresh button: reads the ssh config again and asks every server with an online
+    /// session for its tmux/screen sessions and what runs in them. Hosts that are only listed are
+    /// never contacted (that could ask for passwords or wait on unreachable hosts).
+    func refreshSidebar() async {
+        reloadConfig()
+        var targets: [String: ConnectionTarget] = [:]
+        for s in sessions.sessions where s.phase.isOnline { targets[s.descriptor.target.key] = s.descriptor.target }
+        let wanted = targets.values.map { monitor(for: $0) }
+        await withTaskGroup(of: Void.self) { group in
+            for m in wanted { group.addTask { @MainActor in await m.refreshRemoteSessions() } }
         }
     }
 

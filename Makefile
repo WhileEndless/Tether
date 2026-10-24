@@ -42,7 +42,7 @@ demo: ## Open the app with synthetic demo data (your data is not used). SHOTS=1 
 		--env TETHER_DEFAULTS_SUITE=tether.demo --env TETHER_SSH_CONFIG="$$D/ssh_config" --env TETHER_DEMO_TMUX="$$T" \
 		$(if $(SHOTS),--env TETHER_DEMO_SHOTS=1) --args -AppleLanguages "(en)" -AppleLocale en_US; \
 	if [ -d "$$D/shots" ]; then mkdir -p dist/screenshots && cp "$$D"/shots/*.png dist/screenshots/ && echo "Screenshots in dist/screenshots"; fi; \
-	TMUX_TMPDIR="$$T" "$$D/bin/tmux" kill-server 2>/dev/null; \
+	for s in "$$T"/tmux-*/*; do [ -S "$$s" ] && TMUX= "$$D/bin/tmux" -S "$$s" kill-server 2>/dev/null; done; \
 	rm -rf "$$D" "$$T"; defaults delete tether.demo >/dev/null 2>&1; true
 
 install: app ## Build and copy Tether.app to /Applications (INSTALL_DIR=… to change)

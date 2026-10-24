@@ -41,8 +41,8 @@ final class TmuxDriver {
     /// Reports the foreground command and working directory of the pane (for automatic tab titles)
     /// and the round-trip time of the request (network latency to the server).
     var onActivity: (_ command: String, _ path: String, _ rtt: TimeInterval) -> Void = { _, _, _ in }
-    /// Size provider.
-    var size: () -> (cols: Int, rows: Int) = { (80, 24) }
+    /// The terminal's real size; nil while it is not known yet (the view sends it once laid out).
+    var size: () -> (cols: Int, rows: Int)? = { (80, 24) }
     /// The local screen's last used rows, to find where to continue after a reconnect.
     var screenTail: () -> HistoryCatchUp.Anchor? = { nil }
     /// The most history a catch-up may fetch (what the server keeps for Tether's sessions).
@@ -50,10 +50,18 @@ final class TmuxDriver {
     /// First catch-up attempt: this many history rows (enough unless a lot was printed meanwhile).
     static let catchUpProbe = 1_000
 
-    private var foregroundQueries: [CheckedContinuation<String?, Never>] = []
+    /// Questions to tmux, in the order they were sent: tmux answers in that order. A question that
+    /// timed out keeps its place (without a continuation) so its late answer is not taken for the
+    /// next one's.
+    private var foregroundQueries: [(id: Int, continuation: CheckedContinuation<String?, Never>?)] = []
+    private var nextQueryID = 0
 
     private(set) var exited = false
     private(set) var ready = false
+    /// The size last given to tmux, and one that came in before the driver was ready (a window
+    /// still settling while a tab re-attaches): sent once ready, never dropped.
+    private var sentSize: (cols: Int, rows: Int)?
+    private var pendingSize: (cols: Int, rows: Int)?
 
     /// Whether the session was created by Tether (only then are its options adjusted).
     private let ownSession: Bool
@@ -139,8 +147,9 @@ final class TmuxDriver {
             let firstTime = paneID == nil
             let switched = !firstTime && paneID != info.paneID
             paneID = info.paneID
-            let (cols, rows) = size()
-            send(TmuxCommands.resize(cols: cols, rows: rows, legacySyntax: legacyResize))
+            // Only a real size: a guessed one would resize the window, and its programs would
+            // redraw twice (Claude Code and other TUIs then leave parts of the old frame behind).
+            if let s = size() { sendSize(s) }
             if firstTime && isReattach && !terminalIsEmpty && !info.alternateScreen, let anchor = screenTail() {
                 // Reconnected: add what the pane printed meanwhile, then continue live.
                 restoring = true
@@ -158,7 +167,7 @@ final class TmuxDriver {
             }
         case .foreground:
             let text = success ? lines.first.map { String(decoding: $0, as: UTF8.self) } : nil
-            if !foregroundQueries.isEmpty { foregroundQueries.removeFirst().resume(returning: text) }
+            if !foregroundQueries.isEmpty { foregroundQueries.removeFirst().continuation?.resume(returning: text) }
         case .activity:
             let rtt = activitySentAt.map { Date().timeIntervalSince($0) } ?? 0
             activitySentAt = nil
@@ -210,7 +219,15 @@ final class TmuxDriver {
     private func markReady() {
         guard !ready else { return }
         ready = true
+        // The terminal may have changed size while the screen was being restored.
+        if let s = size() ?? pendingSize, sentSize.map({ $0 != s }) ?? true { sendSize(s) }
+        pendingSize = nil
         onReady()
+    }
+
+    private func sendSize(_ s: (cols: Int, rows: Int)) {
+        sentSize = s
+        send(TmuxCommands.resize(cols: s.cols, rows: s.rows, legacySyntax: legacyResize))
     }
 
     private func restoreScreen(info: TmuxPaneInfo, lines: [[UInt8]], fullHistory: Bool) {
@@ -233,7 +250,9 @@ final class TmuxDriver {
                 out += line
             }
         }
-        out += Array("\u{1b}[0m\u{1b}[\(info.cursorY + 1);\(info.cursorX + 1)H".utf8)
+        // The program's terminal modes (mouse, bracketed paste, hidden cursor, …) and the cursor.
+        out += Array("\u{1b}[0m".utf8)
+        out += Array(info.modes.sequence(cursorX: info.cursorX, cursorY: info.cursorY, height: info.height).utf8)
         display(out)
     }
 
@@ -251,19 +270,34 @@ final class TmuxDriver {
     }
 
     /// A tmux format asked fresh for the pane (e.g. `#{pane_tty}`). Only fixed formats are passed.
-    func query(_ format: String) async -> String? {
+    /// nil when tmux does not answer within `timeout`.
+    func query(_ format: String, timeout: Duration = .seconds(2)) async -> String? {
         guard ready, !exited, let paneID else { return nil }
+        let id = nextQueryID
+        nextQueryID += 1
         return await withCheckedContinuation { cont in
-            foregroundQueries.append(cont)
+            foregroundQueries.append((id, cont))
             send("display-message -p -t \(paneID) '\(format)'\n", expect: .foreground)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.expireQuery(id)
+            }
         }
     }
 
-    /// Ends waiting questions (the connection is gone).
+    /// Answers a question that took too long with nil; its place in the queue stays.
+    private func expireQuery(_ id: Int) {
+        guard let i = foregroundQueries.firstIndex(where: { $0.id == id }),
+              let continuation = foregroundQueries[i].continuation else { return }
+        foregroundQueries[i].continuation = nil
+        continuation.resume(returning: nil)
+    }
+
+    /// Ends waiting questions (the connection is gone: no answers will come).
     func answerForegroundQueries(_ value: String?) {
         let waiting = foregroundQueries
         foregroundQueries = []
-        waiting.forEach { $0.resume(returning: value) }
+        waiting.forEach { $0.continuation?.resume(returning: value) }
     }
 
     /// Asks tmux what is running in the pane. Cheap: answered from tmux's own state.
@@ -274,8 +308,13 @@ final class TmuxDriver {
     }
 
     func resize(cols: Int, rows: Int) {
-        guard ready, !exited else { return }
-        send(TmuxCommands.resize(cols: cols, rows: rows, legacySyntax: legacyResize))
+        guard !exited else { return }
+        guard ready else {
+            pendingSize = (cols, rows)
+            return
+        }
+        guard sentSize.map({ $0 != (cols, rows) }) ?? true else { return }
+        sendSize((cols, rows))
     }
 
     /// Ends the tmux session from inside, over the existing connection.

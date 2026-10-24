@@ -132,13 +132,29 @@ final class WindowState {
         return session
     }
 
+    /// A new session to the same host as `session` — in the folder its shell is in now, unless
+    /// Settings ▸ General says new tabs start in the home folder.
+    func newSession(like session: TerminalSession, mode: OpenMode = .tab) {
+        let target = session.descriptor.target
+        guard model.settings.newTabDirectory == .current else {
+            connect(target, mode: mode)
+            return
+        }
+        Task {
+            let directory = await session.workingDirectory()
+            connect(target, mode: mode, directory: directory)
+        }
+    }
+
     /// Shows a session as a tab here, or in a new window.
     func present(_ id: UUID, mode: OpenMode) {
         // Opening a suspended session reconnects it.
         model.sessions.session(id)?.resume()
         switch mode {
         case .tab:
-            model.workspaces.add(id, to: workspaceID)
+            // Next to the tab being worked in (Settings ▸ General), like browsers and Terminal.app.
+            let current = model.settings.newTabPosition == .afterCurrent ? model.workspaces.workspace(workspaceID).selected : nil
+            model.workspaces.add(id, to: workspaceID, after: current)
         case .window:
             let ws = UUID()
             model.workspaces.add(id, to: ws)

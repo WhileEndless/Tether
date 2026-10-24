@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TestSupport
 @testable import SessionKit
 
 @Suite struct RemoteBootstrapTests {
@@ -21,16 +22,9 @@ import Testing
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.appendingPathComponent("screen").path)
 
         let command = RemoteBootstrap.command(mode: .screen, sessionName: "tether-test", attachOnly: false, historyLimit: 50_000)
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", command]
-        p.environment = ["PATH": bin.path + ":/usr/bin:/bin", "TMPDIR": tmp.path]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = out
-        try p.run()
-        p.waitUntilExit()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let r = BoundedProcess.run("/bin/sh", ["-c", command], environment: ["PATH": bin.path + ":/usr/bin:/bin", "TMPDIR": tmp.path],
+                                   timeout: 20)
+        let text = r.output + r.errorOutput
         #expect(text.contains("MODE=600 1"), "output: \(text)")
         #expect(text.contains("defscrollback 50000"))
         #expect(!text.contains("PLANTED"))

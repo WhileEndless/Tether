@@ -55,6 +55,39 @@ public final class TerminalSession: Identifiable {
     @ObservationIgnored private var promptDetector = PasswordPromptDetector()
     /// Set by the app while this session's terminal is the visible tab of a window.
     @ObservationIgnored public var isOnScreen = false
+
+    /// Something in the terminal wants the user: a program's notification (OSC 9/777/99) or the
+    /// bell. Shown on the tab until it is looked at.
+    public enum Attention: Equatable, Sendable {
+        case bell
+        case message(TerminalNotification)
+    }
+    public private(set) var attention: Attention?
+    /// Called for each notification or bell (to post a system notification).
+    @ObservationIgnored public var onAttention: ((TerminalSession, Attention) -> Void)?
+    @ObservationIgnored private var notificationParser = TerminalNotificationParser()
+
+    /// An OSC sequence that may be a notification (9, 777 or 99), from the terminal emulator.
+    public func terminalOSC(code: Int, payload: [UInt8]) {
+        guard let n = notificationParser.parse(code: code, payload: payload) else { return }
+        raiseAttention(.message(n))
+    }
+
+    /// The bell rang in this terminal.
+    public func bellRang() {
+        raiseAttention(.bell)
+    }
+
+    /// The tab was looked at.
+    public func clearAttention() {
+        if attention != nil { attention = nil }
+    }
+
+    private func raiseAttention(_ a: Attention) {
+        // A message says more than a bell that follows it (Claude Code may send both).
+        if case .message = attention, a == .bell {} else { attention = a }
+        onAttention?(self, a)
+    }
     /// Called when a new password prompt appears (to fill a saved password automatically).
     @ObservationIgnored public var onPasswordPrompt: ((TerminalSession, PasswordPrompt) -> Void)?
     /// Whether to look for password prompts (from the settings; updated on connect and by the app).
@@ -118,6 +151,11 @@ public final class TerminalSession: Identifiable {
         return recorder?.url
     }
 
+    /// The recording and how much output it holds right now (everything shown so far).
+    public func recordingSnapshot() -> (url: URL, length: Int)? {
+        recorder.map { ($0.url, $0.flushedLength()) }
+    }
+
     /// Called whenever the session ends, archived or not.
     @ObservationIgnored public var onEnded: ((TerminalSession) -> Void)?
     /// Called when the session becomes dead (to archive it).
@@ -177,16 +215,18 @@ public final class TerminalSession: Identifiable {
         return found
     }
 
+    /// The shell's working directory now: asked from tmux (the pane's current path) when it can
+    /// tell, otherwise the last one the shell reported (OSC 7). nil when unknown.
+    public func workingDirectory() async -> String? {
+        if persistence == .tmux, phase.isOnline, let path = await tmuxQuery("#{pane_current_path}"), !path.isEmpty {
+            return path
+        }
+        return currentDirectory
+    }
+
     private func tmuxQuery(_ format: String) async -> String? {
         guard let tmux else { return nil }
-        return await withTaskGroup(of: String?.self) { group in
-            group.addTask { @MainActor in await tmux.query(format) }
-            group.addTask { try? await Task.sleep(for: .seconds(2)); return nil }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            if first == nil { tmux.answerForegroundQueries(nil) }
-            return first
-        }
+        return await tmux.query(format, timeout: .seconds(2))
     }
 
     /// Tab title: a custom name if the user set one, otherwise derived from what is running.
@@ -498,7 +538,9 @@ public final class TerminalSession: Identifiable {
         // program started there could use the token to ask Tether for saved secrets.
         askPassEnv = local ? [:] : AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
 
-        var env = ProcessInfo.processInfo.environment
+        // Without `$TMUX`: started from inside tmux (a terminal, a test run), local sessions would
+        // otherwise be created on that outer server, and ending them could end it.
+        var env = ChildEnvironment.base
         for key in ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "TETHER_ASKPASS_SOCKET", "TETHER_ASKPASS_TOKEN"] { env[key] = nil }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
@@ -510,7 +552,7 @@ public final class TerminalSession: Identifiable {
         self.bridge = bridge
         let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
         self.process = process
-        if local { env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin") }
+        if local { env["PATH"] = ChildEnvironment.local["PATH"] }
         // A Finder-launched app runs in "/": local shells start in the home folder like Terminal.app.
         process.startProcess(executable: executable, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh",
@@ -538,7 +580,7 @@ public final class TerminalSession: Identifiable {
         let args = sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: command)
         AskPassBridge.shared.revoke(environment: askPassEnv)
         askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
-        var env = ProcessInfo.processInfo.environment
+        var env = ChildEnvironment.base
         env["TERM"] = "xterm-256color"
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
         for (k, v) in askPassEnv { env[k] = v }
@@ -629,7 +671,7 @@ public final class TerminalSession: Identifiable {
             driver.write = { [weak self] text in self?.process?.send(data: Array(text.utf8)[...]) }
             driver.display = { [weak self] bytes in self?.display(bytes) }
             driver.refresh = { [weak self] bytes in self?.sink?.feed(bytes[...]) }
-            driver.size = { [weak self] in self?.sink?.cellSize ?? (80, 24) }
+            driver.size = { [weak self] in self?.realSize }
             driver.screenTail = { [weak self] in
                 self?.sink?.screenTail(maxRows: 12).map { HistoryCatchUp.Anchor(lines: $0.lines, lastRow: $0.lastRow) }
             }
@@ -659,7 +701,7 @@ public final class TerminalSession: Identifiable {
         attempt = 0
         lastError = nil
         phase = .online
-        if let size = sink?.cellSize { terminalDidResize(cols: size.cols, rows: size.rows) }
+        if let size = realSize { terminalDidResize(cols: size.cols, rows: size.rows) }
         startActivityPolling()
         onOnline?(self)
     }
@@ -873,6 +915,12 @@ public final class TerminalSession: Identifiable {
         return m.contains("permission denied") || m.contains("could not resolve hostname")
             || m.contains("host key verification failed") || m.contains("no such file")
             || m.contains("bad configuration") || m.contains("too many authentication failures")
+    }
+
+    /// The terminal's size once its view has really been laid out (nil before).
+    private var realSize: (cols: Int, rows: Int)? {
+        guard let sink, sink.hasRealSize else { return nil }
+        return sink.cellSize
     }
 
     fileprivate var windowSize: winsize {

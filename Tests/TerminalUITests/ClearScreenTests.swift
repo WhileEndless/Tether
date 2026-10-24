@@ -25,6 +25,38 @@ import TetherCore
         (view.getTerminal().getLine(row: row)?.translateToString(trimRight: true) ?? "").trimmingCharacters(in: .whitespaces)
     }
 
+    /// A program's notification (OSC 9/777) or the bell marks the session; seeing it clears it.
+    @Test func notificationsAndBellMarkTheSession() {
+        _ = NSApplication.shared
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .local, persistence: .off)) { SessionConfiguration(settings: AppSettings()) }
+        let view = TetherTerminalView(session: session, settings: AppSettings())
+        view.getTerminal().resize(cols: 40, rows: 10)
+        var raised: [TerminalSession.Attention] = []
+        session.onAttention = { _, a in raised.append(a) }
+        feed(view, "work\u{1b}]9;Claude is done\u{7}more")
+        #expect(session.attention == .message(TerminalNotification(body: "Claude is done")))
+        feed(view, "\u{7}")
+        // The message stays on the tab; the bell after it is still reported.
+        #expect(session.attention == .message(TerminalNotification(body: "Claude is done")))
+        #expect(raised.count == 2 && raised.last == .bell)
+        session.clearAttention()
+        feed(view, "\u{1b}]777;notify;Build;finished\u{1b}\\")
+        #expect(session.attention == .message(TerminalNotification(title: "Build", body: "finished")))
+        // Not shown as text on the screen.
+        #expect(screenRow(view, 0) == "workmore")
+    }
+
+    /// Saving a session (⌘S) writes lines as the program wrote them: wrapped rows are joined.
+    @Test func logicalTextJoinsWrappedRows() {
+        let view = makeView()
+        let long = String(repeating: "abcdefghij", count: 9)   // 90 columns: three rows at 40
+        feed(view, "first\r\n" + long + "\r\nend   \r\n")
+        let (trimmed, lines, logical) = view.logicalText()
+        #expect(!trimmed)
+        #expect(lines == ["first", long, "end"])
+        #expect(logical >= 3)
+    }
+
     @Test func ctrlLKeepsScreenInScrollbackAndPromptGoesToTop() {
         let view = makeView()
         feed(view, "line one\r\nline two\r\nline three\r\n$ ")

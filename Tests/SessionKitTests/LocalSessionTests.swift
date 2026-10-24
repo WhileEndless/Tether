@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import TetherCore
+import TestSupport
 @testable import SessionKit
 
 /// Collects everything the session displays.
@@ -15,12 +16,41 @@ final class RecordingSink: TerminalSink {
 /// End-to-end tests that run the real bootstrap and tmux control mode locally.
 /// A fake `ssh` executes the remote command with `sh` on this machine, using a private tmux server.
 @MainActor
-@Suite(.serialized) struct LocalSessionTests {
+@Suite(.serialized) final class LocalSessionTests {
     let dir: URL
     let fakeSSH: URL
 
+    nonisolated static let prefix = "tether-it-"
+
+    /// Each test leaves nothing behind: a server it stopped is resumed, then its tmux server and its
+    /// folder go. Nothing here may wait forever (a stopped tmux server never answers).
+    deinit { Self.cleanUp(dir) }
+
+    nonisolated static func cleanUp(_ dir: URL) {
+        let pidFile = dir.appendingPathComponent("stopped.pid")
+        if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGCONT)
+        }
+        BoundedProcess.run("/bin/sh", ["-c", "TMUX= TMUX_TMPDIR=\"$0\" tmux kill-server 2>/dev/null; true", dir.path],
+                           environment: ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"], timeout: 5)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Folders left by runs that were interrupted (older than an hour).
+    nonisolated static func sweepLeftovers() {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-3600)
+        for url in (try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        where url.lastPathComponent.hasPrefix(prefix) {
+            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if date < cutoff { cleanUp(url) }
+        }
+    }
+
     init() throws {
-        dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tether-it-\(UUID().uuidString.prefix(6))")
+        Self.sweepLeftovers()
+        dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(Self.prefix)\(UUID().uuidString.prefix(6))")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fakeSSH = dir.appendingPathComponent("ssh")
         let script = """
@@ -50,20 +80,11 @@ final class RecordingSink: TerminalSink {
     /// Runs tmux against this suite's private server (never the user's own tmux).
     @discardableResult
     func tmux(_ args: [String]) -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["tmux"] + args
         var env = ProcessInfo.processInfo.environment
         env["TMUX_TMPDIR"] = dir.path
         env["TMUX"] = nil
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
-        p.environment = env
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return BoundedProcess.run("/usr/bin/env", ["tmux"] + args, environment: env, timeout: 10).output
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -77,6 +98,37 @@ final class RecordingSink: TerminalSink {
 
     nonisolated static var hasTmux: Bool {
         ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"].contains { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// ⌘T: the new tab starts where the current tab's shell is now (asked from tmux, not a stale value).
+    @Test(.enabled(if: LocalSessionTests.hasTmux)) func newTabStartsInTheCurrentFolder() async throws {
+        let cfg = config()
+        let folder = dir.appendingPathComponent("work dir")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let real = URL(fileURLWithPath: realpath(folder.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? folder.path)
+        let first = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let sink1 = RecordingSink()
+        first.attach(sink: sink1)
+        first.start()
+        try await wait("online") { first.phase.isOnline }
+        first.send(Array("cd '\(folder.path)' && echo moved-$((1+1))\r".utf8)[...])
+        try await wait("cd") { sink1.text.contains("moved-2") }
+        try await Task.sleep(for: .milliseconds(300))
+        let current = await first.workingDirectory()
+        #expect(current == real.path, "got \(current ?? "nil")")
+
+        var descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        descriptor.initialDirectory = current
+        let second = TerminalSession(descriptor: descriptor) { cfg }
+        let sink2 = RecordingSink()
+        second.attach(sink: sink2)
+        second.start()
+        try await wait("second online") { second.phase.isOnline }
+        second.send(Array("echo \"at:$(pwd)\"\r".utf8)[...])
+        try await wait("pwd") { sink2.text.contains("at:\(real.path)") }
+        first.close(killRemote: true)
+        second.close(killRemote: true)
+        try await Task.sleep(for: .milliseconds(500))
     }
 
     @Test func plainShellRoundTrip() async throws {
@@ -152,13 +204,20 @@ final class RecordingSink: TerminalSink {
         try await wait("latency") { session.latency.last != nil }
         #expect(session.latency.median ?? 1 < 0.5)
 
-        let pid = tmux(["display-message", "-p", "#{pid}"])
-        #expect(!pid.isEmpty)
-        kill(pid_t(pid)!, SIGSTOP)
+        let text = tmux(["display-message", "-p", "#{pid}"])
+        // A pid of 0 or below would signal a whole process group (or every process): never.
+        guard let pid = pid_t(text), pid > 1 else {
+            Issue.record("no tmux server pid: \(text)")
+            return
+        }
+        // Written first, so the server is resumed even if this test is cut short (see deinit).
+        try String(pid).write(to: dir.appendingPathComponent("stopped.pid"), atomically: true, encoding: .utf8)
+        kill(pid, SIGSTOP)
+        defer { kill(pid, SIGCONT) }
         let stoppedAt = Date()
         try await wait("waiting", timeout: 10) { if case .waiting = session.phase { true } else { false } }
         #expect(Date().timeIntervalSince(stoppedAt) < 8, "stall should be detected within a few seconds")
-        kill(pid_t(pid)!, SIGCONT)
+        kill(pid, SIGCONT)
         try await wait("back online", timeout: 15) { session.phase.isOnline }
         session.close(killRemote: true)
         try await Task.sleep(for: .milliseconds(600))
@@ -287,7 +346,8 @@ final class RecordingSink: TerminalSink {
     }
 
     @Test func sessionIsUnusedUntilACommandIsRun() async throws {
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { config() }
+        let cfg = config()
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
         session.attach(sink: RecordingSink())
         session.start()
         try await wait("online") { session.phase.isOnline }

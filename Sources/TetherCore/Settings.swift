@@ -151,6 +151,35 @@ public enum TransferArchiveMode: String, Codable, CaseIterable, Identifiable, Se
     }
 }
 
+/// Where a new tab appears in the tab bar.
+public enum NewTabPosition: String, Codable, CaseIterable, Identifiable, Sendable {
+    case afterCurrent
+    case end
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .afterCurrent: "Next to the Current Tab"
+        case .end: "At the End"
+        }
+    }
+}
+
+/// Where a new tab to the same host starts (⌘T).
+public enum NewTabDirectory: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// The folder the current tab's shell is in, like Terminal.app.
+    case current
+    case home
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .current: "Same Folder as the Current Tab"
+        case .home: "Home Folder"
+        }
+    }
+}
+
 /// How the open sessions under a host are ordered in the sidebar.
 public enum SessionSortOrder: String, Codable, CaseIterable, Identifiable, Sendable {
     /// Online first, then connecting, suspended; each in the manual order.
@@ -197,6 +226,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var restoreSessionsOnLaunch = true
     public var confirmCloseOnlineSessions = true
     public var openNewSessionsInWindow = false
+    public var newTabDirectory: NewTabDirectory = .current
+    public var newTabPosition: NewTabPosition = .afterCurrent
     public var showSidebarArchive = false
     public var sessionSortOrder: SessionSortOrder = .status
     /// Closing the last window keeps Tether (and every session) running in the menu bar.
@@ -214,6 +245,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var cursorBlink = false            // Terminal.app default; blinking costs CPU in every tab
     public var scrollbackLines = 10_000
     public var bell: BellMode = .visual
+    /// Notifications programs send (OSC 9/777/99 — Claude Code when it finishes or asks).
+    public var notifyFromPrograms = true
+    /// The bell in a tab that is not being looked at notifies too.
+    public var notifyOnBell = true
     public var allowMouseReporting = true
     public var copyOnSelect = false
 
@@ -329,6 +364,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.restoreSessionsOnLaunch, &restoreSessionsOnLaunch)
         d(.confirmCloseOnlineSessions, &confirmCloseOnlineSessions)
         d(.openNewSessionsInWindow, &openNewSessionsInWindow)
+        d(.newTabDirectory, &newTabDirectory)
+        d(.newTabPosition, &newTabPosition)
         d(.showSidebarArchive, &showSidebarArchive)
         d(.sessionSortOrder, &sessionSortOrder)
         d(.keepRunningInMenuBar, &keepRunningInMenuBar)
@@ -341,6 +378,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.cursorBlink, &cursorBlink)
         d(.scrollbackLines, &scrollbackLines)
         d(.bell, &bell)
+        d(.notifyFromPrograms, &notifyFromPrograms)
+        d(.notifyOnBell, &notifyOnBell)
         d(.allowMouseReporting, &allowMouseReporting)
         d(.copyOnSelect, &copyOnSelect)
         d(.optionAsMeta, &optionAsMeta)

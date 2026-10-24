@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.3.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.3.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.3.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.3.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -34,6 +34,8 @@ Search across every terminal, the archive and recordings.
   - **Neither** → a plain login shell, with automatic reconnects and a local transcript.
 - **Clear states.** *Online*, *Waiting* (connection lost: history stays visible, input is paused) and *Dead* (the remote session is confirmed gone: read-only and archived). A lost network is detected immediately, and a stalled server within seconds. Tabs reattach when the network returns, and also after the app is quit or crashes.
 - **Background sessions.** Close a tab and keep its session running in the background. Your own tmux sessions on a server are listed too, and you can attach to them. Leftover sessions can be cleaned up.
+- **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex and opencode show the name of their session — the one you gave it or the one the agent chose — on server sessions and on open tabs, and whether Claude Code is working. Names come from the agents' own files on the server (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
+- **Save a session** with ⌘S (*File ▸ Save Session…*): everything it has shown, including output no longer in memory (read from its recording), as plain text or as the raw output with colors. Tether remembers the folder and format you chose last.
 
 **Passwords, Touch ID and sudo**
 - Saving passwords is optional: tick *Remember in Keychain* when signing in (works for every jump host and for SSH key passphrases).
@@ -67,6 +69,8 @@ Search across every terminal, the archive and recordings.
   - drag a tab out into its own window, or onto another window's tab bar
   - middle-click to close; the mouse wheel scrolls the tab bar, and ⌄ lists every tab
 - ⌘P quick switcher and Merge All Windows. Only the visible tab is drawn, so many tabs stay cheap.
+- ⌘T opens a new tab to the same host in the folder the current tab's shell is in, like Terminal.app — locally and on servers. New tabs open next to the current one. Both can be changed in Settings ▸ General.
+- **Notifications from programs.** When Claude Code finishes or has a question, when a long job prints `\e]9;done\a`, or when the bell rings in a tab you are not looking at, the tab gets a bell and macOS shows a notification; clicking it brings the tab to the front. The common sequences are understood: OSC 9 (iTerm2 style), OSC 777 (rxvt, Ghostty), OSC 99 (kitty) and the bell — so any of Claude Code's notification channels works.
 - Close a tab to keep its session in the background, or terminate it. You can also terminate every session on a host at once.
 - *Disconnect & Move to Background* drops the connection but leaves tmux/screen running on the server. The session shows as *Suspended* and reattaches when you open it again.
 - File managers open as tabs too, next to terminals. Each keeps its directory and selection, even in the background.
@@ -105,7 +109,7 @@ Search across every terminal, the archive and recordings.
 - Directories you have visited open instantly from a cache and refresh in the background, keeping scroll position and selection.
 - *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*.
 - Transfers show what went where, speed, amount transferred and ETA. Many files travel as one packed stream (tar on both ends, nothing written to disk in between); others are copied several at a time. Both are configurable.
-- **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead.
+- **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead. In local terminals (this Mac) nothing is copied: the file's own path is typed (a pasted image is saved as a PNG first, and kept for a week).
 - Copy files in the file manager and paste them in Finder (and the other way round). Bulk move, copy, permissions, compress, rename and delete.
 
 **Search**
@@ -141,6 +145,7 @@ Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option as M
 | Tab 1…8 / last tab · go to any session | ⌘1…⌘8 / ⌘9 · ⌘P |
 | Move tab to background / disconnect to background | ⇧⌘B / ⌥⇧⌘B |
 | Terminate session | ⌥⇧⌘W |
+| Save the whole session to a file | ⌘S |
 | Fill a saved password (sudo, su, ssh prompt) | ⌥⌘P |
 | Lock Tether (with App Lock on) | ⌃⌘L |
 | Jump between commands / select a command's output | ⌘↑ ⌘↓ / ⇧⌘↑ ⇧⌘↓ |

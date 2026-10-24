@@ -109,6 +109,7 @@ struct SessionPane: View {
         .onDisappear { session.isOnScreen = false }
         .onAppear {
             session.isOnScreen = true
+            if session.attention != nil { Notifier.shared.seen(session) }
             let view = TerminalRegistry.shared.view(for: session)
             view.onReachedHistoryLimit = { at in olderHistoryOnDisk = at }
             // Scrolling past what is in memory reads earlier output back from the recording.

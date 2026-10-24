@@ -157,7 +157,7 @@ final class MasterConnector {
         // ControlPersist the connection stays up as master.
         p.arguments = options.commonOptions() + ["-v", "-E", logURL.path, "-o", "ConnectTimeout=20", "-T"]
             + SSHOptions.destinationArguments(for: target) + ["exit"]
-        p.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
+        p.environment = ChildEnvironment.base.merging(environment) { $1 }
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice

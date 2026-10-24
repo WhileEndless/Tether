@@ -33,7 +33,8 @@ public struct RemoteExecutor: Sendable {
             var input = Data(script.posix.utf8)
             if !script.posix.hasSuffix("\n") { input.append(0x0a) }
             if let extra { input.append(extra) }
-            return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + arguments, input: input, timeout: timeout)
+            return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + arguments, environment: ChildEnvironment.local,
+                                           input: input, timeout: timeout)
         }
         if options.useControlMaster { await ConnectionGate.shared.waitForTurn(target.key) }
         let platform = await resolvedPlatform()

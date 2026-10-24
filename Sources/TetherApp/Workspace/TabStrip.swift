@@ -407,6 +407,12 @@ private struct TabChip: View {
                         .foregroundStyle(.white)
                         .frame(width: 16, height: 16)
                         .background(Circle().fill(Color.accentColor))
+                } else if session.attention != nil {
+                    // A program asked for attention (finished, has a question, rang the bell).
+                    Image(systemName: "bell.badge.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .help(attentionHelp)
                 } else {
                     StatusDot(phase: session.phase, size: 6)
                 }
@@ -622,5 +628,16 @@ private struct TabArrow: View {
         .buttonStyle(.borderless)
         .disabled(!enabled)
         .help(symbol == "chevron.left" ? "Scroll tabs left" : "Scroll tabs right")
+    }
+}
+
+extension TabChip {
+    /// What the program said, for the tooltip.
+    fileprivate var attentionHelp: String {
+        switch session.attention {
+        case .message(let n): return [n.title, n.body].compactMap { $0 }.joined(separator: " — ")
+        case .bell: return "The bell rang"
+        case nil: return ""
+        }
     }
 }

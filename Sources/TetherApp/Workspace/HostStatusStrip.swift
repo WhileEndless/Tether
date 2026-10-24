@@ -51,10 +51,16 @@ struct HostStatusStrip: View {
         .onAppear { monitor.retain(interval: model.settings.monitorRefreshInterval) }
         .onDisappear { monitor.release() }
         .task(id: session.phase.isOnline) {
-            // Learn about other tmux sessions on the server once we are connected.
+            // Learn about other tmux sessions on the server once we are connected, then keep the
+            // list (and what runs in each session) fresh while the window is visible.
             if session.phase.isOnline {
                 await monitor.refreshRemoteSessions()
                 model.checkKeyLogin(session.descriptor.target)
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(15))
+                    guard !Task.isCancelled else { break }
+                    if !monitor.paused { await monitor.refreshRemoteSessions(maxAge: 10) }
+                }
             }
         }
     }

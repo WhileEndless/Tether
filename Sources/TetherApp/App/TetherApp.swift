@@ -106,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWindow.allowsAutomaticWindowTabbing = false
         MainActor.assumeIsolated {
             AppModel.shared.launch()
+            Notifier.shared.install()
             Self.reportTamperedSettings()
             TabBarCenter.shared.start()
             installCloseTabShortcut()

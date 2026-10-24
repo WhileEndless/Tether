@@ -409,13 +409,16 @@ public enum ProbeParser {
     public static func remoteSessions(_ text: String, prefix: String = "") -> [RemoteSessionEntry] {
         let s = sections(text)
         var out: [RemoteSessionEntry] = []
+        let panes = tmuxPanes(s["tmuxpanes"] ?? [], foreground: s["fg"] ?? [], agents: s["agents"] ?? [],
+                              titles: s["tmuxtitles"] ?? [])
         for line in s["tmux"] ?? [] {
             let f = line.split(separator: "|").map(String.init)
             guard f.count >= 3, prefix.isEmpty || f[0].hasPrefix(prefix) else { continue }
             let created = Double(f[1]).map { Date(timeIntervalSince1970: $0) }
             out.append(RemoteSessionEntry(kind: .tmux, name: f[0], created: created, attached: f[2] != "0",
                                           windows: f.count > 3 ? Int(f[3]) : nil,
-                                          lastActivity: f.count > 4 ? Double(f[4]).map { Date(timeIntervalSince1970: $0) } : nil))
+                                          lastActivity: f.count > 4 ? Double(f[4]).map { Date(timeIntervalSince1970: $0) } : nil,
+                                          panes: panes[f[0]] ?? []))
         }
         for line in s["screen"] ?? [] {
             // "\t12345.tether-abc\t(Detached)"
@@ -427,5 +430,89 @@ public enum ProbeParser {
             out.append(RemoteSessionEntry(kind: .screen, name: name, created: nil, attached: t.contains("Attached")))
         }
         return out
+    }
+
+    /// `session|window|name|windowActive|paneActive|paneID|tty|command|path` lines, keyed by session.
+    /// The full command line comes from the tty's foreground processes (`pid tty stat args` from `ps`),
+    /// the agent session names from `pid|kind|field|value` lines, the titles from `paneID|host|title`.
+    static func tmuxPanes(_ lines: [String], foreground: [String], agents: [String] = [],
+                          titles: [String] = []) -> [String: [RemoteSessionPane]] {
+        var byTTY: [String: [(pid: String, args: String)]] = [:]
+        for line in foreground {
+            // Columns are padded with several spaces.
+            let f = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard f.count == 4, !f[3].isEmpty else { continue }
+            byTTY[ttyKey(f[1]), default: []].append((f[0], f[3]))
+        }
+        let agentsByPID = codingAgents(agents)
+        var titleByPane: [String: String] = [:]
+        for line in titles {
+            let f = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 3, f[2] != f[1] else { continue }
+            titleByPane[f[0]] = f[2]
+        }
+        var out: [String: [RemoteSessionPane]] = [:]
+        for line in lines {
+            // The path is last so a "|" in it survives.
+            let f = line.split(separator: "|", maxSplits: 8, omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 9, let window = Int(f[1]) else { continue }
+            let command = f[7]
+            let candidates = byTTY[ttyKey(f[6])] ?? []
+            let match = candidates.last { c in
+                let program = c.args.split(separator: " ").first.map { $0.split(separator: "/").last.map(String.init) ?? "" } ?? ""
+                return !command.isEmpty && (program == command || program.hasPrefix(command) || program == "-" + command)
+            }
+            var pane = RemoteSessionPane(windowIndex: window, windowName: f[2], windowActive: f[3] == "1",
+                                         paneActive: f[4] == "1", command: command, commandLine: match?.args, path: f[8],
+                                         title: titleByPane[f[5]] ?? "")
+            // Wrappers (node, sh) and their children share the tty: prefer the agent with a known name.
+            let found = candidates.compactMap { agentsByPID[$0.pid] }
+            pane.agent = agentsByPID.values.first { $0.paneID == f[5] }
+                ?? found.first { $0.sessionName != nil } ?? found.first
+            if pane.isShell && pane.agent == nil { pane.commandLine = nil }
+            out[f[0], default: []].append(pane)
+        }
+        return out
+    }
+
+    /// `pid|claude|json|{"name":…}`, `pid|codex|index|{…}`, `pid|codex|title|…`, `pid|opencode|title|…`,
+    /// `pid|kind|found|` lines from the probe.
+    static func codingAgents(_ lines: [String]) -> [String: CodingAgent] {
+        var out: [String: CodingAgent] = [:]
+        for line in lines {
+            let f = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 4, let kind = CodingAgent.Kind(rawValue: f[1]) else { continue }
+            var agent = out[f[0]] ?? CodingAgent(kind: kind)
+            let value = f[3].trimmingCharacters(in: .whitespaces)
+            switch f[2] {
+            case "json":
+                let json = (try? JSONSerialization.jsonObject(with: Data(value.utf8))) as? [String: Any] ?? [:]
+                if let name = json["name"] as? String, !name.isEmpty { agent.sessionName = name }
+                agent.namedByUser = (json["nameSource"] as? String).map { $0 != "auto" } ?? false
+                agent.status = json["status"] as? String
+                if let tmux = json["tmux"] as? String, let i = tmux.lastIndex(of: "%") { agent.paneID = String(tmux[i...]) }
+            case "index":
+                // Codex keeps names the user gave threads here; they win over generated titles.
+                let json = (try? JSONSerialization.jsonObject(with: Data(value.utf8))) as? [String: Any] ?? [:]
+                if let name = json["thread_name"] as? String, !name.isEmpty {
+                    agent.sessionName = name
+                    agent.namedByUser = true
+                }
+            case "title":
+                if agent.sessionName == nil, !value.isEmpty { agent.sessionName = value }
+            default:
+                break
+            }
+            out[f[0]] = agent
+        }
+        return out
+    }
+
+    /// `/dev/pts/3`, `pts/3` → `pts/3`; `/dev/ttys003`, `s003` → `s003` (macOS `ps` drops "tty").
+    static func ttyKey(_ tty: String) -> String {
+        var t = tty.hasPrefix("/dev/") ? String(tty.dropFirst(5)) : tty
+        if t.hasPrefix("tty") { t = String(t.dropFirst(3)) }
+        return t
     }
 }

@@ -530,6 +530,20 @@ enum DemoFiles {
         web.remoteSessions = """
         @@tmux
         deploy-main|\(Int(Date().timeIntervalSince1970) - 86_400 * 3)|0|2|\(Int(Date().timeIntervalSince1970) - 3_600)
+        agents|\(Int(Date().timeIntervalSince1970) - 7_200)|0|2|\(Int(Date().timeIntervalSince1970) - 20)
+        @@tmuxpanes
+        deploy-main|0|logs|1|1|%1|/dev/pts/4|tail|/srv/shop
+        deploy-main|1|shell|0|1|%2|/dev/pts/5|bash|/srv/shop/scripts
+        agents|0|claude|1|1|%3|/dev/pts/6|claude|/srv/shop
+        agents|1|codex|0|1|%4|/dev/pts/7|codex|/srv/shop/api
+        @@fg
+        4101 pts/4 S+ tail -f /var/log/shop/api.log
+        4102 pts/5 Ss+ -bash
+        4103 pts/6 Sl+ claude
+        4104 pts/7 Sl+ codex
+        @@agents
+        4103|claude|json|{"name":"Speed up orders.list query","nameSource":"user","status":"busy"}
+        4104|codex|title|Add retry to payment webhook
         """
         web.logs = """
         2026-10-23T09:14:02+0000 web-01 systemd[1]: Started shop-api.service - Shop API (Node.js).
@@ -552,6 +566,8 @@ enum DemoFiles {
         """
         gpu.gpuProcesses = (0..<4).map { "GPU-\($0), \(77_120 + $0), python, \(60_000 + $0 * 2_400)" }.joined(separator: "\n")
         gpu.remoteSessions = "@@tmux\ntraining|\(Int(Date().timeIntervalSince1970) - 30_000)|1|1|\(Int(Date().timeIntervalSince1970) - 30)\n"
+            + "@@tmuxpanes\ntraining|0|train|1|1|%1|/dev/pts/2|python|/srv/ml\n"
+            + "@@fg\n7711 pts/2 Rl+ python train.py --config configs/llm-ft.yaml\n"
 
         var db = data(box("db-primary", "10.20.0.21", cpus: 16, mem: 128, used: 0.71, load: "1.84 1.62 1.40"),
                       cpu: wave(48, base: 0.32, amp: 0.1, phase: 2), mem: 0.71, rx: 9_000_000, tx: 14_000_000)

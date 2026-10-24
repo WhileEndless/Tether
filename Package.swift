@@ -65,15 +65,18 @@ let package = Package(
         // Tiny SSH_ASKPASS helper that forwards prompts to the running app.
         .executableTarget(name: "TetherAskPass"),
 
+        // Helpers shared by the tests (bounded child processes); not part of the app.
+        .target(name: "TestSupport", path: "Tests/TestSupport"),
+
         .testTarget(name: "SSHConfigKitTests", dependencies: ["SSHConfigKit"]),
         .testTarget(name: "TmuxControlTests", dependencies: ["TmuxControl"]),
-        .testTarget(name: "MonitorKitTests", dependencies: ["MonitorKit"]),
+        .testTarget(name: "MonitorKitTests", dependencies: ["MonitorKit", "TestSupport"]),
         .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore", "SearchKit"]),
-        .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore"]),
+        .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore", "TestSupport"]),
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
         .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit"]),
-        .testTarget(name: "SessionKitTests", dependencies: ["SessionKit", "TetherCore"]),
-        .testTarget(name: "TerminalUITests", dependencies: ["TerminalUI", "SessionKit", "TetherCore", "SearchKit", "RecordingKit",
+        .testTarget(name: "SessionKitTests", dependencies: ["SessionKit", "TetherCore", "TestSupport"]),
+        .testTarget(name: "TerminalUITests", dependencies: ["TerminalUI", "SessionKit", "TetherCore", "SearchKit", "RecordingKit", "TestSupport",
                                                             .product(name: "SwiftTerm", package: "SwiftTerm")]),
     ],
     swiftLanguageModes: [.v5]

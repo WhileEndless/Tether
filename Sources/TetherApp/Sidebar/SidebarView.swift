@@ -445,13 +445,20 @@ private struct ServerSessionRow: View {
                 .font(.caption)
                 .foregroundStyle(entry.attached ? .green : .secondary)
                 .frame(width: 16)
-            Text(entry.isTether ? "Detached session" : entry.name)
-                .lineLimit(1)
-            Text(entry.kind.rawValue)
-                .font(.caption2)
-                .padding(.horizontal, 4)
-                .background(Capsule().fill(.quaternary))
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(entry.isTether ? "Detached session" : entry.name)
+                        .lineLimit(1)
+                    Text(entry.kind.rawValue)
+                        .font(.caption2)
+                        .padding(.horizontal, 4)
+                        .background(Capsule().fill(.quaternary))
+                        .foregroundStyle(.secondary)
+                }
+                if let pane = entry.activePane {
+                    PaneSummary(pane: pane)
+                }
+            }
             Spacer(minLength: 4)
             if attaching {
                 ProgressView().controlSize(.mini)
@@ -465,12 +472,21 @@ private struct ServerSessionRow: View {
         .padding(.leading, 22)
         .contentShape(Rectangle())
         .onTapGesture(perform: attach)
-        .help("\(entry.kind.rawValue) session “\(entry.name)” on the server\(entry.attached ? " (attached elsewhere)" : "") — click to open it in a tab")
+        .help(helpText)
         .contextMenu {
             Button("Attach in New Tab", action: attach)
             Divider()
             Button("Kill on Server", role: .destructive) { Task { await monitor.killRemoteSession(entry) } }
         }
+    }
+
+    private var helpText: String {
+        var text = "\(entry.kind.rawValue) session “\(entry.name)” on the server\(entry.attached ? " (attached elsewhere)" : "") — click to open it in a tab"
+        let windows = entry.panes.filter(\.paneActive)
+        if !windows.isEmpty {
+            text += "\n" + windows.map { "\($0.windowIndex): \($0.windowName) — \($0.summary)" }.joined(separator: "\n")
+        }
+        return text
     }
 
     private func attach() {
@@ -479,6 +495,29 @@ private struct ServerSessionRow: View {
         state.connect(target, remoteSessionName: entry.name, persistence: entry.kind == .tmux ? .tmux : .screen)
         // The row disappears once the session is open; reset in case attaching fails.
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { attaching = false }
+    }
+}
+
+/// What runs in a server session's pane: the coding agent and its session name, or the command, and
+/// the folder.
+struct PaneSummary: View {
+    let pane: RemoteSessionPane
+    var showPath = true
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if let agent = pane.agent {
+                Image(systemName: agent.isWorking ? "sparkles" : "sparkle")
+                    .font(.caption2)
+                    .foregroundStyle(agent.isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .help(agent.isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
+            }
+            Text(showPath ? pane.summary : pane.displayCommand)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
     }
 }
 
@@ -565,6 +604,7 @@ private struct SidebarBottomBar: View {
     @Environment(WindowState.self) private var state
     @Environment(\.openWindow) private var openWindow
     @Binding var showNewGroup: Bool
+    @State private var refreshing = false
 
     var body: some View {
         let sessions = model.sessions.sessions
@@ -588,6 +628,15 @@ private struct SidebarBottomBar: View {
             .help("Add a host or group")
 
             // Icon-only buttons with tooltips: they fit any sidebar width.
+            BarButton(symbol: refreshing ? "arrow.clockwise.circle.fill" : "arrow.clockwise", active: refreshing,
+                      help: "Refresh: reload the SSH config and the sessions on each connected server") {
+                guard !refreshing else { return }
+                refreshing = true
+                Task {
+                    await model.refreshSidebar()
+                    refreshing = false
+                }
+            }
             BarButton(symbol: model.settings.showSidebarArchive ? "archivebox.fill" : "archivebox",
                       badge: archived, active: model.settings.showSidebarArchive,
                       help: model.settings.showSidebarArchive ? "Hide the archive (\(archived) ended sessions)"
@@ -734,10 +783,12 @@ struct SessionRow: View {
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
         let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID)
+        VStack(alignment: .leading, spacing: 1) {
         HStack(spacing: 6) {
-            Image(systemName: session.phase.isSuspended ? "pause.circle.fill" : inBackground ? "moon.zzz.fill" : "terminal")
+            Image(systemName: session.attention != nil ? "bell.badge.fill"
+                  : session.phase.isSuspended ? "pause.circle.fill" : inBackground ? "moon.zzz.fill" : "terminal")
                 .font(.caption)
-                .foregroundStyle(session.phase.tint)
+                .foregroundStyle(session.attention != nil ? Color.orange : session.phase.tint)
                 .frame(width: 16)
             if session.phase.isSuspended {
                 Text("Suspended").font(.caption2).foregroundStyle(.blue)
@@ -765,11 +816,28 @@ struct SessionRow: View {
                 state.terminate(session)
             }
         }
+            // A coding agent in the tab: its session name, under the title.
+            if let pane = agentPane {
+                PaneSummary(pane: pane, showPath: false)
+                    .padding(.leading, 22)
+            }
+        }
         .padding(.leading, 22)
         .tag(SidebarItem.session(session.id))
         .id(SidebarItem.session(session.id))
         .help(elsewhere.map { "Open in \($0) — click to go there · right-click to move it here" }
               ?? (inBackground ? "In the background — click to open in a tab · double-click to rename" : "Double-click to rename"))
+    }
+}
+
+extension SessionRow {
+    /// The tab's active pane, when the last look at the host's tmux sessions found a coding agent in it.
+    private var agentPane: RemoteSessionPane? {
+        guard !session.phase.isDead, session.persistence == .tmux else { return nil }
+        let entry = model.monitor(for: session.descriptor.target).remoteSessions
+            .first { $0.kind == .tmux && $0.name == session.descriptor.remoteSessionName }
+        guard let pane = entry?.activePane, pane.agent != nil else { return nil }
+        return pane
     }
 }
 
@@ -874,7 +942,7 @@ struct SessionContextMenu: View {
             }
         }
         SessionSortMenu()
-        Button("New Session to Same Host") { state.connect(session.descriptor.target) }
+        Button("New Session to Same Host") { state.newSession(like: session) }
         if case .waiting = session.phase {
             Button("Reconnect Now") { session.reconnectNow() }
         }

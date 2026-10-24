@@ -47,9 +47,7 @@ public enum ProcessRunner {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
-            if let environment {
-                process.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
-            }
+            process.environment = ChildEnvironment.base.merging(environment ?? [:]) { $1 }
             let outPipe = Pipe(), errPipe = Pipe(), inPipe = Pipe()
             process.standardOutput = outPipe
             process.standardError = errPipe
@@ -105,5 +103,35 @@ public enum ProcessRunner {
                 }
             }
         }
+    }
+}
+
+/// The environment for programs Tether starts: the app's own, without what would tie them to a
+/// terminal multiplexer the app happens to run inside. With `$TMUX` set, tmux talks to that outer
+/// server — local sessions and scripts would list, create or end sessions there.
+public enum ChildEnvironment {
+    public static let removed = ["TMUX", "TMUX_PANE"]
+
+    public static var base: [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for key in removed { env[key] = nil }
+        return env
+    }
+
+    /// Folders where package managers put tools such as tmux. An app started from the Dock or
+    /// Finder gets launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) without them.
+    public static let toolFolders = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+
+    /// For programs run on this Mac (local terminals, local probes): `base` with the tool folders
+    /// in PATH, so this Mac's tmux is found like on a server.
+    public static var local: [String: String] {
+        var env = base
+        env["PATH"] = withToolFolders(env["PATH"])
+        return env
+    }
+
+    static func withToolFolders(_ path: String?) -> String {
+        let current = (path ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(separator: ":").map(String.init)
+        return (toolFolders.filter { !current.contains($0) } + current).joined(separator: ":")
     }
 }

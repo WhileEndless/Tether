@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Testing
+import TestSupport
 import SwiftTerm
 import SearchKit
 import TetherCore
@@ -16,12 +17,8 @@ import TetherCore
 
     /// Each test leaves nothing behind: its tmux server and its folder (with the fake ssh) go.
     deinit {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "TMUX= TMUX_TMPDIR=\"$0\" tmux kill-server 2>/dev/null; true", dir.path]
-        p.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"]
-        try? p.run()
-        p.waitUntilExit()
+        BoundedProcess.run("/bin/sh", ["-c", "TMUX= TMUX_TMPDIR=\"$0\" tmux kill-server 2>/dev/null; true", dir.path],
+                           environment: ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"], timeout: 5)
         try? FileManager.default.removeItem(at: dir)
     }
 
@@ -238,16 +235,11 @@ import TetherCore
 
     /// Stops this suite's private tmux server.
     func killTmuxServer() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["tmux", "kill-server"]
         var env = ProcessInfo.processInfo.environment
         env["TMUX_TMPDIR"] = dir.path
+        env["TMUX"] = nil
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
-        p.environment = env
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
+        BoundedProcess.run("/usr/bin/env", ["tmux", "kill-server"], environment: env, timeout: 5)
     }
 
     /// Long sessions: only the newest lines stay in memory, the rest is searched in the recording,

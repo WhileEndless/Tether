@@ -88,6 +88,113 @@ import Testing
         #expect(tether[0].attached == false)
     }
 
+    @Test func parsesTmuxPanesWithForegroundCommands() {
+        let text = """
+        @@tmux
+        work|1700000000|0|3
+        build|1700000000|1|1
+        @@tmuxpanes
+        work|0|editor|0|1|%1|/dev/pts/3|vim|/home/user/src
+        work|1|train|1|0|%2|/dev/pts/4|bash|/srv/ml
+        work|1|train|1|1|%3|/dev/pts/5|python3|/srv/ml/a|b
+        work|2|idle|0|1|%4|/dev/pts/6|zsh|/home/user
+        build|0|make|1|1|%5|/dev/ttys007|make|/Users/user/project
+        @@tmuxtitles
+        %1|host.example.com|host.example.com
+        %4|host.example.com|user@host: ~
+        @@fg
+        101 pts/3 S+ vim main.go
+        102 pts/4 Ss+ -bash
+        103 pts/5 Ss bash
+        104 pts/5 Rl+ /usr/bin/python3 train.py --epochs 3
+        105 ttys007  S+   make -j8 all
+        @@agents
+        @@screen
+        @@end
+        """
+        let all = ProbeParser.remoteSessions(text)
+        let work = all[0], build = all[1]
+        #expect(work.panes.count == 4)
+        #expect(work.activePane?.windowName == "train")
+        #expect(work.activePane?.commandLine == "/usr/bin/python3 train.py --epochs 3")
+        #expect(work.activePane?.path == "/srv/ml/a|b")
+        #expect(work.panes[0].displayCommand == "vim main.go")
+        #expect(work.panes[1].isShell && work.panes[1].commandLine == nil)
+        #expect(work.panes[3].summary == "zsh — /home/user")
+        #expect(build.activePane?.commandLine == "make -j8 all")
+        #expect(work.panes[0].title.isEmpty)
+        #expect(work.panes[3].title == "user@host: ~")
+    }
+
+    @Test func namesCodingAgentSessions() {
+        let text = #"""
+        @@tmux
+        agents|1700000000|0|4
+        @@tmuxpanes
+        agents|0|claude|1|1|%1|/dev/pts/1|claude|/srv/app
+        agents|1|codex|0|1|%2|/dev/pts/2|codex|/srv/api
+        agents|2|node|0|1|%3|/dev/pts/3|node|/srv/web
+        agents|3|opencode|0|1|%4|/dev/pts/4|opencode|/srv/docs
+        @@tmuxtitles
+        %3|host.example.com|⠂ Codex
+        %4|host.example.com|✳ Write the changelog
+        @@fg
+        201 pts/1 Sl+ claude
+        202 pts/2 Sl+ codex resume 11111111-2222-3333-4444-555555555555
+        203 pts/3 Sl+ node /usr/lib/node_modules/@openai/codex/bin/codex.js
+        204 pts/3 Sl+ /usr/lib/node_modules/@openai/codex/vendor/codex
+        205 pts/4 Sl+ opencode
+        @@agents
+        201|claude|json|{"name":"Fix \"login\" bug","nameSource":"user","status":"busy"}
+        201|claude|found|
+        202|codex|index|{"id":"11111111-2222-3333-4444-555555555555","thread_name":"Release prep","updated_at":"2026-10-01T00:00:00Z"}
+        202|codex|title|Generated title
+        202|codex|found|
+        203|codex|found|
+        204|codex|found|
+        205|opencode|found|
+        @@end
+        """#
+        let panes = ProbeParser.remoteSessions(text)[0].panes
+        #expect(panes[0].agent == CodingAgent(kind: .claude, sessionName: "Fix \"login\" bug", namedByUser: true, status: "busy"))
+        #expect(panes[0].agent?.isWorking == true)
+        #expect(panes[0].displayCommand == "Claude Code: Fix \"login\" bug")
+        #expect(panes[1].agent?.sessionName == "Release prep" && panes[1].agent?.namedByUser == true)
+        // No name known and the title only says "Codex": just the agent.
+        #expect(panes[2].agent?.kind == .codex)
+        #expect(panes[2].displayCommand == "Codex")
+        // opencode without its database: the terminal title stands in.
+        #expect(panes[3].summary == "opencode: Write the changelog — /srv/docs")
+    }
+
+    /// Claude Code names its tmux pane; that wins even when the foreground process is something else.
+    @Test func claudeFoundByItsTmuxPane() {
+        let text = #"""
+        @@tmux
+        work|1700000000|0|1
+        @@tmuxpanes
+        work|0|main|1|1|%7|/dev/pts/9|bash|/srv/app
+        @@fg
+        301 pts/9 Ss+ -bash
+        @@agents
+        455|claude|json|{"name":"Ship it","nameSource":"auto","status":"idle","tmux":"work:@3.%7"}
+        455|claude|found|
+        @@end
+        """#
+        let pane = ProbeParser.remoteSessions(text)[0].panes[0]
+        #expect(pane.agent?.sessionName == "Ship it")
+        #expect(pane.agent?.namedByUser == false && pane.agent?.isWorking == false)
+        #expect(pane.displayCommand == "Claude Code: Ship it")
+    }
+
+    @Test func remoteSessionsWithoutPaneSections() {
+        let all = ProbeParser.remoteSessions("@@tmux\nwork|1700000000|0|1\n@@end\n")
+        #expect(all.count == 1)
+        #expect(all[0].panes.isEmpty && all[0].activePane == nil)
+        #expect(RemoteSessionPane(windowIndex: 0, windowName: "", windowActive: true, paneActive: true,
+                                  command: "-zsh", commandLine: nil, path: "").isShell)
+    }
+
     @Test func parsesNvidiaIncludingUnifiedMemory() {
         let lines = ["0, NVIDIA GB10, 37, [N/A], [N/A], 51, 18.42, [N/A]",
                      "1, NVIDIA A100-SXM4-80GB, 99, 40000, 81920, 70, 300.5, 400.00"]

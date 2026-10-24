@@ -9,6 +9,8 @@ public final class SessionRecorder: @unchecked Sendable {
     private var handle: FileHandle?
     private var pending = Data()
     private var bytesSinceQuotaCheck = 0
+    /// Bytes of output in the file (as received: before encryption).
+    private var written = 0
     /// Set when this recording is encrypted: every batch is written as one sealed frame.
     private let sealer: RecordingCrypto.Sealer?
     private var nextFrame = 0
@@ -44,12 +46,15 @@ public final class SessionRecorder: @unchecked Sendable {
         do { sealer = try RecordingCrypto.sealer(for: url) } catch { return nil }
         guard let h = try? FileHandle(forWritingTo: url) else { return nil }
         if sealer != nil, let r = try? FileHandle(forReadingFrom: url) {
-            nextFrame = (try? FrameIndex(handle: r).boxes.count) ?? 0
+            let index = try? FrameIndex(handle: r)
+            nextFrame = index?.boxes.count ?? 0
+            written = index?.plainLengths.reduce(0, +) ?? 0
             try? r.close()
         }
         self.sealer = sealer
         self.url = url
-        h.seekToEndOfFile()
+        let end = h.seekToEndOfFile()
+        if sealer == nil { written = Int(end) }
         handle = h
         RecordingStore.markActive(url)
     }
@@ -94,6 +99,15 @@ public final class SessionRecorder: @unchecked Sendable {
         queue.sync { flushLocked() }
     }
 
+    /// Writes everything buffered and returns how many bytes of output the file holds now, so a
+    /// reader can stop exactly there while the session goes on writing.
+    public func flushedLength() -> Int {
+        queue.sync {
+            flushLocked()
+            return written
+        }
+    }
+
     private func flushLocked() {
         guard let handle, !pending.isEmpty else { return }
         do {
@@ -112,6 +126,7 @@ public final class SessionRecorder: @unchecked Sendable {
             return
         }
         bytesSinceQuotaCheck += pending.count
+        written += pending.count
         pending.removeAll(keepingCapacity: true)
         if bytesSinceQuotaCheck >= quotaCheckInterval {
             bytesSinceQuotaCheck = 0

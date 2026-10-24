@@ -1,4 +1,5 @@
 import Testing
+import TestSupport
 import Foundation
 import TetherCore
 @testable import SSHTransport
@@ -65,14 +66,7 @@ import TetherCore
                        "new\nline", "'", "\\", "\"double\"", "tab\there", "ünïcødé ✓", "--rm -rf /", "*?[a]", ""]
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] where FileManager.default.isExecutableFile(atPath: shell) {
             for sample in samples {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: shell)
-                p.arguments = ["-c", "printf %s " + sample.shellQuoted]
-                let out = Pipe()
-                p.standardOutput = out
-                try p.run()
-                p.waitUntilExit()
-                let got = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let got = BoundedProcess.run(shell, ["-c", "printf %s " + sample.shellQuoted], timeout: 10).output
                 #expect(got == sample, "\(shell): \(sample.debugDescription) → \(got.debugDescription)")
             }
         }
