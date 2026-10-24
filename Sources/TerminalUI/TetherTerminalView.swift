@@ -14,6 +14,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private var markLines: [Int] = []
     private var pendingResize: DispatchWorkItem?
     private var lastSentSize: (cols: Int, rows: Int)?
+    /// The display scale the cell size was worked out for (see `viewDidChangeBackingProperties`).
+    private var metricsScale: CGFloat = 1
     /// Called with files dropped onto (or pasted into) the terminal.
     public var onFiles: (([URL]) -> Void)?
 
@@ -36,6 +38,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         scrollerStyle = .legacy
         registerForDraggedTypes([.fileURL] + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
         apply(settings: settings)
+        // Outside a window SwiftTerm sizes cells for the main screen.
+        metricsScale = NSScreen.main?.backingScaleFactor ?? 1
         KeyboardRouter.shared.install()
         // Notifications from programs (OSC 9, 777, 99) — never while old output is replayed.
         for code in [9, 777, 99] {
@@ -53,7 +57,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public func apply(settings: AppSettings) {
         self.settings = settings
         let newFont = settings.terminalFont
-        if newFont != font { font = newFont }
+        if newFont != font { setFont(newFont) }
         applyTheme()
         optionAsMetaKey = settings.optionAsMeta
         allowMouseReporting = settings.allowMouseReporting
@@ -156,7 +160,35 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        updateMetricsForScale()
         if window != nil { DispatchQueue.main.async { [weak self] in self?.reportSizeIfNeeded() } }
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateMetricsForScale()
+    }
+
+    /// SwiftTerm snaps the cell width to the pixels of the screen it measured on and never measures
+    /// again. Box-drawing characters (─ │ ╭ …, Claude Code's tables, rules and input box) are drawn
+    /// at whole pixels per cell of the current screen, text at the measured width: measured on a
+    /// Retina screen (7.5 pt) and shown on a 1× one, the lines move 0.5 px further right per column.
+    /// Views made before they have a window (tabs restored at launch) measure on the main screen,
+    /// so measure again for the window's screen.
+    private func updateMetricsForScale() {
+        guard let scale = window?.backingScaleFactor, scale != metricsScale else { return }
+        setFont(font)
+    }
+
+    /// Changes the font without resetting the terminal: SwiftTerm soft-resets a sized view when its
+    /// font changes (cursor visibility, application keys, scroll region, … of the running program).
+    /// With no size, it only measures; the size given back then resizes the terminal as usual.
+    private func setFont(_ newFont: NSFont) {
+        let size = frame.size
+        setFrameSize(.zero)
+        font = newFont
+        setFrameSize(size)
+        metricsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
     }
 
     public override func setFrameSize(_ newSize: NSSize) {

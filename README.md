@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.3.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.3.2 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.3.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.3.2): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -55,7 +55,7 @@ Search across every terminal, the archive and recordings.
 - Windows has no tmux or screen, so a shell there ends with its connection (its output stays in the recording).
 
 **Terminal**
-- xterm-256color and true color, mouse reporting, alternate screen, Option as Meta, and key mappings. vim, htop, fzf and emacs work as expected.
+- xterm-256color and true color, mouse reporting, alternate screen, Option as Meta (off by default, so Option types your layout's characters such as @), and key mappings. vim, htop, fzf and emacs work as expected.
 - Uses this Mac's Terminal.app profile (colors, font, translucency) by default.
 - Terminal.app navigation: ⌘↑/⌘↓ jump between commands, ⇧⌘↑/⇧⌘↓ select whole commands, and PageUp/PageDown/Home/End scroll.
 - Tab names follow the running command (or the current directory), and you can rename any tab.
@@ -135,7 +135,7 @@ Search across every terminal, the archive and recordings.
 
 ## Keyboard shortcuts
 
-Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option as Meta, Esc, function keys — goes straight to the terminal, so vim, emacs, tmux bindings and fzf behave as usual. The full, searchable list is in **Help ▸ Keyboard Shortcuts** (⌘/) and in **Settings ▸ Keyboard**.
+Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option (characters, or Meta if you turn it on), Esc, function keys — goes straight to the terminal, so vim, emacs, tmux bindings and fzf behave as usual. The full, searchable list is in **Help ▸ Keyboard Shortcuts** (⌘/) and in **Settings ▸ Keyboard**.
 
 | | |
 | --- | --- |
@@ -186,6 +186,8 @@ Or `make run` to build and open it from `dist/` without installing. A build made
 ### Updating
 
 Quit Tether, then install the new version over the old one (`git pull && make install` from source). Settings, hosts, sessions and recordings are kept. Sessions that were open reattach on the next launch.
+
+Tether is not signed with a developer certificate, so to the keychain every new version is a new app: the first time a new version uses a saved password (or the recording key), macOS asks whether Tether may use it. Choose *Always Allow*. Tether's own security settings are read without asking.
 
 ### Uninstalling
 

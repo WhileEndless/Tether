@@ -164,7 +164,7 @@ private struct KeyboardSettings: View {
         Form {
             Section {
                 Toggle("Use Option as Meta key", isOn: $store.settings.optionAsMeta)
-                Text("Required for Alt shortcuts in emacs, readline (⌥B / ⌥F) and many TUI apps. Turn off to type special characters with ⌥.")
+                Text("Off: ⌥ types the characters of your keyboard layout (⌥Q → @ on Turkish keyboards, [ ] { } | \\ ~ on many others), like Terminal.app. On: ⌥ sends Meta for Alt shortcuts in emacs, readline (⌥B / ⌥F) and many TUI apps — those characters can then not be typed with ⌥.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

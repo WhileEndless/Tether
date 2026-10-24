@@ -114,12 +114,34 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
     private static let service = "Tether Security Settings"
     private static let account = "settings"
 
-    public static func pinned() -> SecuritySettings? {
-        Keychain.read(service: service, account: account).flatMap { try? JSONDecoder().decode(SecuritySettings.self, from: $0) }
+    /// The keychain copy. It is not secret, only guarded against silent changes, so it lives in an
+    /// attribute that Tether reads without a keychain prompt, also after an update (see
+    /// `Keychain.lookUpAttribute`). Copies written by 0.3.0–0.3.1 keep it in the item's data: that is
+    /// read once (which may ask the user) and moved to the attribute.
+    public enum Pin: Equatable, Sendable {
+        case pinned(SecuritySettings)
+        /// No copy in the keychain.
+        case missing
+        /// A copy exists but could not be read (the user denied access to an old-style copy).
+        case unreadable
+    }
+
+    public static func pinned() -> Pin {
+        switch Keychain.lookUpAttribute(service: service, account: account) {
+        case .missing:
+            return .missing
+        case .found(let value?):
+            return (try? JSONDecoder().decode(SecuritySettings.self, from: value)).map(Pin.pinned) ?? .unreadable
+        case .found(nil):
+            guard let data = Keychain.read(service: service, account: account),
+                  let old = try? JSONDecoder().decode(SecuritySettings.self, from: data) else { return .unreadable }
+            pin(old)
+            return .pinned(old)
+        }
     }
 
     public static func pin(_ settings: SecuritySettings) {
         guard let data = try? JSONEncoder().encode(settings) else { return }
-        Keychain.write(data, service: service, account: account, label: "Tether security settings")
+        Keychain.writeAttribute(data, service: service, account: account, label: "Tether security settings")
     }
 }

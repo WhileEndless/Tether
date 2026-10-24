@@ -9,6 +9,7 @@ public enum Keychain {
     /// they never read or change the user's keychain.
     private static let inMemory = AppPaths.debugOverride("TETHER_DEFAULTS_SUITE") != nil || AppPaths.isRunningTests
     nonisolated(unsafe) private static var memory: [String: Data] = [:]
+    nonisolated(unsafe) private static var memoryAttributes: [String: Data] = [:]
     private static let memoryLock = NSLock()
     private static func memoryKey(_ service: String, _ account: String) -> String { service + "\u{0}" + account }
 
@@ -41,7 +42,9 @@ public enum Keychain {
     /// fails, the previous value is put back.
     @discardableResult
     public static func write(_ data: Data, service: String, account: String, label: String) -> Bool {
-        if inMemory { memoryLock.lock(); memory[memoryKey(service, account)] = data; memoryLock.unlock(); return true }
+        if inMemory {
+            memoryLock.lock(); memory[memoryKey(service, account)] = data; memoryAttributes[memoryKey(service, account)] = nil; memoryLock.unlock(); return true
+        }
         let previous = read(service: service, account: account)
         SecItemDelete(base(service: service, account: account) as CFDictionary)
         var add = base(service: service, account: account)
@@ -57,8 +60,53 @@ public enum Keychain {
         return false
     }
 
+    /// Whether an item exists and the value kept in its "generic" attribute. Attributes are read
+    /// without the access list's prompt, so this suits values that must not be changed silently but
+    /// are not secret. (Tether is ad-hoc signed: every build is a new app to the keychain, and
+    /// reading an item's data would ask the user again after each update.)
+    public enum Lookup: Equatable, Sendable { case missing, found(Data?) }
+
+    public static func lookUpAttribute(service: String, account: String) -> Lookup {
+        if inMemory {
+            memoryLock.lock(); defer { memoryLock.unlock() }
+            return memoryAttributes[memoryKey(service, account)].map { .found($0) } ?? (memory[memoryKey(service, account)] != nil ? .found(nil) : .missing)
+        }
+        var query = base(service: service, account: account)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return .missing }
+        return .found((item as? [String: Any])?[kSecAttrGeneric as String] as? Data)
+    }
+
+    /// Stores `value` in the "generic" attribute of a new item (see `lookUpAttribute`), replacing any
+    /// existing one like `write`. If adding fails, the previous value is put back.
+    @discardableResult
+    public static func writeAttribute(_ value: Data, service: String, account: String, label: String) -> Bool {
+        if inMemory {
+            memoryLock.lock(); defer { memoryLock.unlock() }
+            memory[memoryKey(service, account)] = nil
+            memoryAttributes[memoryKey(service, account)] = value
+            return true
+        }
+        let previous = lookUpAttribute(service: service, account: account)
+        SecItemDelete(base(service: service, account: account) as CFDictionary)
+        func add(_ value: Data) -> Bool {
+            var add = base(service: service, account: account)
+            add[kSecAttrGeneric as String] = value
+            add[kSecValueData as String] = Data()
+            add[kSecAttrLabel as String] = label
+            return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+        }
+        if add(value) { return true }
+        if case .found(let old?) = previous { _ = add(old) }
+        return false
+    }
+
     public static func delete(service: String, account: String) {
-        if inMemory { memoryLock.lock(); memory[memoryKey(service, account)] = nil; memoryLock.unlock(); return }
+        if inMemory {
+            memoryLock.lock(); memory[memoryKey(service, account)] = nil; memoryAttributes[memoryKey(service, account)] = nil; memoryLock.unlock(); return
+        }
         SecItemDelete(base(service: service, account: account) as CFDictionary)
     }
 

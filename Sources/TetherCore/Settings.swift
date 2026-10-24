@@ -253,7 +253,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var copyOnSelect = false
 
     // Keyboard
-    public var optionAsMeta = true
+    /// Off by default, like Terminal.app: Option types the characters of the keyboard layout
+    /// (⌥Q is @ on Turkish and other layouts, ⌥5/⌥6 are [ ] on German, …).
+    public var optionAsMeta = false
     public var keyMappings: [KeyMapping] = KeyMapping.macDefaults
 
     // Sessions
@@ -332,7 +334,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     /// Bumped when defaults change in a way existing users should get too (see `migrate`).
     public var version = AppSettings.currentVersion
-    public static let currentVersion = 3
+    public static let currentVersion = 4
 
     public init() {}
 
@@ -344,6 +346,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         }
         if version < 3 {
             showSidebarArchive = false
+        }
+        if version < 4 {
+            // Option as Meta swallowed characters typed with Option (⌥Q → @ on Turkish keyboards).
+            optionAsMeta = false
         }
         version = Self.currentVersion
     }
@@ -464,15 +470,20 @@ public final class SettingsStore {
         settings.sshBinary = SecuritySettings.usableProgram(settings.sshBinary, fallback: defaults.sshBinary)
         settings.scpBinary = SecuritySettings.usableProgram(settings.scpBinary, fallback: defaults.scpBinary)
         // The keychain copy of the security settings wins over the preferences file.
-        if var pinned = SecuritySettings.pinned() {
+        switch SecuritySettings.pinned() {
+        case .pinned(var pinned):
             pinned.sshBinary = SecuritySettings.usableProgram(pinned.sshBinary, fallback: defaults.sshBinary)
             pinned.scpBinary = SecuritySettings.usableProgram(pinned.scpBinary, fallback: defaults.scpBinary)
             tamperedSecuritySettings = pinned.differences(from: SecuritySettings(settings))
             if !tamperedSecuritySettings.isEmpty { pinned.apply(to: &settings) }
-        } else {
+        case .missing:
             // No keychain copy yet (first launch of this version, or it was removed): keep what the
             // preferences say, but list what differs from the defaults so the user can check it.
             unpinnedNonDefaults = SecuritySettings(AppSettings()).differences(from: SecuritySettings(settings))
+            SecuritySettings.pin(SecuritySettings(settings))
+        case .unreadable:
+            // The user declined the keychain prompt for an old-style copy: they know what they set,
+            // so keep the preferences without a warning and store a copy that never asks again.
             SecuritySettings.pin(SecuritySettings(settings))
         }
     }
