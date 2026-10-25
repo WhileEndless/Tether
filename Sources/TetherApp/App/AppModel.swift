@@ -71,6 +71,8 @@ final class AppModel {
         #if DEBUG
         DemoMode.prepareIfRequested()
         #endif
+        // Another Tether already uses this data folder: show that one instead of running twice.
+        if !InstanceLock.acquire() { Self.handOverToRunningCopy() }
         let store = SettingsStore.shared
         sessions = SessionManager(settings: store)
         transfers = TransferManager(options: { SSHOptions(settings: store.settings) }, policy: {
@@ -111,9 +113,12 @@ final class AppModel {
         }
         RecordingStore.configure(quotaMB: store.settings.recordingQuotaMB,
                                  retentionDays: store.settings.recordingRetentionDays,
-                                 compressAfterDays: store.settings.compressRecordingsAfterDays)
+                                 compressAfterDays: store.settings.compressRecordingsAfterDays,
+                                 partMB: store.settings.recordingPartMB,
+                                 shortenLargestFirst: store.settings.recordingShortenLargestFirst)
         // Compress old recordings now and then once a day.
         Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { _ in RecordingStore.requestQuotaEnforcement() }
+        DispatchQueue.global(qos: .utility).async { AppPaths.removeLeftovers() }
         watchConfigFile()
         // Platforms detected earlier (Windows or Unix-like) are known before the first connection;
         // newly detected ones are remembered per host.
@@ -373,7 +378,18 @@ final class AppModel {
         m.paused = !NSApp.windows.contains { $0.isVisible && $0.occlusionState.contains(.visible) && !($0 is NSPanel) }
             && !NSApp.windows.isEmpty
         monitors[target.key] = m
+        m.onRemoteSessions = { [weak self] entries in self?.nameTabsAfterAgents(target: target, entries) }
         return m
+    }
+
+    /// Tabs on tmux whose active pane runs a coding agent take its session name (unless renamed by
+    /// hand, or turned off in Settings ▸ General); they go back to the usual title when it ends.
+    func nameTabsAfterAgents(target: ConnectionTarget, _ entries: [RemoteSessionEntry]) {
+        for s in sessions.sessions(for: target.key) where s.persistence == .tmux {
+            let pane = entries.first { $0.kind == .tmux && $0.name == s.descriptor.remoteSessionName }?.activePane
+            let title = settings.tabTitleFromAgent ? pane?.agent?.label(fallbackTitle: pane?.title ?? "") : nil
+            if s.agentTitle != title { s.agentTitle = title }
+        }
     }
 
     @ObservationIgnored private var keyChecks: Set<String> = []
@@ -576,14 +592,29 @@ final class AppModel {
         prompt.continuation.resume(returning: answer)
     }
 
+    // MARK: One copy
+
+    /// Brings the Tether that holds the data folder to the front and quits this one, before it
+    /// touched anything.
+    private static func handOverToRunningCopy() -> Never {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != me }
+        others.first?.activate()
+        FileHandle.standardError.write(Data("Tether is already running with this data folder; showing it instead.\n".utf8))
+        exit(0)
+    }
+
     // MARK: Settings side effects
 
     func settingsChanged() {
         TerminalRegistry.shared.applySettings(settings)
         RecordingStore.configure(quotaMB: settings.recordingQuotaMB, retentionDays: settings.recordingRetentionDays,
-                                 compressAfterDays: settings.compressRecordingsAfterDays)
+                                 compressAfterDays: settings.compressRecordingsAfterDays,
+                                 partMB: settings.recordingPartMB, shortenLargestFirst: settings.recordingShortenLargestFirst)
         if config.mainURL != settings.resolvedSSHConfigURL { reloadConfig() }
         applyCommandSettings()
+        for (key, m) in monitors { nameTabsAfterAgents(target: target(forKey: key), m.remoteSessions) }
     }
 }
 

@@ -244,6 +244,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var cursorShape: CursorShape = .block
     public var cursorBlink = false            // Terminal.app default; blinking costs CPU in every tab
     public var scrollbackLines = 10_000
+    /// Programs may erase the scrollback (`clear`, `ESC[3J`) as in other terminals. Off: output never
+    /// erases the history on screen (the recording keeps everything either way).
+    public var programsMayClearScrollback = false
+    /// "Browse" in a terminal of this Mac opens its folder in Finder (off: Tether's file manager).
+    public var browseLocalInFinder = true
+    /// Tabs not renamed by hand are named after the coding agent session in them (Claude Code,
+    /// Codex, opencode).
+    public var tabTitleFromAgent = true
     public var bell: BellMode = .visual
     /// Notifications programs send (OSC 9/777/99 — Claude Code when it finishes or asks).
     public var notifyFromPrograms = true
@@ -279,6 +287,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var recordingRetentionDays = 0     // 0 = keep until quota
     /// Compress recordings older than this many days (0 = never).
     public var compressRecordingsAfterDays = 7
+    /// A session's recording moves its earlier output aside as a compressed part every this many MB
+    /// while the session runs (0 = never). The latest output stays uncompressed for scrolling back.
+    public var recordingPartMB = 16
+    /// When the storage limit is reached, a session holding more than half of it loses its oldest
+    /// output first, before any other recording is removed.
+    public var recordingShortenLargestFirst = true
 
     // Monitoring
     public var monitorRefreshInterval: Double = 5
@@ -404,6 +418,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.cursorShape, &cursorShape)
         d(.cursorBlink, &cursorBlink)
         d(.scrollbackLines, &scrollbackLines)
+        d(.programsMayClearScrollback, &programsMayClearScrollback)
+        d(.browseLocalInFinder, &browseLocalInFinder)
+        d(.tabTitleFromAgent, &tabTitleFromAgent)
         d(.bell, &bell)
         d(.notifyFromPrograms, &notifyFromPrograms)
         d(.notifyOnBell, &notifyOnBell)
@@ -425,6 +442,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.recordingQuotaMB, &recordingQuotaMB)
         d(.recordingRetentionDays, &recordingRetentionDays)
         d(.compressRecordingsAfterDays, &compressRecordingsAfterDays)
+        d(.recordingPartMB, &recordingPartMB)
+        d(.recordingShortenLargestFirst, &recordingShortenLargestFirst)
         d(.monitorRefreshInterval, &monitorRefreshInterval)
         d(.monitorAutoLoad, &monitorAutoLoad)
         d(.showStatusStrip, &showStatusStrip)

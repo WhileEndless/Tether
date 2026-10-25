@@ -179,7 +179,7 @@ private struct ForwardEditor: View {
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
-                .buttonStyle(.glassProminent)
+                .prominentGlassButtonStyle()
                 .disabled(!(1...65535 ~= (Int(listen) ?? 0)) || (forward.kind != .dynamic && !(1...65535 ~= (Int(destPort) ?? 0))))
             }
             .padding()

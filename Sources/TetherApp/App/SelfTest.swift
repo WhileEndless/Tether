@@ -16,6 +16,20 @@ import TerminalUI
 enum SelfTest {
     private static var started = false
 
+    /// A terminal's row in the sidebar and where it is (window coordinates, top-left origin).
+    static func sidebarRow(in window: NSWindow, workspace: UUID) -> (UUID, CGRect)? {
+        guard let content = window.contentView else { return nil }
+        func search(_ view: NSView) -> (UUID, CGRect)? {
+            if let m = view as? SidebarRowMarker.MarkerView, m.workspace == workspace, case .session(let id)? = m.item, !m.isHiddenOrHasHiddenAncestor {
+                let r = m.convert(m.bounds, to: nil)
+                return (id, CGRect(x: r.minX, y: content.frame.height - r.maxY, width: r.width, height: r.height))
+            }
+            for sub in view.subviews { if let found = search(sub) { return found } }
+            return nil
+        }
+        return search(content)
+    }
+
     /// Saves a picture of the window (TETHER_SELFTEST_SNAPSHOT=<dir>) so layouts can be checked
     /// without screen-recording permission.
     static func snapshot(_ window: NSWindow?, _ name: String) {
@@ -922,6 +936,16 @@ enum SelfTest {
                     let closed = center.closeTab(at: CGPoint(x: r.midX, y: r.midY), in: w)
                     try? await Task.sleep(for: .milliseconds(500))
                     say("middle click closed=\(closed) tabs \(count) -> \(state.items.count)")
+                }
+                // The same middle click on a terminal's row in the sidebar closes it too.
+                if let (id, r) = Self.sidebarRow(in: w, workspace: state.workspaceID) {
+                    let before = state.items.count
+                    let closed = center.closeTab(at: CGPoint(x: r.midX, y: r.midY), in: w)
+                    try? await Task.sleep(for: .milliseconds(500))
+                    let gone = !state.items.contains { $0.id == id }
+                    say("\(closed && gone ? "PASS" : "FAIL") sidebar middle click closed=\(closed) tabs \(before) -> \(state.items.count)")
+                } else {
+                    say("FAIL sidebar middle click: no sidebar row with a terminal")
                 }
             }
             if ProcessInfo.processInfo.environment["TETHER_SELFTEST_KEEP"] != nil { say("keeping"); return }

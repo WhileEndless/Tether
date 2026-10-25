@@ -198,7 +198,10 @@ so it is always current. A test checks that this page names every entry in it.
   - Creates, renames, moves or deletes only what you ask for.
   - Never overwrites: new names are free ones (`name-1.ext`).
 - **Transfers:** use `scp`, or a `tar` stream for many files (unpacked by `tar` on the host). They
-  write only the files you transfer.
+  write only the files you transfer. Before an upload under a new name, the name is checked to be
+  still free (the file manager's listing script). When such an upload fails or is cancelled, the
+  partial file it made is removed (`rm -rf -- <that path>`, `Remove-Item` on Windows); nothing else
+  is touched.
 - **Key setup:** appends your public key to `~/.ssh/authorized_keys` (on Windows, also
   `administrators_authorized_keys` for administrators). Only when you ask, and only if the key is not
   there yet.

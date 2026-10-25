@@ -270,7 +270,11 @@ import TetherCore
         #expect(base > 0, "old lines should have been dropped from memory")
         let url = try #require(session.flushedRecordingURL())   // writes out the batched output
         var earlier = SearchSource(id: "e", kind: .recording(url: url, archiveID: nil), title: "e", host: "h", date: nil, status: "")
-        earlier.skipTrailingLines = logical
+        // As the search does: the seam is found by the first logical lines in memory.
+        let memory = view.logicalText().lines
+        earlier.skipTrailingLines = memory.count
+        earlier.memoryHead = Array(memory.prefix(64))
+        _ = logical
         let live = SearchSource(id: "l", kind: .live(sessionID: session.id, lineBase: base), title: "l", host: "h",
                                 date: nil, status: "", lines: lines)
         var q = SearchQuery(pattern: #"^row-(5|2999)$"#)

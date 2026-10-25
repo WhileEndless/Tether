@@ -110,10 +110,34 @@ enum RecordingKeyStore {
     }
 
     /// Forgets every key (the Tether password was forgotten): encrypted recordings can no longer be opened.
+    /// Recordings still being written with the key stop and remove themselves.
     static func forgetAll() {
+        for id in [wrapped()?.keyID, RecordingCrypto.lockedSealing?.keyID, RecordingCrypto.key.map(RecordingCrypto.keyID),
+                   storedKey().map(RecordingCrypto.keyID)].compactMap({ $0 }) {
+            RecordingCrypto.revoke(keyID: id)
+        }
         Keychain.delete(service: service, account: wrappedAccount)
         Keychain.delete(service: service, account: plainAccount)
         writeBackup(nil)
+        Keychain.delete(service: service, account: sealingAccount)
+        RecordingCrypto.lockedSealing = nil
+    }
+
+    /// The public half of the key: what output and history are sealed to while Tether is locked
+    /// (`RecordingCrypto.LockedSealing`). Not secret, but kept in the keychain like the key, so no
+    /// other program can put its own public key there and receive what is written while locked.
+    private static let sealingAccount = "locked-sealing"
+
+    /// Keeps the public half of the key in memory current in the keychain.
+    static func saveSealing() {
+        guard let data = RecordingCrypto.encodedLockedSealing,
+              Keychain.read(service: service, account: sealingAccount) != data else { return }
+        Keychain.write(data, service: service, account: sealingAccount, label: "Tether recording key (public half, for while locked)")
+    }
+
+    /// Tells the recordings where to find it when something must be sealed while locked.
+    static func provideSealing() {
+        RecordingCrypto.lockedSealingLoader = { Keychain.read(service: service, account: sealingAccount) }
     }
 
     private static func derive(_ password: String, salt: Data, rounds: Int) -> SymmetricKey? {

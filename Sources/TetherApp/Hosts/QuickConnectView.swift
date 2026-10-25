@@ -254,7 +254,7 @@ private struct DirectConnectForm: View {
                 Button("Cancel", action: onDone).keyboardShortcut(.cancelAction)
                 Button("Connect") { connect() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .disabled(!canConnect)
             }
             .padding(12)

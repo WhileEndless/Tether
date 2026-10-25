@@ -241,21 +241,46 @@ import TetherCore
         var r = CommandRecord(id: UUID(), hostKey: "h", hostName: "web, eu", sessionID: UUID(), sessionTitle: "t",
                               commandLine: "=cmd \"quoted\"", pid: 7, started: now, lastSeen: now.addingTimeInterval(90), status: .finished)
         r.add(CommandSample(date: now.addingTimeInterval(2), cpu: 12.5, memory: 2048), weight: 2)
+        let p = CommandProcess(pid: 8, ppid: 7, user: "user", state: "R", cpuSeconds: 1, rssBytes: 4096, commandLine: "curl https://example.com")
+        r.note(processes: [p], cpu: [8: 30], weight: 2, at: now)
+        r.note(connections: [ConnectionTraffic(proto: "TCP", state: "ESTAB", local: "192.0.2.1:5000", peer: "192.0.2.2:443", pid: 8,
+                                               processName: "curl", received: 100, sent: 10, receivedBytes: 1000, sentBytes: 50)], at: now)
+
         let csv = String(decoding: MonitorExport.history([r], format: .csv), as: UTF8.self)
         let lines = csv.components(separatedBy: "\r\n")
-        #expect(lines[0].hasPrefix("started,ended,duration_s,status,host,tab,pid,command"))
+        #expect(lines[0].hasPrefix("record_id,started,last_seen,ended,ended_before,duration_s,status,short,host,host_key,tab,session_id,pid,command"))
+        #expect(lines[0].hasSuffix(",remote_hosts,programs"))
         #expect(lines[1].contains("\"web, eu\""))
         #expect(lines[1].contains("\"'=cmd \"\"quoted\"\"\""))   // quoted, and never a formula
         #expect(lines[1].contains(",90,finished,"))
         #expect(lines[1].contains(",12.50,12.50,12.50,"))
-        let json = MonitorExport.history([r], format: .json)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let file = try decoder.decode(MonitorExport.HistoryFile.self, from: json)
-        #expect(file.format == "tether-command-history" && file.records.first?.id == r.id)
-        let conn = String(decoding: MonitorExport.connections([ConnectionTraffic(proto: "TCP", state: "ESTAB", local: "192.0.2.1:1",
+        #expect(lines[1].hasSuffix(",192.0.2.2:443 (HTTPS),curl"))   // where it connected, what it ran
+
+        let processes = String(decoding: MonitorExport.history([r], format: .processesCSV), as: UTF8.self).components(separatedBy: "\r\n")
+        #expect(processes[1].hasPrefix(r.id.uuidString))
+        #expect(processes[1].contains(",8,curl,user,curl https://example.com,"))
+
+        let connections = String(decoding: MonitorExport.history([r], format: .connectionsCSV), as: UTF8.self).components(separatedBy: "\r\n")
+        #expect(connections[0].contains(",remote,remote_host,remote_port,service,"))
+        #expect(connections[1].contains(",8,curl,TCP,ESTAB,192.0.2.1:5000,192.0.2.2:443,192.0.2.2,443,HTTPS,"))
+        #expect(connections[1].contains(",1000,50,100,10"))
+
+        // JSON: named fields with units, the processes and connections with their details.
+        let json = try #require(JSONSerialization.jsonObject(with: MonitorExport.history([r], format: .json)) as? [String: Any])
+        #expect(json["format"] as? String == "tether-command-history" && json["version"] as? Int == 2)
+        let record = try #require((json["records"] as? [[String: Any]])?.first)
+        #expect(record["id"] as? String == r.id.uuidString)
+        #expect((record["cpu_percent"] as? [String: Any])?["avg"] as? Double == 12.5)
+        #expect(record["remote_hosts"] as? [String] == ["192.0.2.2:443 (HTTPS)"])
+        let conn = try #require((record["connection_list"] as? [[String: Any]])?.first)
+        #expect(conn["remote_host"] as? String == "192.0.2.2" && conn["remote_port"] as? Int == 443 && conn["service"] as? String == "HTTPS")
+        #expect((record["process_list"] as? [[String: Any]])?.first?["command_line"] as? String == "curl https://example.com")
+        #expect((record["graph"] as? [[String: Any]])?.first?["cpu_percent"] as? Double == 12.5)
+
+        let live = String(decoding: MonitorExport.connections([ConnectionTraffic(proto: "TCP", state: "ESTAB", local: "192.0.2.1:1",
                                                                                    peer: "192.0.2.2:443", pid: 3, processName: "curl")]), as: UTF8.self)
-        #expect(conn.contains("3,curl,TCP,ESTAB,192.0.2.1:1,192.0.2.2:443,HTTPS"))
+        #expect(live.contains("3,curl,TCP,ESTAB,192.0.2.1:1,192.0.2.2:443,192.0.2.2,443,HTTPS"))
+        #expect(MonitorExport.suggestedName("tether-command-history", format: .connectionsCSV).hasPrefix("tether-command-history connections "))
     }
 
     /// Commands the watcher saw but no look caught are kept with their command line and duration;
@@ -322,5 +347,69 @@ final class LockFlag: @unchecked Sendable {
     var value: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _value }
         set { lock.lock(); _value = newValue; lock.unlock() }
+    }
+}
+
+/// While Tether is locked, a host's history file cannot be opened: commands recorded meanwhile go
+/// to a pending file next to it (one per run), and are merged into it once it opens. Nothing is
+/// kept only in memory, and nothing is overwritten.
+@MainActor @Suite struct CommandHistoryLockedTests {
+    final class Lock: @unchecked Sendable {
+        private let l = NSLock()
+        private var _locked = false
+        var locked: Bool { get { l.lock(); defer { l.unlock() }; return _locked } set { l.lock(); _locked = newValue; l.unlock() } }
+    }
+
+    /// "S" + data while sealed; it opens only while unlocked (like files sealed with the key).
+    func codec(_ lock: Lock) -> CommandHistoryStore.Codec {
+        CommandHistoryStore.Codec(seal: { Data("S".utf8) + $0 }, open: { data in
+            guard data.first == UInt8(ascii: "S") else { return .unreadable }
+            return lock.locked ? .locked : .data(Data(data.dropFirst()))
+        })
+    }
+
+    func add(_ store: CommandHistoryStore, _ command: String, at date: Date) {
+        let id = store.begin(hostKey: "web", hostName: "web", sessionID: UUID(), sessionTitle: "t",
+                             process: CommandProcess(pid: 1, ppid: 0, started: date, commandLine: command), at: date)
+        store.end(id, status: .finished, at: date.addingTimeInterval(1))
+    }
+
+    @Test func recordsWhileLockedAreWrittenAndMerged() async throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tether-chl-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let lock = Lock()
+        let now = Date()
+
+        let first = CommandHistoryStore(directory: dir, codec: codec(lock))
+        add(first, "make one", at: now)
+        first.flush()
+        let mainFile = try #require(try FileManager.default.contentsOfDirectory(atPath: dir.path).first)
+        let mainBefore = try Data(contentsOf: dir.appendingPathComponent(mainFile))
+
+        // Two runs while locked: each writes its own pending file, the host's file stays as it was.
+        lock.locked = true
+        for (i, command) in ["make two", "make three"].enumerated() {
+            let run = CommandHistoryStore(directory: dir, codec: codec(lock))
+            run.load()
+            #expect(run.isLocked)
+            add(run, command, at: now.addingTimeInterval(Double(i + 1) * 10))
+            run.flush()
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        #expect(names.filter { $0.contains(".pending-") }.count == 2)
+        #expect(try Data(contentsOf: dir.appendingPathComponent(mainFile)) == mainBefore)
+
+        // Unlocked: everything is there once, in the host's file; the pending files are gone.
+        lock.locked = false
+        let after = CommandHistoryStore(directory: dir, codec: codec(lock))
+        after.load()
+        #expect(Set(after.records().map(\.commandLine)) == ["make one", "make two", "make three"])
+        add(after, "make four", at: now.addingTimeInterval(40))
+        after.flush()
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.contains(".pending-") }.isEmpty)
+        let reread = CommandHistoryStore(directory: dir, codec: codec(lock))
+        reread.load()
+        #expect(reread.records().count == 4)
     }
 }

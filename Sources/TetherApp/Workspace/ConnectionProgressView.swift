@@ -37,7 +37,7 @@ struct ConnectionProgressCard: View {
         }
         .padding(20)
         .frame(maxWidth: 460)
-        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+        .glassBackground(cornerRadius: 18)
         .shadow(color: .black.opacity(0.15), radius: 20, y: 6)
         .padding(16)   // stays inside narrow terminal panes
     }
@@ -244,7 +244,7 @@ struct ConnectionProgressCard: View {
                         .disabled(removingKey)
                 } else {
                     Button("Retry") { retry() }
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                         .keyboardShortcut(.defaultAction)
                 }
             } else {

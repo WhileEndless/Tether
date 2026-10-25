@@ -173,8 +173,15 @@ import TestSupport
         tmuxRun(["new-session", "-d", "-s", "agents", "-c", dir.appendingPathComponent("app").path, "\(bin)/claude"])
         tmuxRun(["new-window", "-t", "agents", "-c", dir.appendingPathComponent("api").path, "\(bin)/codex"])
         tmuxRun(["new-window", "-t", "agents", "-c", dir.appendingPathComponent("docs").path, "\(bin)/opencode"])
-        Thread.sleep(forTimeInterval: 0.8)
-        let out = try run(ProbeScripts.remoteSessions, [], seconds: 20, environment: env)
+        // The fake agents write their session files as they start: look until they are all seen
+        // (a busy machine, with the other tests running, can take a few seconds).
+        var out = ""
+        for _ in 0..<20 {
+            Thread.sleep(forTimeInterval: 0.4)
+            out = try run(ProbeScripts.remoteSessions, [], seconds: 20, environment: env)
+            let found = ProbeParser.remoteSessions(out).first { $0.name == "agents" }?.panes.compactMap(\.agent) ?? []
+            if found.count == 3, found.first?.sessionName != nil { break }
+        }
         #expect(!out.contains("peerToken"))
         let sessions = ProbeParser.remoteSessions(out)
         let session = sessions.first { $0.name == "probe" }

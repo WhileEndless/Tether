@@ -50,17 +50,13 @@ enum SessionSave {
             // thread, where output arrives), so nothing is saved twice or mixed in from later.
             let snapshot = session.recordingSnapshot()
             var lines: [String] = []
-            var dropLast = 0
-            var source = snapshot
-            if chosen == .text, let view {
-                if view.showsAlternateScreen && snapshot != nil {
-                    // A full-screen program is up: the session's text is all in the recording.
-                } else {
-                    let (trimmed, text, logical) = view.logicalText()
-                    lines = text
-                    // Nothing was trimmed from memory: the scrollback alone is the whole session.
-                    if trimmed { dropLast = logical } else { source = nil }
-                }
+            let dropLast = 0
+            let source = snapshot
+            // With a recording, the text comes from it alone, as the terminal showed it: each line
+            // once (the screen keeps every redraw of programs such as Claude Code), and nothing to
+            // join with memory. Without one (a private tab, recording off), from the screen.
+            if chosen == .text, snapshot == nil, let view {
+                lines = view.logicalText().lines
             }
             Task.detached(priority: .utility) {
                 do {

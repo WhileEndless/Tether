@@ -9,6 +9,10 @@ public struct RecordingInfo: Identifiable, Hashable, Sendable {
     public var size: Int64
     public var modified: Date
     public var isActive: Bool
+    /// Earlier output of a long session, moved aside and compressed while it ran (`RecordingParts`).
+    public var parts: [URL] = []
+    /// The recording's files: its parts, then the file itself.
+    public var files: [URL] { parts + [url] }
     public var id: URL { url }
 }
 
@@ -20,6 +24,8 @@ public enum RecordingStore {
     nonisolated(unsafe) private static var quotaBytes: Int64 = 1024 * 1024 * 1024
     nonisolated(unsafe) private static var retentionDays = 0
     nonisolated(unsafe) private static var compressAfterDays = 7
+    nonisolated(unsafe) private static var _partBytes = 16 * 1024 * 1024
+    nonisolated(unsafe) private static var shortenLargest = true
     private static let lock = NSLock()
     private static let queue = DispatchQueue(label: "tether.recording-quota", qos: .utility)
 
@@ -32,11 +38,19 @@ public enum RecordingStore {
     static func markActive(_ url: URL) { lock.lock(); active.insert(url.path); lock.unlock() }
     static func markInactive(_ url: URL) { lock.lock(); active.remove(url.path); lock.unlock() }
 
-    public static func configure(quotaMB: Int, retentionDays days: Int, compressAfterDays compressDays: Int = 7) {
+    /// - Parameters:
+    ///   - partMB: a recording still being written moves its output aside as a compressed part
+    ///     every this many MB (0 = never: it is compressed only after the session, as configured).
+    ///   - shortenLargestFirst: when space runs out, a recording that holds more than half of it
+    ///     loses its oldest parts before any other recording is removed.
+    public static func configure(quotaMB: Int, retentionDays days: Int, compressAfterDays compressDays: Int = 7,
+                                 partMB: Int = 16, shortenLargestFirst: Bool = true) {
         lock.lock()
         quotaBytes = Int64(max(quotaMB, 16)) * 1024 * 1024
         retentionDays = max(days, 0)
         compressAfterDays = max(compressDays, 0)
+        _partBytes = max(partMB, 0) * 1024 * 1024
+        shortenLargest = shortenLargestFirst
         lock.unlock()
         requestQuotaEnforcement()
     }
@@ -54,30 +68,70 @@ public enum RecordingStore {
     public static func compressOld(in directory: URL = AppPaths.recordingsDirectory, now: Date = Date(),
                                    olderThanDays: Int? = nil) -> Int {
         lock.lock(); let days = olderThanDays ?? compressAfterDays; lock.unlock()
-        guard days > 0 else { return 0 }
+        // Parts are never written to again: they are compressed right away, whatever their age.
+        var count = RecordingParts.compressAll(in: directory)
+        guard days > 0 else { return count }
         let cutoff = now.addingTimeInterval(-Double(days) * 86_400)
-        var count = 0
         for item in all(in: directory) where !item.isActive && !item.isCompressed && item.modified < cutoff {
             if (try? RecordingCompression.compress(item.url)) != nil { count += 1 }
         }
         return count
     }
 
-    public static func requestQuotaEnforcement() {
-        queue.async { enforceQuota() }
+    /// Bytes of output after which a recording being written starts a new part (0 = never).
+    static var partBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _partBytes
     }
+
+    public static func requestQuotaEnforcement(in directory: URL = AppPaths.recordingsDirectory) {
+        queue.async { enforceQuota(in: directory) }
+    }
+
+    /// Runs `work` on the maintenance queue, after (and never at the same time as) quota checks,
+    /// compression and other passes, so two of them never rewrite the same recording at once.
+    public static func perform<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: work()) }
+        }
+    }
+
+    /// Waits until queued maintenance (quota, compression of parts) has run.
+    static func waitForMaintenance() { queue.sync {} }
 
     public static func all(in directory: URL = AppPaths.recordingsDirectory) -> [RecordingInfo] {
         let fm = FileManager.default
         guard let e = fm.enumerator(at: directory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) else { return [] }
         lock.lock(); let activeNow = active; lock.unlock()
         var list: [RecordingInfo] = []
-        for case let url as URL in e where url.pathExtension == fileExtension
-            || (url.pathExtension == RecordingCompression.compressedExtension && url.deletingPathExtension().pathExtension == fileExtension) {
+        var parts: [String: [(url: URL, size: Int64)]] = [:]
+        for case let url as URL in e {
+            if RecordingParts.isPart(url) {
+                guard url.pathExtension != "tmp", let owner = RecordingParts.owner(of: url) else { continue }
+                parts[owner, default: []].append((url, Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)))
+                continue
+            }
+            guard url.pathExtension == fileExtension
+                || (url.pathExtension == RecordingCompression.compressedExtension && url.deletingPathExtension().pathExtension == fileExtension) else { continue }
             let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             list.append(RecordingInfo(url: url, targetKey: url.deletingLastPathComponent().lastPathComponent,
                                       size: Int64(v?.fileSize ?? 0), modified: v?.contentModificationDate ?? .distantPast,
                                       isActive: activeNow.contains(url.path)))
+        }
+        // A recording's parts count as the recording (listed, sized and removed with it). Parts
+        // whose recording is gone (it was removed while a part was being compressed) are listed
+        // under their own name, so the quota still sees and removes them.
+        for i in list.indices {
+            let owner = RecordingCompression.isCompressed(list[i].url) ? list[i].url.deletingPathExtension().path : list[i].url.path
+            guard let mine = parts.removeValue(forKey: owner) else { continue }
+            let sorted = mine.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+            list[i].parts = sorted.map(\.url)
+            list[i].size += sorted.reduce(0) { $0 + $1.size }
+        }
+        for orphan in parts.values.flatMap({ $0 }) {
+            let v = try? orphan.url.resourceValues(forKeys: [.contentModificationDateKey])
+            list.append(RecordingInfo(url: orphan.url, targetKey: orphan.url.deletingLastPathComponent().lastPathComponent,
+                                      size: orphan.size, modified: v?.contentModificationDate ?? .distantPast, isActive: false))
         }
         return list.sorted { $0.modified > $1.modified }
     }
@@ -111,13 +165,31 @@ public enum RecordingStore {
         if days > 0 {
             let cutoff = now.addingTimeInterval(-Double(days) * 86_400)
             for item in items where !item.isActive && item.modified < cutoff {
-                if (try? fm.removeItem(at: item.url)) != nil { removed.append(item.url) }
+                if remove(item) { removed.append(item.url) }
             }
             items.removeAll { removed.contains($0.url) }
         }
         var total = items.reduce(0) { $0 + $1.size }
+        lock.lock(); let shorten = shortenLargest; lock.unlock()
+        if shorten, total > limit {
+            // One very long session must not push every other recording out: while the largest
+            // holds more than half of the space, its oldest output goes first (part by part, the
+            // file being written is never touched).
+            for i in items.indices.sorted(by: { items[$0].size > items[$1].size }).prefix(1) {
+                var item = items[i]
+                while total > limit, item.size > limit / 2, let oldest = item.parts.first {
+                    let size = Int64((try? oldest.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                    guard (try? fm.removeItem(at: oldest)) != nil else { break }
+                    item.parts.removeFirst()
+                    item.size -= size
+                    total -= size
+                    removed.append(oldest)
+                }
+                items[i] = item
+            }
+        }
         for item in items where total > limit && !item.isActive {
-            if (try? fm.removeItem(at: item.url)) != nil {
+            if remove(item) {
                 total -= item.size
                 removed.append(item.url)
             }
@@ -132,8 +204,25 @@ public enum RecordingStore {
     }
 
     public static func deleteAll(in directory: URL = AppPaths.recordingsDirectory) {
-        for item in all(in: directory) where !item.isActive {
-            try? FileManager.default.removeItem(at: item.url)
+        for item in all(in: directory) where !item.isActive { remove(item) }
+    }
+
+    /// Removes a recording with its parts. True if the recording itself is gone.
+    @discardableResult
+    static func remove(_ item: RecordingInfo) -> Bool {
+        let fm = FileManager.default
+        guard (try? fm.removeItem(at: item.url)) != nil else { return false }
+        for part in item.parts { try? fm.removeItem(at: part) }
+        return true
+    }
+
+    /// Removes the recording at `path` (an archived session's) with its parts, on the maintenance
+    /// queue (so a compression running at that moment cannot bring it back).
+    public static func delete(path: String) {
+        queue.async {
+            guard let url = resolve(path) else { return }
+            for part in RecordingParts.parts(of: url) { try? FileManager.default.removeItem(at: part.url) }
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -154,15 +243,24 @@ public enum RecordingStore {
     /// the regular maintenance pass for recordings that were still open then). Returns how many.
     @discardableResult
     public static func encryptAll(with key: SymmetricKey, in directory: URL = AppPaths.recordingsDirectory) -> Int {
-        all(in: directory).filter { !$0.isActive && !RecordingCrypto.isEncrypted($0.url, with: key) }
-            .reduce(0) { $0 + (RecordingCrypto.encryptFile($1.url, key: key) ? 1 : 0) }
+        // Everything not really encrypted with this key, including output that merely starts like an
+        // encrypted file (a server can print that). Recordings of a key that was reset are removed
+        // (`RecordingCrypto.revoke`, `deleteEncrypted`), so none is left to be wrapped again.
+        files(in: directory).filter { !RecordingCrypto.isEncrypted($0, with: key) }
+            .reduce(0) { $0 + (RecordingCrypto.encryptFile($1, key: key) ? 1 : 0) }
     }
 
     /// Decrypts every inactive recording the loaded key opens (when encryption is switched off).
     @discardableResult
     public static func decryptAll(in directory: URL = AppPaths.recordingsDirectory) -> Int {
-        all(in: directory).filter { !$0.isActive && RecordingCrypto.isEncrypted($0.url) }
-            .reduce(0) { $0 + (RecordingCrypto.decryptFile($1.url) ? 1 : 0) }
+        files(in: directory).filter { RecordingCrypto.isEncrypted($0) }
+            .reduce(0) { $0 + (RecordingCrypto.decryptFile($1) ? 1 : 0) }
+    }
+
+    /// Every file of every recording that is not being written: inactive recordings with their
+    /// parts, and the parts of active ones (never written to again).
+    private static func files(in directory: URL) -> [URL] {
+        all(in: directory).flatMap { $0.isActive ? $0.parts : $0.files }
     }
 
     /// Removes `*.tmp` files older than an hour (from an interrupted compression or encryption).
@@ -177,13 +275,15 @@ public enum RecordingStore {
 
     /// Whether any recording is encrypted with the key that has this id.
     public static func anyEncrypted(keyID: Data, in directory: URL = AppPaths.recordingsDirectory) -> Bool {
-        all(in: directory).contains { RecordingCrypto.keyID(of: $0.url) == keyID }
+        all(in: directory).contains { $0.files.contains { RecordingCrypto.keyID(of: $0) == keyID } }
     }
 
     /// Deletes every encrypted recording (its key is gone for good).
     public static func deleteEncrypted(in directory: URL = AppPaths.recordingsDirectory) {
-        for item in all(in: directory) where !item.isActive && RecordingCrypto.isEncrypted(item.url) {
-            try? FileManager.default.removeItem(at: item.url)
+        // Only files built like encrypted ones throughout: plain output that merely starts with
+        // the same letters is the user's text and stays.
+        for url in files(in: directory) where RecordingCrypto.isEncrypted(url) && RecordingCrypto.isWellFormed(url) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -192,7 +292,7 @@ public enum RecordingStore {
         let items = all(in: directory)
         let key = RecordingCrypto.key
         let encrypted = items.filter { item in
-            key.map { RecordingCrypto.isEncrypted(item.url, with: $0) } ?? RecordingCrypto.isEncrypted(item.url)
+            item.files.allSatisfy { url in key.map { RecordingCrypto.isEncrypted(url, with: $0) } ?? RecordingCrypto.isEncrypted(url) }
         }
         return (encrypted.count, items.count)
     }

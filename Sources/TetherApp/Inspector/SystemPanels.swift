@@ -9,7 +9,11 @@ struct GPUPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(monitor.snapshot?.gpus ?? []) { GPUCard(gpu: $0) }
-                Card(title: "Processes using the GPU") {
+                Card(title: "Processes using the GPU", onExport: {
+                    let gpus = monitor.snapshot?.gpus ?? []
+                    let processes = monitor.gpuProcesses
+                    ExportPanel.save(title: "Export GPUs", baseName: "gpus", formats: MonitorExport.Format.table) { MonitorExport.gpus(gpus, processes: processes, format: $0) }
+                }) {
                     if monitor.gpuProcesses.isEmpty {
                         Text("None").foregroundStyle(.secondary)
                     }
@@ -24,6 +28,14 @@ struct GPUPanel: View {
                 }
             }
             .padding(12)
+            .contextMenu {
+                let gpus = monitor.snapshot?.gpus ?? []
+                let processes = monitor.gpuProcesses
+                Button("Export GPUs and Their Processes…") {
+                    ExportPanel.save(title: "Export GPUs", baseName: "gpus", formats: MonitorExport.Format.table) { MonitorExport.gpus(gpus, processes: processes, format: $0) }
+                }
+                .disabled(gpus.isEmpty && processes.isEmpty)
+            }
         }
         .task {
             while !Task.isCancelled {
@@ -74,6 +86,13 @@ struct ServicesPanel: View {
                     TextField("Filter services", text: $search).textFieldStyle(.roundedBorder)
                     Button { Task { await monitor.refreshServices() } } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
+                    Button {
+                        let shown = rows
+                        ExportPanel.save(title: "Export Services", baseName: "services", formats: MonitorExport.Format.table) { MonitorExport.services(shown, format: $0) }
+                    } label: { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(.borderless)
+                        .disabled(rows.isEmpty)
+                        .help("Export the services shown as CSV")
                 }
                 if let message {
                     Text(message).font(.caption).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .leading)
@@ -150,6 +169,13 @@ struct ContainersPanel: View {
                 Spacer()
                 Button { Task { await monitor.refreshContainers() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
+                Button {
+                    let list = monitor.containers
+                    ExportPanel.save(title: "Export Containers", baseName: "containers", formats: MonitorExport.Format.table) { MonitorExport.containers(list, format: $0) }
+                } label: { Image(systemName: "square.and.arrow.up") }
+                    .buttonStyle(.borderless)
+                    .disabled(monitor.containers.isEmpty)
+                    .help("Export the containers as CSV")
             }
             .padding(10)
             if let message {

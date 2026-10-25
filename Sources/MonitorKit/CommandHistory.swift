@@ -239,7 +239,15 @@ public final class CommandHistoryStore {
     @ObservationIgnored private let codec: Codec
     /// Names of files that are locked: not written until opened.
     @ObservationIgnored private var lockedFiles: Set<String> = []
+    /// Of `lockedFiles`, those encrypted with a key that is not loaded (rather than unreadable).
+    @ObservationIgnored private var sealedFiles: Set<String> = []
     @ObservationIgnored private var dirty: Set<String> = []
+    /// While a host's file cannot be opened (Tether locked), what is recorded for it meanwhile is
+    /// written next to it, `<file>.pending-<run>.json`, one per run of the app; once the file opens,
+    /// they are merged into it and removed. So nothing waits in memory only.
+    @ObservationIgnored private let runID = String(UUID().uuidString.prefix(8)).lowercased()
+    /// Pending files whose records were read into `records` (removed once their host is written).
+    @ObservationIgnored private var mergedPending: Set<URL> = []
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var loaded = false
     @ObservationIgnored private let writer = DispatchQueue(label: "tether.command-history", qos: .utility)
@@ -352,20 +360,35 @@ public final class CommandHistoryStore {
 
     // MARK: Files
 
+    /// The key of the encrypted files is gone for good (the Tether password was reset): they can
+    /// never be opened, so they are removed and what was recorded since is written again.
+    public func forgetEncryptedFiles() {
+        for name in sealedFiles {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name + ".json"))
+            fileSizes[name] = nil
+        }
+        lockedFiles.subtract(sealedFiles)
+        sealedFiles = []
+        isLocked = !lockedFiles.isEmpty
+        for host in Set(records.map(\.hostKey)) { changed(host, soon: true) }
+    }
+
     /// Reads files that could not be opened before (after unlocking), merging what was recorded meanwhile.
     public func reload() {
         guard loaded, !lockedFiles.isEmpty else { return }
         let waiting = lockedFiles
         lockedFiles = []
+        sealedFiles = []
         for file in files() where waiting.contains(Self.name(of: file)) {
             guard let found = read(file) else { continue }
-            let known = Set(records.map(\.id))
-            records.append(contentsOf: found.filter { !known.contains($0.id) })
+            if Self.isPending(file) { mergedPending.insert(file) }
+            records = Self.unique(records + found)
         }
         records.sort { $0.started > $1.started }
         isLocked = !lockedFiles.isEmpty
         // Opened now: what was recorded meanwhile can be written together with what was there.
-        for host in Set(records.map(\.hostKey)) where waiting.contains(Self.fileName(for: host)) && !lockedFiles.contains(Self.fileName(for: host)) {
+        let opened = Set(waiting.map { $0.prefix { $0 != "." } }.map(String.init))
+        for host in Set(records.map(\.hostKey)) where opened.contains(Self.fileName(for: host)) && !lockedFiles.contains(Self.fileName(for: host)) {
             changed(host, soon: true)
         }
     }
@@ -393,9 +416,28 @@ public final class CommandHistoryStore {
         guard !loaded else { return }
         loaded = true
         var all: [CommandRecord] = []
-        for file in files() { all += read(file) ?? [] }
-        records = all.sorted { $0.started > $1.started }
+        for file in files() {
+            guard let list = read(file) else { continue }
+            all += list
+            if Self.isPending(file) { mergedPending.insert(file) }
+        }
+        records = Self.unique(all).sorted { $0.started > $1.started }
         isLocked = !lockedFiles.isEmpty
+    }
+
+    /// One record per id (a pending file and its host's file may hold the same command): the one
+    /// seen last.
+    private static func unique(_ list: [CommandRecord]) -> [CommandRecord] {
+        var best: [UUID: CommandRecord] = [:]
+        for r in list where best[r.id].map({ $0.lastSeen < r.lastSeen }) ?? true { best[r.id] = r }
+        return Array(best.values)
+    }
+
+    private static func isPending(_ file: URL) -> Bool { file.lastPathComponent.contains(".pending-") }
+
+    /// The host file name a pending file belongs to.
+    private static func owner(ofPending file: URL) -> String {
+        String(file.lastPathComponent.prefix { $0 != "." })
     }
 
     private static func name(of file: URL) -> String { file.deletingPathExtension().lastPathComponent }
@@ -417,6 +459,7 @@ public final class CommandHistoryStore {
         switch codec.open(data) {
         case .locked:
             lockedFiles.insert(Self.name(of: file))
+            sealedFiles.insert(Self.name(of: file))
             return nil
         case .unreadable:
             moveAside(file)
@@ -498,23 +541,35 @@ public final class CommandHistoryStore {
     /// a snapshot of the records is taken here. The sizes come back afterwards: over the limit, the
     /// oldest finished records go and the files are written again.
     private func writeDirty() {
-        let hosts = dirty.filter { !lockedFiles.contains(Self.fileName(for: $0)) }
-        dirty.subtract(hosts)
+        let hosts = dirty
+        dirty = []
         guard !hosts.isEmpty else { return }
         prune()
-        let snapshot = hosts.map { host in (host, records.filter { $0.hostKey == host }) }
+        // A host whose file cannot be opened now gets this run's pending file instead (never the
+        // file itself); one that can is written whole, and its merged pending files go.
+        let snapshot = hosts.map { host -> (host: String, list: [CommandRecord], url: URL, pending: Bool, merged: [URL]) in
+            let name = Self.fileName(for: host)
+            let pending = lockedFiles.contains(name)
+            let url = directory.appendingPathComponent(pending ? "\(name).pending-\(runID).json" : name + ".json")
+            let merged = pending ? [] : mergedPending.filter { Self.owner(ofPending: $0) == name && $0 != url }
+            return (host, records.filter { $0.hostKey == host }, url, pending, Array(merged))
+        }
         let dir = directory
         let codec = self.codec
         writer.async { [weak self] in
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             var sizes: [String: Int?] = [:]   // nil: nothing written (not sealable now)
+            var removed: [URL] = []
+            var pendingWritten: [URL] = []
             var failures: [String] = []
-            for (host, list) in snapshot {
-                let url = dir.appendingPathComponent(Self.fileName(for: host) + ".json")
+            for (host, list, url, pending, merged) in snapshot {
                 do {
                     guard !list.isEmpty else {
-                        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                        if !pending {
+                            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                            for file in merged where (try? FileManager.default.removeItem(at: file)) != nil { removed.append(file) }
+                        }
                         sizes[host] = .some(0)
                         continue
                     }
@@ -526,18 +581,26 @@ public final class CommandHistoryStore {
                     guard let sealed = codec.seal(packed) else { sizes[host] = .some(nil); continue }
                     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                     try sealed.write(to: url, options: [.atomic])
-                    sizes[host] = .some(sealed.count)
+                    sizes[host] = pending ? .some(0) : .some(sealed.count)
+                    if pending { pendingWritten.append(url) }
+                    // Everything they held is in the file now.
+                    for file in merged where (try? FileManager.default.removeItem(at: file)) != nil { removed.append(file) }
                 } catch {
                     failures.append("The command history could not be saved: \(error.localizedDescription)")
+                    sizes[host] = .some(nil)    // stays dirty: written again with the next change or at quit
                 }
             }
-            Task { @MainActor in self?.written(sizes, failures: failures) }
+            Task { @MainActor in self?.written(sizes, removed: removed, pending: pendingWritten, failures: failures) }
         }
     }
 
     /// After a write: the sizes are known; enforce the size limit.
-    private func written(_ sizes: [String: Int?], failures: [String]) {
+    private func written(_ sizes: [String: Int?], removed: [URL] = [], pending: [URL] = [], failures: [String]) {
         failures.forEach { diagnostics.add($0, source: "history") }
+        mergedPending.subtract(removed)
+        // This run's pending files hold only records in memory: removed once their host is written.
+        mergedPending.formUnion(pending)
+        removed.forEach { fileSizes[Self.name(of: $0)] = nil }
         for (host, size) in sizes {
             if let size { fileSizes[Self.fileName(for: host)] = size == 0 ? nil : size } else { dirty.insert(host) }
         }

@@ -64,7 +64,7 @@ function Frame($first) {
   }
   if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     '@@nvidia'
-    nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>$null
+    nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,uuid --format=csv,noheader,nounits 2>$null
   }
 }
 """#

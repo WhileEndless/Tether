@@ -4,6 +4,7 @@ import SwiftTerm
 import TetherCore
 import SSHTransport
 import RecordingKit
+import TerminalText
 
 /// Session-level settings captured when a session (re)starts.
 public struct SessionConfiguration: Sendable {
@@ -191,6 +192,10 @@ public final class TerminalSession: Identifiable {
     /// Windows: the unique part of the PowerShell command line this tab started (see `WindowsShell`).
     @ObservationIgnored private var windowsShellTag: String?
     @ObservationIgnored private var recorder: SessionRecorder?
+    /// The size last noted in the recording (`display`).
+    @ObservationIgnored private var recordedSize: (recording: URL, cols: Int, rows: Int)?
+    @ObservationIgnored private var bytesSinceSizeMarker = 0
+    @ObservationIgnored private var recordedEscapes = EscapeState()
     @ObservationIgnored private var attempt = 0
     @ObservationIgnored private var retryTask: Task<Void, Never>?
     @ObservationIgnored private var askPassEnv: [String: String] = [:]
@@ -263,9 +268,14 @@ public final class TerminalSession: Identifiable {
     }
 
     /// Tab title: a custom name if the user set one, otherwise derived from what is running.
+    /// A coding agent runs in the tab and has a session name (`Claude Code: Fix login bug`); set by
+    /// the app from the last look at the host's tmux sessions, nil when none runs.
+    public var agentTitle: String?
+
     public var displayTitle: String {
         if descriptor.customTitle { return descriptor.title }
         let host = descriptor.target.displayName
+        if let agentTitle, !agentTitle.isEmpty { return "\(agentTitle) — \(host)" }
         if let activity, !activity.command.isEmpty {
             if Self.shells.contains(activity.command) {
                 let dir = (activity.path as NSString).lastPathComponent
@@ -302,6 +312,10 @@ public final class TerminalSession: Identifiable {
     /// True once a command was typed and sent in this session (any non-blank line + Return).
     public private(set) var hasRunCommands = false
     @ObservationIgnored private var typedOnLine = false
+
+    /// The tmux/screen session on the server may hold work: this tab was online, or it was restored
+    /// or opened to attach to a session that already existed there.
+    public var mayHoldServerWork: Bool { wasOnline || restoredFromDisk || openedForAttach }
 
     /// Nothing worth keeping: no command was run here, nothing is running in it, and it was not
     /// re-attached to an existing session (which may hold earlier work). Closing it needs no question.
@@ -913,7 +927,21 @@ public final class TerminalSession: Identifiable {
         guard !bytes.isEmpty else { return }
         fedAnything = true
         sink?.feed(bytes[...])
-        recorder?.append(bytes)
+        if let recorder {
+            // The recording notes the terminal's size before output laid out for it, so replays
+            // and the recording's text lay it out the same way (`SizeMarker`, invisible).
+            // It is noted again every megabyte, so any piece of the recording says it.
+            // Only between escape sequences: a marker inside one would split it (and hide a clear).
+            if let size = realSize, !recordedEscapes.isInside, recordedSize?.recording != recorder.url || recordedSize?.cols != size.cols
+                || recordedSize?.rows != size.rows || bytesSinceSizeMarker >= 1 << 20 {
+                recorder.append(SizeMarker.bytes(cols: size.cols, rows: size.rows))
+                recordedSize = (recorder.url, size.cols, size.rows)
+                bytesSinceSizeMarker = 0
+            }
+            recorder.append(bytes)
+            recordedEscapes.feed(bytes)
+            bytesSinceSizeMarker += bytes.count
+        }
         if detectPrompts {
             let prompt = promptDetector.feed(bytes)
             if prompt != passwordPrompt {

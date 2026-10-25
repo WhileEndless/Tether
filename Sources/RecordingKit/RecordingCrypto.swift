@@ -20,8 +20,12 @@ import Compression
 /// whether a recording is encrypted is read from its first bytes, so quota, listing and compression
 /// work the same for both kinds. A compressed recording is compressed first, then encrypted.
 public enum RecordingCrypto {
+    /// Header of a file encrypted with the recording key (`newFile`).
     public static let headerSize = 48
+    /// Header of a file sealed while Tether was locked (`newLockedFile`).
+    public static let lockedHeaderSize = 80
     static let magic = Data("TETHENC1".utf8)
+    static let lockedMagic = Data("TETHENC2".utf8)
     /// Nonce (12) + tag (16).
     static let overhead = 28
     /// Plain bytes per frame when a whole file is encrypted at once (migration, compression).
@@ -40,9 +44,80 @@ public enum RecordingCrypto {
     nonisolated(unsafe) private static var _encryptNew = false
 
     /// The key for reading (and writing) encrypted recordings; nil while Tether is locked.
+    /// Setting a key also sets `lockedSealing` (its public half), which locking keeps.
     public static var key: SymmetricKey? {
         get { lock.lock(); defer { lock.unlock() }; return _key }
-        set { lock.lock(); _key = newValue; lock.unlock() }
+        set {
+            lock.lock()
+            _key = newValue
+            if let newValue { _lockedSealing = LockedSealing(key: newValue) }
+            lock.unlock()
+        }
+    }
+
+    // MARK: While locked
+
+    /// While Tether is locked the recording key is not in memory, yet new output and command
+    /// history must not be lost (or written in plain text). They are sealed to a public key
+    /// (HPKE: X25519, HKDF-SHA256, ChaCha20-Poly1305) whose private half is derived from the
+    /// recording key and never stored: only unlocking can open them. The public half is kept in a
+    /// file so even a Tether started locked can seal.
+    public struct LockedSealing: Codable, Equatable, Sendable {
+        public var publicKey: Data
+        /// Id of the recording key the private half comes from.
+        public var keyID: Data
+
+        public init(key: SymmetricKey) {
+            publicKey = RecordingCrypto.privateKey(for: key).publicKey.rawRepresentation
+            keyID = RecordingCrypto.keyID(key)
+        }
+
+        var recipient: Curve25519.KeyAgreement.PublicKey? { try? .init(rawRepresentation: publicKey) }
+    }
+
+    nonisolated(unsafe) private static var _lockedSealing: LockedSealing?
+
+    nonisolated(unsafe) private static var _sealingLoader: (@Sendable () -> Data?)?
+    nonisolated(unsafe) private static var _lastSealingRead = Date.distantPast
+
+    /// Where the public half is stored (the app's keychain), read the first time something must be
+    /// sealed while locked, so a launch never reads the keychain for it.
+    public static var lockedSealingLoader: (@Sendable () -> Data?)? {
+        get { lock.lock(); defer { lock.unlock() }; return _sealingLoader }
+        set { lock.lock(); _sealingLoader = newValue; lock.unlock() }
+    }
+
+    /// What new files are sealed to while locked (nil: encryption was never set up, or was reset).
+    public static var lockedSealing: LockedSealing? {
+        get {
+            lock.lock()
+            if let s = _lockedSealing { lock.unlock(); return s }
+            // Read when first needed; when that finds nothing (or the keychain said no), again
+            // a minute later at the earliest, so a locked Tether never asks over and over.
+            guard let loader = _sealingLoader, Date().timeIntervalSince(_lastSealingRead) > 60 else { lock.unlock(); return nil }
+            _lastSealingRead = Date()
+            lock.unlock()
+            guard let data = loader(), let s = try? JSONDecoder().decode(LockedSealing.self, from: data), s.recipient != nil else { return nil }
+            lock.lock()
+            if _lockedSealing == nil { _lockedSealing = s }
+            defer { lock.unlock() }
+            return _lockedSealing
+        }
+        set { lock.lock(); _lockedSealing = newValue; _sealingLoader = nil; lock.unlock() }
+    }
+
+    /// The public half as the app stores it (without loading it).
+    public static var encodedLockedSealing: Data? {
+        lock.lock(); defer { lock.unlock() }
+        return _lockedSealing.flatMap { try? JSONEncoder().encode($0) }
+    }
+
+    static let hpkeSuite = HPKE.Ciphersuite.Curve25519_SHA256_ChachaPoly
+    static let hpkeInfo = Data("tether-locked-v1".utf8)
+
+    static func privateKey(for key: SymmetricKey) -> Curve25519.KeyAgreement.PrivateKey {
+        let raw = subkey(key, "locked").withUnsafeBytes { Data($0) }
+        return try! Curve25519.KeyAgreement.PrivateKey(rawRepresentation: raw)   // any 32 bytes are a valid key
     }
 
     /// New recordings are written encrypted (when a key is loaded).
@@ -70,18 +145,66 @@ public enum RecordingCrypto {
             self.key = RecordingCrypto.subkey(key, "frames")
             self.fileID = fileID
         }
+        init(framesKey: SymmetricKey, fileID: Data) {
+            key = framesKey
+            self.fileID = fileID
+        }
     }
+
+    /// What a recorder keeps to start new files (parts) with: the key's id and the two keys derived
+    /// from it, never the recording key itself (which also opens history and the locked files).
+    struct FileKeys: Sendable {
+        let keyID: Data
+        let header: SymmetricKey
+        let frames: SymmetricKey
+        init(_ key: SymmetricKey) {
+            keyID = RecordingCrypto.keyID(key)
+            header = RecordingCrypto.subkey(key, "header")
+            frames = RecordingCrypto.subkey(key, "frames")
+        }
+    }
+
+    // MARK: Revoked keys
+
+    nonisolated(unsafe) private static var revoked = Set<Data>()
+
+    /// The key with this id is gone for good (the Tether password was reset): recordings still
+    /// being written with it stop and remove themselves, as nothing could ever read them.
+    public static func revoke(keyID: Data) { lock.lock(); revoked.insert(keyID); lock.unlock() }
+
+    static func isRevoked(_ keyID: Data) -> Bool { lock.lock(); defer { lock.unlock() }; return revoked.contains(keyID) }
 
     static func subkey(_ key: SymmetricKey, _ purpose: String) -> SymmetricKey {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: key, info: Data("tether-recording-v1-\(purpose)".utf8), outputByteCount: 32)
     }
 
     /// A header for a new encrypted file, and the sealer for its frames.
-    static func newFile(_ key: SymmetricKey) -> (header: Data, sealer: Sealer) {
+    static func newFile(_ key: SymmetricKey) -> (header: Data, sealer: Sealer) { newFile(FileKeys(key)) }
+
+    static func newFile(_ keys: FileKeys) -> (header: Data, sealer: Sealer) {
         let fileID = SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }
-        let body = magic + keyID(key) + fileID
-        let tag = Data(HMAC<SHA256>.authenticationCode(for: body, using: subkey(key, "header")).prefix(16))
-        return (body + tag, Sealer(key: key, fileID: fileID))
+        let body = magic + keys.keyID + fileID
+        let tag = Data(HMAC<SHA256>.authenticationCode(for: body, using: keys.header).prefix(16))
+        return (body + tag, Sealer(framesKey: keys.frames, fileID: fileID))
+    }
+
+    /// A header for a new file sealed while locked, and the sealer for its frames:
+    ///
+    ///     "TETHENC2" · key id (8) · file id (16) · HPKE encapsulated key (32) · tag (16)
+    ///
+    /// The frame key and the header tag's key are HPKE exports: only the recording key (through its
+    /// derived private key) opens the file. The tag shows the header was made for this public key
+    /// (so output that merely starts like a header never passes for an encrypted file); it is not
+    /// a signature, as anyone holding the public key could make such a file.
+    static func newLockedFile(_ sealing: LockedSealing) -> (header: Data, sealer: Sealer)? {
+        guard let recipient = sealing.recipient,
+              let sender = try? HPKE.Sender(recipientKey: recipient, ciphersuite: hpkeSuite, info: hpkeInfo),
+              let frames = try? sender.exportSecret(context: Data("frames".utf8), outputByteCount: 32),
+              let headerKey = try? sender.exportSecret(context: Data("header".utf8), outputByteCount: 32) else { return nil }
+        let fileID = SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }
+        let body = lockedMagic + sealing.keyID + fileID + sender.encapsulatedKey
+        let tag = Data(HMAC<SHA256>.authenticationCode(for: body, using: headerKey).prefix(16))
+        return (body + tag, Sealer(key: frames, fileID: fileID))
     }
 
     private struct Header {
@@ -89,14 +212,58 @@ public enum RecordingCrypto {
         var fileID: Data
         var tag: Data
         var body: Data
+        /// Set for files sealed while locked.
+        var encapsulatedKey: Data?
+        var size: Int { encapsulatedKey == nil ? headerSize : lockedHeaderSize }
     }
 
     private static func header(of url: URL) -> Header? {
         guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? h.close() }
-        guard let head = try? h.read(upToCount: headerSize), head.count == headerSize, head.prefix(8) == magic else { return nil }
+        guard let head = try? h.read(upToCount: lockedHeaderSize), head.count >= headerSize else { return nil }
         let d = Data(head)
-        return Header(keyID: d.subdata(in: 8..<16), fileID: d.subdata(in: 16..<32), tag: d.subdata(in: 32..<48), body: d.prefix(32))
+        if d.prefix(8) == magic {
+            return Header(keyID: d.subdata(in: 8..<16), fileID: d.subdata(in: 16..<32), tag: d.subdata(in: 32..<48), body: d.prefix(32))
+        }
+        guard d.prefix(8) == lockedMagic, d.count == lockedHeaderSize else { return nil }
+        return Header(keyID: d.subdata(in: 8..<16), fileID: d.subdata(in: 16..<32), tag: d.subdata(in: 64..<80),
+                      body: d.prefix(64), encapsulatedKey: d.subdata(in: 32..<64))
+    }
+
+    /// Whether an encrypted-looking file is made of whole frames up to its end (a frame cut short
+    /// by a crash at the end is allowed). Checks the structure only; without the key nothing more
+    /// can be known.
+    static func isWellFormed(_ url: URL) -> Bool {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? h.close() }
+        guard let index = try? FrameIndex(handle: h), let size = try? h.seekToEnd() else { return false }
+        let end = index.boxes.last.map { $0.offset + UInt64($0.length) + 4 } ?? index.start
+        return size - end < 8 + UInt64(fileFrameBytes) && (index.boxes.count > 0 || size <= index.start + 8)
+    }
+
+    /// Bytes before the first frame of an encrypted file (0 for a plain one).
+    static func headerLength(of handle: FileHandle) -> Int {
+        guard (try? handle.seek(toOffset: 0)) != nil, let head = try? handle.read(upToCount: 8) else { return 0 }
+        if Data(head) == lockedMagic { return lockedHeaderSize }
+        return Data(head) == magic ? headerSize : 0
+    }
+
+    /// The frame key and header check of a file sealed while locked, opened with the recording key.
+    private static func lockedKeys(_ h: Header, key: SymmetricKey) -> (frames: SymmetricKey, tagOK: Bool)? {
+        guard let encapsulated = h.encapsulatedKey,
+              let recipient = try? HPKE.Recipient(privateKey: privateKey(for: key), ciphersuite: hpkeSuite, info: hpkeInfo,
+                                                  encapsulatedKey: encapsulated),
+              let frames = try? recipient.exportSecret(context: Data("frames".utf8), outputByteCount: 32),
+              let headerKey = try? recipient.exportSecret(context: Data("header".utf8), outputByteCount: 32) else { return nil }
+        let signed = HMAC<SHA256>.authenticationCode(for: h.body, using: headerKey)
+        return (frames, constantTimeEqual(Data(signed.prefix(16)), h.tag))
+    }
+
+    private static func constantTimeEqual(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        var diff: UInt8 = 0
+        for (x, y) in zip(a, b) { diff |= x ^ y }
+        return diff == 0
     }
 
     /// The key id in an encrypted recording's header, or nil for a plain one.
@@ -108,6 +275,7 @@ public enum RecordingCrypto {
     /// Really encrypted with `key`: its header is signed with it.
     public static func isEncrypted(_ url: URL, with key: SymmetricKey) -> Bool {
         guard let h = header(of: url), h.keyID == keyID(key) else { return false }
+        if h.encapsulatedKey != nil { return lockedKeys(h, key: key)?.tagOK == true }
         var signed = HMAC<SHA256>.authenticationCode(for: h.body, using: subkey(key, "header")).makeIterator()
         var tag = h.tag.makeIterator()
         var diff: UInt8 = 0
@@ -139,6 +307,10 @@ public enum RecordingCrypto {
         guard let h = header(of: url) else { return nil }
         guard let key = loaded else { throw Failure.locked }
         guard h.keyID == keyID(key) else { throw Failure.wrongKey }
+        if h.encapsulatedKey != nil {
+            guard let opened = lockedKeys(h, key: key), opened.tagOK else { throw Failure.corrupt }
+            return Sealer(key: opened.frames, fileID: h.fileID)
+        }
         guard isEncrypted(url, with: key) else { throw Failure.corrupt }
         return Sealer(key: key, fileID: h.fileID)
     }
@@ -209,9 +381,13 @@ struct FrameIndex {
     var plainLengths: [Int] { boxes.map { $0.length - RecordingCrypto.overhead } }
 
     /// Walks the frames from the header on, stopping at a frame cut short.
+    /// Where the first frame starts (after the header).
+    private(set) var start = UInt64(RecordingCrypto.headerSize)
+
     init(handle: FileHandle) throws {
+        start = UInt64(max(RecordingCrypto.headerLength(of: handle), RecordingCrypto.headerSize))
         let size = try handle.seekToEnd()
-        var pos = UInt64(RecordingCrypto.headerSize)
+        var pos = start
         while pos + 8 <= size {
             try handle.seek(toOffset: pos)
             guard let lenData = try handle.read(upToCount: 4), lenData.count == 4 else { break }
@@ -260,12 +436,38 @@ final class RawCursor {
     }
 }
 
-/// Every way of reading a recording, for plain, encrypted and compressed files alike.
+/// Every way of reading a recording, for plain, encrypted and compressed files alike, and for
+/// recordings kept in parts (`RecordingParts`): the parts and the file read as one recording.
 public enum RecordingReader {
     /// Successive chunks of the recording's text (decrypted and decompressed). Return false to stop.
     public static func forEachChunk(of url: URL, key: SymmetricKey? = RecordingCrypto.key,
                                     _ body: (Data) throws -> Bool) throws {
-        let cursor = try RawCursor(url: url, key: key)
+        // The parts and the file being written are taken at one moment: no new part can start in
+        // between (`RecordingParts.rotation`). The open file keeps its contents even when it is
+        // moved aside as a part later, so nothing is skipped or read twice.
+        let (parts, main) = try RecordingParts.rotation.withLock {
+            (RecordingParts.parts(of: url), try RawCursor(url: url, key: key))
+        }
+        var stopped = false
+        for part in parts where !stopped {
+            do {
+                try forEachChunk(ofFile: RecordingParts.current(part.url), key: key) { chunk in
+                    if try !body(chunk) { stopped = true; return false }
+                    return true
+                }
+            } catch CocoaError.fileReadNoSuchFile {
+                continue      // removed meanwhile (the storage limit shortened this session)
+            }
+        }
+        if !stopped { try forEachChunk(ofFile: url, cursor: main, body) }
+    }
+
+    /// One file's chunks (a recording without parts, or one part).
+    static func forEachChunk(ofFile url: URL, key: SymmetricKey?, _ body: (Data) throws -> Bool) throws {
+        try forEachChunk(ofFile: url, cursor: RawCursor(url: url, key: key), body)
+    }
+
+    private static func forEachChunk(ofFile url: URL, cursor: RawCursor, _ body: (Data) throws -> Bool) throws {
         if RecordingCompression.isCompressed(url) {
             let filter = try InputFilter(.decompress, using: .lzfse) { length in try cursor.read(upTo: length) }
             while let chunk = try filter.readData(ofLength: 4 << 20), !chunk.isEmpty {
@@ -278,11 +480,71 @@ public enum RecordingReader {
         }
     }
 
-    /// The last `lines` lines of a recording, starting at a line boundary. Reads only the end of
-    /// the file (backwards) unless it is compressed.
+    /// The most `tail` reads: output with few line breaks (full-screen programs, progress bars)
+    /// must never bring gigabytes into memory for a few thousand lines.
+    public static let tailMaxBytes = 16 * 1024 * 1024
+
+    /// The last `lines` lines of a recording (at most `tailMaxBytes`), starting at a line boundary.
+    /// Reads only the end of the file (backwards) unless it is compressed, and only as many parts as
+    /// those lines need.
     public static func tail(of url: URL, lines: Int, key loaded: SymmetricKey? = RecordingCrypto.key) -> [UInt8]? {
+        // No new part starts while the end is read (quick: at most `tailMaxBytes`).
+        RecordingParts.rotation.withLock { tailOfParts(url, lines: lines, key: loaded) }
+    }
+
+    private static func tailOfParts(_ url: URL, lines: Int, key loaded: SymmetricKey?) -> [UInt8]? {
+        let last = tail(ofFile: url, lines: lines, key: loaded)
+        var parts = RecordingParts.parts(of: url)
+        guard !parts.isEmpty else { return last }
+        var collected = Data(last ?? [])
+        var newlines = collected.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
+        while newlines <= lines, collected.count < tailMaxBytes, let part = parts.popLast() {
+            guard let earlier = wholePart(part, key: loaded) else { break }
+            newlines += earlier.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
+            collected = earlier + collected
+        }
+        return Array(cutToLastLines(capped(collected), lines))
+    }
+
+    /// The last `tailMaxBytes` of `data`, from a line start when there is one.
+    private static func capped(_ data: Data) -> Data {
+        guard data.count > tailMaxBytes else { return data }
+        let cut = data.suffix(tailMaxBytes)
+        if let nl = cut.firstIndex(of: 0x0a), nl + 1 < cut.endIndex { return Data(cut[(nl + 1)...]) }
+        return Data(cut)
+    }
+
+    /// The output of one part, kept for a while: scrolling back loads a few thousand lines at a
+    /// time, and the same part would otherwise be decompressed again for each of them.
+    private static func wholePart(_ part: RecordingParts.Part, key: SymmetricKey?) -> Data? {
+        let url = RecordingParts.current(part.url)
+        partCache.lock.lock()
+        if let hit = partCache.entry, hit.path == url.path { partCache.lock.unlock(); return hit.data }
+        partCache.lock.unlock()
+        var data = Data(capacity: part.length)
+        do { try forEachChunk(ofFile: url, key: key) { data.append($0); return true } } catch { return nil }
+        partCache.lock.lock()
+        partCache.entry = (url.path, data)
+        partCache.lock.unlock()
+        // Released after a minute so a large part never stays in memory for nothing.
+        let path = url.path
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
+            partCache.lock.lock()
+            if partCache.entry?.path == path { partCache.entry = nil }
+            partCache.lock.unlock()
+        }
+        return data
+    }
+
+    private final class PartCache: @unchecked Sendable {
+        let lock = NSLock()
+        var entry: (path: String, data: Data)?
+    }
+    private static let partCache = PartCache()
+
+    static func tail(ofFile url: URL, lines: Int, key loaded: SymmetricKey?) -> [UInt8]? {
         if RecordingCompression.isCompressed(url) {
-            let data = slice(of: url, around: 1, maxBytes: 16 * 1024 * 1024, key: loaded).0
+            let data = slice(ofFile: url, around: 1, maxBytes: tailMaxBytes, key: loaded).0
             return Array(cutToLastLines(data, lines))
         }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
@@ -298,9 +560,9 @@ public enum RecordingReader {
             guard let plain = try? FrameIndex.decrypt(box, index: index, handle: handle, sealer: sealer) else { break }
             collected = plain + collected
             newlines += plain.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
-            if newlines > lines { break }
+            if newlines > lines || collected.count >= tailMaxBytes { break }
         }
-        return Array(cutToLastLines(collected, lines))
+        return Array(cutToLastLines(capped(collected), lines))
     }
 
     private static func plainTail(handle: FileHandle, lines: Int) -> [UInt8]? {
@@ -310,6 +572,14 @@ public enum RecordingReader {
         var newlines = 0
         var start: UInt64 = 0
         outer: while offset > 0 {
+            if size - offset >= UInt64(tailMaxBytes) {     // enough: start at the next line from here
+                start = offset
+                try? handle.seek(toOffset: offset)
+                if let rest = try? handle.read(upToCount: 1 << 20), let nl = rest.firstIndex(of: 0x0a) {
+                    start = offset + UInt64(nl - rest.startIndex) + 1
+                }
+                break
+            }
             let read = min(block, offset)
             offset -= read
             try? handle.seek(toOffset: offset)
@@ -342,10 +612,48 @@ public enum RecordingReader {
     }
 
     /// Up to `maxBytes` of a recording centred on `fraction` (0…1), starting at a line boundary, and
-    /// where `fraction` lies within the returned data.
+    /// where `fraction` lies within the returned data. In a recording kept in parts only the part
+    /// holding that position is read; the parts' names say how long each one is.
     public static func slice(of url: URL, around fraction: Double, maxBytes: Int = 16 * 1024 * 1024,
                              key loaded: SymmetricKey? = RecordingCrypto.key) -> (Data, Double) {
-        if RecordingCompression.isCompressed(url) { return slidingSlice(of: url, around: fraction, maxBytes: maxBytes, key: loaded) }
+        RecordingParts.rotation.withLock { sliceOfParts(url, around: fraction, maxBytes: maxBytes, key: loaded) }
+    }
+
+    private static func sliceOfParts(_ url: URL, around fraction: Double, maxBytes: Int, key loaded: SymmetricKey?) -> (Data, Double) {
+        let parts = RecordingParts.parts(of: url)
+        guard !parts.isEmpty else { return slice(ofFile: url, around: fraction, maxBytes: maxBytes, key: loaded) }
+        let lengths = parts.map(\.length) + [length(ofFile: url, key: loaded)]
+        let files = parts.map { RecordingParts.current($0.url) } + [url]
+        let total = lengths.reduce(0, +)
+        var target = Double(total) * min(max(fraction, 0), 1)
+        for (i, len) in lengths.enumerated() {
+            if target <= Double(len) || i == lengths.count - 1 {
+                return slice(ofFile: files[i], around: len > 0 ? min(target / Double(len), 1) : 1, maxBytes: maxBytes, key: loaded,
+                             length: i < parts.count ? len : nil)
+            }
+            target -= Double(len)
+        }
+        return (Data(), 0)
+    }
+
+    /// Bytes of output in one file (reads through it only when it is compressed).
+    static func length(ofFile url: URL, key: SymmetricKey?) -> Int {
+        if RecordingCompression.isCompressed(url) {
+            var n = 0
+            try? forEachChunk(ofFile: url, key: key) { n += $0.count; return true }
+            return n
+        }
+        guard let h = try? FileHandle(forReadingFrom: url) else { return 0 }
+        defer { try? h.close() }
+        if (try? RecordingCrypto.sealer(for: url, loaded: key)) != nil {
+            return (try? FrameIndex(handle: h))?.plainLengths.reduce(0, +) ?? 0
+        }
+        return Int((try? h.seekToEnd()) ?? 0)
+    }
+
+    static func slice(ofFile url: URL, around fraction: Double, maxBytes: Int, key loaded: SymmetricKey?,
+                      length: Int? = nil) -> (Data, Double) {
+        if RecordingCompression.isCompressed(url) { return slidingSlice(of: url, around: fraction, maxBytes: maxBytes, key: loaded, length: length) }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return (Data(), 0) }
         defer { try? handle.close() }
         if let sealer = try? RecordingCrypto.sealer(for: url, loaded: loaded) {
@@ -390,23 +698,23 @@ public enum RecordingReader {
         return (data, (center - Double(start) - Double(skipped)) / Double(max(data.count, 1)))
     }
 
-    /// For compressed recordings (no random access): a sliding window over the whole stream.
-    private static func slidingSlice(of url: URL, around fraction: Double, maxBytes: Int, key: SymmetricKey?) -> (Data, Double) {
-        var all = Data()
-        var dropped = 0
-        try? forEachChunk(of: url, key: key) { chunk in
-            all.append(chunk)
-            if all.count > maxBytes * 2 {
-                let cut = all.count - maxBytes * 2
-                all.removeSubrange(0..<cut)
-                dropped += cut
-            }
-            return true
+    /// For compressed recordings (no random access): the window is cut out of the stream as it
+    /// goes by, so at most `maxBytes` are held, and reading stops after it. The length (from a
+    /// part's name, or one counting pass) says where the window lies.
+    private static func slidingSlice(of url: URL, around fraction: Double, maxBytes: Int, key: SymmetricKey?,
+                                     length: Int? = nil) -> (Data, Double) {
+        let total = length ?? self.length(ofFile: url, key: key)
+        let center = Double(total) * min(max(fraction, 0), 1)
+        let start = max(0, min(Int(center) - maxBytes / 2, total - maxBytes))
+        let end = min(total, start + maxBytes)
+        var data = Data()
+        var pos = 0
+        try? forEachChunk(ofFile: url, key: key) { chunk in
+            defer { pos += chunk.count }
+            let lo = max(start - pos, 0), hi = min(end - pos, chunk.count)
+            if lo < hi { data += chunk.subdata(in: (chunk.startIndex + lo)..<(chunk.startIndex + hi)) }
+            return pos + chunk.count < end
         }
-        let total = Double(dropped + all.count)
-        let center = total * min(max(fraction, 0), 1) - Double(dropped)
-        let start = max(0, min(Int(center) - maxBytes / 2, all.count - maxBytes))
-        let data = all.subdata(in: start..<min(start + maxBytes, all.count))
         return lineAligned(data, start: start, center: center)
     }
 }

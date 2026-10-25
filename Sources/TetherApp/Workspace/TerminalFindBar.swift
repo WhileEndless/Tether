@@ -48,7 +48,7 @@ struct TerminalFindBar: View {
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .glassEffect(.regular, in: .capsule)
+        .glassBackground()
         .onAppear { refresh() }
         .onChange(of: model.terminalFindStep[session.id]) { _, _ in
             // Driven by Edit ▸ Find Next / Previous (⌘G, ⇧⌘G).

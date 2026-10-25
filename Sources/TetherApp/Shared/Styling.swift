@@ -114,7 +114,101 @@ struct GlassPill<Content: View>: View {
         content
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
-            .glassEffect(.regular, in: .capsule)
+            .glassBackground()
+    }
+}
+
+// MARK: Newer SwiftUI, with a fallback for earlier macOS
+
+extension View {
+    /// A symbol that wiggles when `value` changes (macOS 15); it bounces on earlier systems.
+    @ViewBuilder func wiggleEffect<V: Equatable>(value: V) -> some View {
+        if #available(macOS 15, *) { symbolEffect(.wiggle, value: value) } else { symbolEffect(.bounce, value: value) }
+    }
+
+    /// Reports how far a horizontal scroll view is scrolled: SwiftUI's scroll geometry on macOS 15,
+    /// the enclosing NSScrollView's position on earlier systems.
+    @ViewBuilder func onHorizontalScroll(_ action: @escaping (CGFloat) -> Void) -> some View {
+        if #available(macOS 15, *) {
+            onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.x } action: { _, x in action(x) }
+        } else {
+            background(ScrollOffsetReader(action: action))
+        }
+    }
+}
+
+/// Watches the NSScrollView it is placed in (macOS 14, for `onHorizontalScroll`).
+private struct ScrollOffsetReader: NSViewRepresentable {
+    let action: (CGFloat) -> Void
+    func makeNSView(context: Context) -> Reader { Reader() }
+    func updateNSView(_ view: Reader, context: Context) { view.action = action }
+
+    final class Reader: NSView {
+        var action: ((CGFloat) -> Void)?
+        private var observer: Any?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer); self.observer = nil }
+            guard window != nil, let clip = enclosingScrollView?.contentView else { return }
+            clip.postsBoundsChangedNotifications = true
+            observer = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+                let x = clip.bounds.origin.x
+                MainActor.assumeIsolated { self?.action?(x) }
+            }
+        }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+// MARK: Liquid Glass, with a look for earlier macOS
+
+/// Tether runs on macOS 14.4 and later. Liquid Glass (macOS 26) is used where it exists; earlier
+/// systems get the standard look in its place (bordered buttons, a material background). Built with
+/// an SDK before macOS 26 (Xcode 16), the glass code is left out.
+extension View {
+    /// The main button of a view (`.glassProminent` on macOS 26).
+    @ViewBuilder func prominentGlassButtonStyle() -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) { buttonStyle(.glassProminent) } else { buttonStyle(.borderedProminent) }
+        #else
+        buttonStyle(.borderedProminent)
+        #endif
+    }
+
+    /// A secondary button (`.glass` on macOS 26).
+    @ViewBuilder func glassButtonStyle() -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) { buttonStyle(.glass) } else { buttonStyle(.bordered) }
+        #else
+        buttonStyle(.bordered)
+        #endif
+    }
+
+    /// A floating glass background: a capsule, or a rounded rectangle with `cornerRadius`.
+    @ViewBuilder func glassBackground(cornerRadius: CGFloat? = nil, interactive: Bool = false) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            if let cornerRadius {
+                glassEffect(interactive ? .regular.interactive() : .regular, in: .rect(cornerRadius: cornerRadius))
+            } else {
+                glassEffect(interactive ? .regular.interactive() : .regular, in: .capsule)
+            }
+        } else {
+            materialBackground(cornerRadius: cornerRadius)
+        }
+        #else
+        materialBackground(cornerRadius: cornerRadius)
+        #endif
+    }
+
+    @ViewBuilder private func materialBackground(cornerRadius: CGFloat?) -> some View {
+        if let cornerRadius {
+            background(.regularMaterial, in: .rect(cornerRadius: cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).strokeBorder(.separator.opacity(0.6)))
+        } else {
+            background(.regularMaterial, in: .capsule)
+                .overlay(Capsule().strokeBorder(.separator.opacity(0.6)))
+        }
     }
 }
 

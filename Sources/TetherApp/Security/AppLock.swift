@@ -38,7 +38,9 @@ final class AppLock {
         if RecordingKeyStore.hasPassword && mode != .password {
             AppModel.shared.settings.appLockMode = .password
         }
-        // Set before anything can record: with encryption on and no key yet, nothing is recorded.
+        // Set before anything can record: with encryption on and no key yet, output is sealed to
+        // the key's public half (saved earlier), or not recorded at all when there is none.
+        RecordingKeyStore.provideSealing()
         RecordingCrypto.encryptNew = settings.encryptRecordings
         if mode == .off {
             installKey(RecordingKeyStore.trustedStoredKey())
@@ -110,6 +112,7 @@ final class AppLock {
     /// Encryption needs the Tether password: without its key nothing new is recorded.
     func installKey(_ key: SymmetricKey?) {
         RecordingCrypto.key = key
+        if key != nil { RecordingKeyStore.saveSealing() }
         RecordingCrypto.encryptNew = settings.encryptRecordings
         // Command history files encrypted with this key can be read now.
         if key != nil { AppModel.shared.commandHistory.reload() }
@@ -210,6 +213,7 @@ final class AppLock {
         let key = RecordingCrypto.key ?? SymmetricKey(size: .bits256)
         guard RecordingKeyStore.setPassword(password, for: key, keepKeychainCopy: settings.unlockWithTouchID) else { return false }
         RecordingCrypto.key = key
+        RecordingKeyStore.saveSealing()
         AppModel.shared.settings.appLockMode = .password
         return true
     }
@@ -226,6 +230,7 @@ final class AppLock {
         guard let key = await Task.detached(operation: { RecordingKeyStore.unwrap(password: current) }).value else { return false }
         RecordingKeyStore.removePassword(keeping: key)
         RecordingCrypto.key = key
+        RecordingKeyStore.saveSealing()
         AppModel.shared.settings.appLockMode = mode
         return true
     }
@@ -247,12 +252,14 @@ final class AppLock {
 
     /// The Tether password is forgotten: start over, after the Mac's own check (Touch ID or the Mac
     /// password — so someone at the Mac cannot simply reset the lock away). Recordings encrypted until
-    /// now cannot be opened any more and are deleted, as nothing could ever read them.
+    /// now (and encrypted command history files) cannot be opened any more and are deleted, as
+    /// nothing could ever read them.
     func resetForgottenPassword() async -> Bool {
         guard await confirmWithSystem("reset the Tether password") else { return false }
         RecordingKeyStore.forgetAll()
         RecordingCrypto.key = nil
-        RecordingStore.deleteEncrypted()
+        Task { await RecordingStore.perform { RecordingStore.deleteEncrypted() } }
+        AppModel.shared.commandHistory.forgetEncryptedFiles()
         AppModel.shared.settings.appLockMode = .off
         // Encryption needs a Tether password; it starts again once a new one is set.
         AppModel.shared.settings.encryptRecordings = false

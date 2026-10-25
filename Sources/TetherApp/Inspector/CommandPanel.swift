@@ -154,7 +154,7 @@ struct RunningCommandView: View {
             .contextMenu {
                 let list = sampler.connections
                 Button("Export Connections…") {
-                    ExportPanel.save(title: "Export Connections", baseName: "\(leader.name) connections") { _ in MonitorExport.connections(list) }
+                    ExportPanel.save(title: "Export Connections", baseName: "\(leader.name) connections", formats: MonitorExport.Format.table) { MonitorExport.connections(list, format: $0) }
                 }
                 Button("Copy as CSV") { CommandFormat.copy(String(decoding: MonitorExport.connections(list), as: UTF8.self)) }
             }

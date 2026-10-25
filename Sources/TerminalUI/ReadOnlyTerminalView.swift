@@ -1,6 +1,7 @@
 import AppKit
 import SwiftTerm
 import TetherCore
+import TerminalText
 
 /// Terminal view that only displays bytes; keyboard input is ignored.
 public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
@@ -45,13 +46,46 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
         // Wait one runloop so the view has its final size before replaying.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.feedKeepingScrollback([UInt8](data)[...])
+            self.replay([UInt8](data)[...])
             // Leave a full-screen program's screen (where there is no scrollback), stop any mouse
             // reporting it turned on, and hide the replay's cursor.
             self.feed(byteArray: Array("\u{1b}[?1049l\u{1b}[?1047l\u{1b}[?47l\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1006l\u{1b}[r\u{1b}[?25l".utf8)[...])
+            self.fitToView()
             self.scrollTo(row: Int.max / 2)
             self.revealPending()
         }
+    }
+
+    /// The size the view had before a replay changed it to the recorded one.
+    private var viewSize: (cols: Int, rows: Int)?
+
+    /// Replays at the size the terminal had (`SizeMarker`s in the recording), so programs that
+    /// place the cursor, and long lines, come out as they were shown. A slice that starts before
+    /// its first marker uses that marker's size (Tether notes the size at least every megabyte).
+    func replay(_ bytes: ArraySlice<UInt8>) {
+        let mayClear = SettingsStore.shared.settings.programsMayClearScrollback
+        var rest = bytes
+        if let (_, first) = SizeMarker.find(in: rest) { resizeForReplay(first) }
+        while let (range, size) = SizeMarker.find(in: rest) {
+            feedKeepingScrollback(rest[rest.startIndex..<range.lowerBound], programsMayClear: mayClear)
+            resizeForReplay(size)
+            rest = rest[range.upperBound...]
+        }
+        feedKeepingScrollback(rest, programsMayClear: mayClear)
+    }
+
+    private func resizeForReplay(_ size: (cols: Int, rows: Int)) {
+        let t = getTerminal()
+        guard size.cols > 1, size.rows > 1, size.cols != t.cols || size.rows != t.rows else { return }
+        if viewSize == nil { viewSize = (t.cols, t.rows) }
+        t.resize(cols: size.cols, rows: size.rows)
+    }
+
+    /// Back to the window's size once replayed (long lines reflow to it).
+    private func fitToView() {
+        guard let size = viewSize else { return }
+        viewSize = nil
+        getTerminal().resize(cols: size.cols, rows: size.rows)
     }
 
     private func revealPending() {

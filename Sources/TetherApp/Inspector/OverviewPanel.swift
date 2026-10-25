@@ -396,11 +396,21 @@ struct SystemCard: View {
 
 struct Card<Content: View>: View {
     let title: String
+    /// Shows an export button in the card's title row (the card's table as CSV or JSON).
+    var onExport: (() -> Void)? = nil
     @ViewBuilder var content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            HStack {
+                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                if let onExport {
+                    Spacer()
+                    Button(action: onExport) { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(.borderless)
+                        .help("Export as CSV or JSON")
+                }
+            }
             content
         }
         .padding(12)
@@ -436,7 +446,7 @@ struct ErrorCard: View {
             } else {
                 Text(message).multilineTextAlignment(.center).font(.callout).textSelection(.enabled)
             }
-            Button("Retry", action: retry).buttonStyle(.glass)
+            Button("Retry", action: retry).glassButtonStyle()
         }
         .frame(maxWidth: .infinity)
         .padding(20)

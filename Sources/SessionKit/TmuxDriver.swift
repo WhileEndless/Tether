@@ -149,14 +149,22 @@ final class TmuxDriver {
             paneID = info.paneID
             // Only a real size: a guessed one would resize the window, and its programs would
             // redraw twice (Claude Code and other TUIs then leave parts of the old frame behind).
-            if let s = size() { sendSize(s) }
+            // Without one (a tab restored in the background), the screen restored now is drawn
+            // again once the real size is known (`resize`).
+            if let s = size() {
+                if sentSize.map({ $0 != s }) ?? true { sendSize(s) }
+            } else if firstTime {
+                screenNeedsRedraw = true
+            }
             if firstTime && isReattach && !terminalIsEmpty && !info.alternateScreen, let anchor = screenTail() {
                 // Reconnected: add what the pane printed meanwhile, then continue live.
                 restoring = true
                 let rows = min(info.historySize, Self.catchUpProbe)
                 send(TmuxCommands.capturePane(pane: info.paneID, historyLines: max(rows, 1), join: false),
                      expect: .catchUp(info: info, anchor: anchor, rows: rows))
-            } else if (firstTime && isReattach) || switched {
+            } else if (firstTime && isReattach) || switched || redrawRequested {
+                redrawing = redrawRequested
+                redrawRequested = false
                 restoring = true
                 let full = firstTime && terminalIsEmpty && !info.alternateScreen
                 send(TmuxCommands.capturePane(pane: info.paneID, historyLines: full ? historyLines : 0, join: full),
@@ -176,7 +184,12 @@ final class TmuxDriver {
             let parts = text.split(separator: "\t", maxSplits: 1).map(String.init)
             onActivity(parts.first ?? "", parts.count > 1 ? parts[1] : "", rtt)
         case .capture(let info, let fullHistory):
-            restoreScreen(info: info, lines: success ? lines : [], fullHistory: fullHistory)
+            if redrawing {
+                redrawing = false
+                if success { redrawScreen(info: info, lines: lines) }
+            } else {
+                restoreScreen(info: info, lines: success ? lines : [], fullHistory: fullHistory)
+            }
             restoring = false
             bufferedOutput.removeAll() // the capture already contains this output
             markReady()
@@ -228,6 +241,21 @@ final class TmuxDriver {
     private func sendSize(_ s: (cols: Int, rows: Int)) {
         sentSize = s
         send(TmuxCommands.resize(cols: s.cols, rows: s.rows, legacySyntax: legacyResize))
+    }
+
+    /// Draws the pane's screen again, row by row, over what the terminal shows: no clear (which
+    /// would keep the wrong frame in the scrollback) and nothing recorded (the recording has it).
+    private func redrawScreen(info: TmuxPaneInfo, lines: [[UInt8]]) {
+        var out: [UInt8] = []
+        if info.alternateScreen { out += Array("\u{1b}[?1049h".utf8) }
+        let visible = Array(lines.suffix(info.height))
+        for row in 0..<info.height {
+            out += Array("\u{1b}[\(row + 1);1H\u{1b}[0m\u{1b}[2K".utf8)
+            if row < visible.count { out += visible[row] }
+        }
+        out += Array("\u{1b}[0m".utf8)
+        out += Array(info.modes.sequence(cursorX: info.cursorX, cursorY: info.cursorY, height: info.height).utf8)
+        refresh(out)
     }
 
     private func restoreScreen(info: TmuxPaneInfo, lines: [[UInt8]], fullHistory: Bool) {
@@ -313,9 +341,23 @@ final class TmuxDriver {
             pendingSize = (cols, rows)
             return
         }
-        guard sentSize.map({ $0 != (cols, rows) }) ?? true else { return }
-        sendSize((cols, rows))
+        if sentSize.map({ $0 != (cols, rows) }) ?? true { sendSize((cols, rows)) }
+        // The screen was restored before the terminal had its real size: it is taken from tmux
+        // again now, at this size. tmux sends no SIGWINCH when its window already had this size,
+        // so a program such as Claude Code would not redraw it by itself.
+        if screenNeedsRedraw {
+            screenNeedsRedraw = false
+            redrawRequested = true
+            send(TmuxCommands.paneInfo, expect: .paneInfo)
+        }
     }
+
+    /// The screen was restored without a real size (`resize` draws it again).
+    private var screenNeedsRedraw = false
+    /// The capture asked for is that redraw.
+    private var redrawing = false
+    /// The next pane info is for drawing the screen again (`screenNeedsRedraw`).
+    private var redrawRequested = false
 
     /// Ends the tmux session from inside, over the existing connection.
     func killSession(_ name: String) {

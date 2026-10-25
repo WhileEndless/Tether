@@ -163,7 +163,7 @@ struct PasswordPromptBar: View {
                     .lineLimit(1)
                 if rejected {
                     Button("Enter New Password…") { state.passwordEntry = session }
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                         .help("Type the current password; it replaces the saved one")
                 } else if saved {
                     Button {
@@ -172,7 +172,7 @@ struct PasswordPromptBar: View {
                         Label(SecretGate.shared.isRequired ? "Fill with \(SecretGate.shared.methodName)" : "Fill Saved Password",
                               systemImage: "touchid")
                     }
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .help("Types the saved password into the terminal (⌥⌘P)")
                 }
                 if !rejected {
@@ -241,7 +241,7 @@ struct PasswordEntrySheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Enter") { enter() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .disabled(password.isEmpty)
             }
         }

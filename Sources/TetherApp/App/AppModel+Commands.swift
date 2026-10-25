@@ -90,13 +90,13 @@ extension AppModel {
 }
 
 extension CommandHistoryStore.Codec {
-    /// Sealed with the recording key while recordings are encrypted (see `SealedData`). With
-    /// encryption on and Tether locked nothing is written (records wait in memory); a file that
-    /// needs the key waits until Tether is unlocked.
+    /// Sealed with the recording key while recordings are encrypted (see `SealedData`); while
+    /// Tether is locked, sealed to its public half, so nothing waits in memory only. A file that
+    /// needs the key to be read waits until Tether is unlocked.
     static let recordingKey = Self(seal: { plain in
         guard RecordingCrypto.encryptNew else { return plain }
-        guard let key = RecordingCrypto.writerKey else { return nil }
-        return SealedData.seal(plain, key: key)
+        if let key = RecordingCrypto.writerKey { return SealedData.seal(plain, key: key) }
+        return RecordingCrypto.lockedSealing.flatMap { SealedData.seal(plain, to: $0) }
     }, open: { data in
         do {
             return .data(try SealedData.open(data, key: RecordingCrypto.key))

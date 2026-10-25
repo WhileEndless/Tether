@@ -228,6 +228,10 @@ public final class RemoteMonitor {
 
     /// Lists the host's tmux/screen sessions and what runs in them. One look at a time per host;
     /// with `maxAge`, a list younger than that is kept (several views ask on their own schedules).
+    /// Called after every look at the server sessions (the app names tabs after coding agents; it
+    /// changes nothing when nothing changed).
+    @ObservationIgnored public var onRemoteSessions: (([RemoteSessionEntry]) -> Void)?
+
     public func refreshRemoteSessions(maxAge: TimeInterval = 0) async {
         guard !frozen else { return }
         if sessionsRefreshing {
@@ -252,6 +256,7 @@ public final class RemoteMonitor {
             // Unchanged lists are not assigned: observers (the sidebar) are not redrawn for nothing.
             let found = ProbeParser.remoteSessions(text)
             if found != remoteSessions { remoteSessions = found }
+            onRemoteSessions?(found)
         }
     }
 

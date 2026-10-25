@@ -3,7 +3,11 @@
 #   scripts/build-app.sh            release build
 #   scripts/build-app.sh debug      debug build
 #   scripts/build-app.sh debug demo "Tether Demo.app" (separate bundle id, used by `make demo`)
+#   UNIVERSAL=1 scripts/build-app.sh   Apple silicon and Intel in one app (release downloads)
 set -euo pipefail
+
+# The oldest macOS Tether runs on; keep in step with `platforms` in Package.swift.
+MIN_MACOS="14.4"
 
 CONFIG="${1:-release}"
 VARIANT="${2:-}"
@@ -20,16 +24,31 @@ cd "$ROOT"
 # info), revealing the builder's home folder. Map them to "." and strip debug symbols.
 MAP=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=." -Xswiftc -debug-prefix-map -Xswiftc "$ROOT=."
      -Xcc "-ffile-prefix-map=$ROOT=." -Xcc "-fdebug-prefix-map=$ROOT=.")
-swift build -c "$CONFIG" "${MAP[@]}" --product Tether
-swift build -c "$CONFIG" "${MAP[@]}" --product tether-askpass
-BIN="$(swift build -c "$CONFIG" "${MAP[@]}" --show-bin-path)"
+build() {   # build <extra swift build arguments…>; prints the folder with the products
+    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product Tether >&2
+    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product tether-askpass >&2
+    swift build -c "$CONFIG" "${MAP[@]}" "$@" --show-bin-path
+}
+if [ "${UNIVERSAL:-}" = 1 ]; then
+    # One build per architecture, joined with lipo (resource bundles are the same for both).
+    BIN="$(build --arch arm64)"
+    INTEL="$(build --arch x86_64)"
+else
+    BIN="$(build)"
+    INTEL=""
+fi
 
 APP="$ROOT/dist/$NAME.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$BIN/Tether" "$APP/Contents/MacOS/Tether"
-cp "$BIN/tether-askpass" "$APP/Contents/MacOS/tether-askpass"
+for exe in Tether tether-askpass; do
+    if [ -n "$INTEL" ]; then
+        lipo -create "$BIN/$exe" "$INTEL/$exe" -output "$APP/Contents/MacOS/$exe"
+    else
+        cp "$BIN/$exe" "$APP/Contents/MacOS/$exe"
+    fi
+done
 # SwiftPM resource bundles (e.g. SwiftTerm's Metal shaders)
 for bundle in "$BIN"/*.bundle; do
     [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
@@ -58,7 +77,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
     <key>CFBundleVersion</key><string>${BUILD}</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>

@@ -253,6 +253,8 @@ public struct GPUInfo: Identifiable, Hashable, Sendable {
     public var temperature: Double?      // °C
     public var power: Double?            // W
     public var powerLimit: Double?       // W
+    /// NVIDIA's GPU id (`GPU-…`), which `GPUProcess.gpu` refers to.
+    public var uuid: String? = nil
     public var id: String { "\(vendor.rawValue)-\(index)" }
     public var memoryFraction: Double? {
         guard let u = memoryUsed, let t = memoryTotal, t > 0 else { return nil }

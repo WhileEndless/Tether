@@ -54,12 +54,37 @@ final class TabBarCenter {
         return scrollTabs(by: step, at: event.locationInWindow, in: window)
     }
 
-    /// Closes the tab at a point in window coordinates (top-left origin). True if there was one.
+    /// Closes the tab, or the sidebar row's terminal or file tab, at a point in window coordinates
+    /// (top-left origin). True if there was one.
     func closeTab(at point: CGPoint, in window: NSWindow) -> Bool {
-        guard let state = AppModel.shared.workspaces.state(of: window),
-              let item = state.items.first(where: { tabFrames[$0.id]?.contains(point) == true }) else { return false }
-        state.close(item)
+        guard let state = AppModel.shared.workspaces.state(of: window) else { return false }
+        if let item = state.items.first(where: { tabFrames[$0.id]?.contains(point) == true }) {
+            state.close(item)
+            return true
+        }
+        // A sidebar row under the pointer: the table row there holds a marker saying which one it is.
+        guard let content = window.contentView,
+              // hitTest takes a point in the content view's superview, whose coordinates are the window's.
+              let hit = content.hitTest(CGPoint(x: point.x, y: content.frame.height - point.y)),
+              let rowView = sequence(first: hit, next: \.superview).first(where: { $0 is NSTableRowView }),
+              let marker = Self.marker(in: rowView), marker.workspace == state.workspaceID, let item = marker.item else { return false }
+        switch item {
+        case .session(let id):
+            guard let s = AppModel.shared.sessions.session(id) else { return false }
+            state.closeTab(s)
+        case .files(let id):
+            guard let t = AppModel.shared.fileTabs.tab(id) else { return false }
+            state.close(.files(t))
+        default:
+            return false
+        }
         return true
+    }
+
+    private static func marker(in view: NSView) -> SidebarRowMarker.MarkerView? {
+        if let m = view as? SidebarRowMarker.MarkerView { return m }
+        for sub in view.subviews { if let m = marker(in: sub) { return m } }
+        return nil
     }
 
     /// Scrolls the tab bar under a point (window coordinates, bottom-left origin) sideways.
@@ -326,7 +351,7 @@ struct TabStrip: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
                 }
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0 }
-                .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.x } action: { _, x in offset = x }
+                .onHorizontalScroll { offset = $0 }
                 // Fades at the edges show that more tabs are hidden there.
                 .mask {
                     HStack(spacing: 0) {
@@ -480,7 +505,7 @@ private struct TabChip: View {
                 Button("Disconnect & Move to Background") { state.disconnectToBackground(session) }
             }
             Button("Browse Files Here") {
-                state.openFiles(session.descriptor.target, path: session.currentDirectory)
+                state.browse(session.descriptor.target, path: session.currentDirectory)
             }
             Button("Search in Session…") {
                 model.searchPreset = SearchPreset(host: nil, session: session.id)

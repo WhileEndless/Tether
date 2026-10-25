@@ -22,7 +22,7 @@ enum ExportPanel {
         var format = MonitorExport.Format(rawValue: UserDefaults.standard.string(forKey: formatKey) ?? "") ?? formats[0]
         if !formats.contains(format) { format = formats[0] }
         let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        let target = FormatTarget(panel: panel, formats: formats)
+        let target = FormatTarget(panel: panel, formats: formats, baseName: baseName)
         if formats.count > 1 {
             popup.addItems(withTitles: formats.map(\.title))
             popup.selectItem(at: formats.firstIndex(of: format) ?? 0)
@@ -74,16 +74,25 @@ enum ExportPanel {
     private final class FormatTarget: NSObject {
         let panel: NSSavePanel
         let formats: [MonitorExport.Format]
+        let baseName: String
+        private var current: MonitorExport.Format?
 
-        init(panel: NSSavePanel, formats: [MonitorExport.Format]) {
+        init(panel: NSSavePanel, formats: [MonitorExport.Format], baseName: String) {
             self.panel = panel
             self.formats = formats
+            self.baseName = baseName
         }
 
+        /// The suggested name follows the format; a name the user typed keeps its text and only
+        /// changes its extension.
         @MainActor @objc func changed(_ sender: NSPopUpButton) {
             let format = formats[max(0, sender.indexOfSelectedItem)]
             let name = (panel.nameFieldStringValue as NSString).deletingPathExtension
-            panel.nameFieldStringValue = name + "." + format.fileExtension
+            let suggested = formats.map { (MonitorExport.suggestedName(baseName, format: $0) as NSString).deletingPathExtension }
+            panel.nameFieldStringValue = suggested.contains(name)
+                ? MonitorExport.suggestedName(baseName, format: format)
+                : name + "." + format.fileExtension
+            current = format
         }
     }
 }

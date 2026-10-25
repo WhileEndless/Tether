@@ -146,7 +146,7 @@ struct SecuritySettingsPane: View {
         guard let key = RecordingCrypto.writerKey else { return }
         working = "Encrypting…"
         Task {
-            let n = await Task.detached(priority: .utility) { RecordingStore.encryptAll(with: key) }.value
+            let n = await RecordingStore.perform { RecordingStore.encryptAll(with: key) }
             working = nil
             message = n > 0 ? "Encrypted \(n) existing recording\(n == 1 ? "" : "s")." : message
             await refreshStatus()
@@ -156,7 +156,7 @@ struct SecuritySettingsPane: View {
     private func decryptExisting() {
         Task {
             working = "Decrypting…"
-            let n = await Task.detached(priority: .utility) { RecordingStore.decryptAll() }.value
+            let n = await RecordingStore.perform { RecordingStore.decryptAll() }
             working = nil
             message = "Decrypted \(n) recording\(n == 1 ? "" : "s")."
             await refreshStatus()
@@ -222,7 +222,7 @@ struct PasswordSheet: View {
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(actionTitle) { save() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .disabled(!canSave || busy)
             }
         }

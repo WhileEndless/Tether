@@ -17,11 +17,11 @@ struct AboutView: View {
                 Link(destination: AppInfo.repository) {
                     Label("GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                 }
-                .buttonStyle(.glassProminent)
+                .prominentGlassButtonStyle()
                 Link(destination: AppInfo.issues) {
                     Label("Report an Issue", systemImage: "exclamationmark.bubble")
                 }
-                .buttonStyle(.glass)
+                .glassButtonStyle()
             }
             Text(AppInfo.repository.absoluteString.replacingOccurrences(of: "https://", with: ""))
                 .font(.caption.monospaced())

@@ -32,7 +32,7 @@ struct KeySetupView: View {
             HStack(spacing: 12) {
                 Image(systemName: "key.horizontal.fill")
                     .font(.system(size: 28)).foregroundStyle(.tint)
-                    .symbolEffect(.wiggle, value: step)
+                    .wiggleEffect(value: step)
                 VStack(alignment: .leading) {
                     Text("Set Up SSH Key").font(.title3.weight(.semibold))
                     Text("for \(request.alias)").foregroundStyle(.secondary)
@@ -51,7 +51,7 @@ struct KeySetupView: View {
                     Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     Button("Install Key") { Task { await run() } }
                         .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                         .disabled(useExisting ? selectedKey == nil : keyName.isEmpty)
                 } else {
                     Button(step == .done ? "Done" : "Working…") { dismiss() }

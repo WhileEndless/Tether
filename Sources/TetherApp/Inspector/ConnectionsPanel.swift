@@ -14,7 +14,10 @@ struct ConnectionsPanel: View {
                 ListeningCard(sockets: monitor.listeningPorts) { s in
                     if let target = state.inspectedTarget { model.quickForward(target, port: s.port, address: s.address) }
                 }
-                Card(title: "Logged-in users") {
+                Card(title: "Logged-in users", onExport: monitor.logins.isEmpty ? nil : {
+                    let logins = monitor.logins
+                    ExportPanel.save(title: "Export Logged-in Users", baseName: "logged-in users", formats: MonitorExport.Format.table) { MonitorExport.logins(logins, format: $0) }
+                }) {
                     if monitor.logins.isEmpty {
                         Text("Nobody").foregroundStyle(.secondary)
                     }
@@ -30,7 +33,17 @@ struct ConnectionsPanel: View {
                         }
                     }
                 }
-                Card(title: "Established TCP connections (\(monitor.connections.count))") {
+                .contextMenu {
+                    let logins = monitor.logins
+                    Button("Export Logged-in Users…") {
+                        ExportPanel.save(title: "Export Logged-in Users", baseName: "logged-in users", formats: MonitorExport.Format.table) { MonitorExport.logins(logins, format: $0) }
+                    }
+                    .disabled(logins.isEmpty)
+                }
+                Card(title: "Established TCP connections (\(monitor.connections.count))", onExport: monitor.connections.isEmpty ? nil : {
+                    let connections = monitor.connections
+                    ExportPanel.save(title: "Export TCP Connections", baseName: "tcp connections", formats: MonitorExport.Format.table) { MonitorExport.tcpConnections(connections, format: $0) }
+                }) {
                     ForEach(monitor.connections) { c in
                         HStack(alignment: .firstTextBaseline) {
                             Image(systemName: c.isSSH ? "lock.fill" : "arrow.left.arrow.right")
@@ -43,6 +56,13 @@ struct ConnectionsPanel: View {
                             }
                         }
                     }
+                }
+                .contextMenu {
+                    let connections = monitor.connections
+                    Button("Export TCP Connections…") {
+                        ExportPanel.save(title: "Export TCP Connections", baseName: "tcp connections", formats: MonitorExport.Format.table) { MonitorExport.tcpConnections(connections, format: $0) }
+                    }
+                    .disabled(connections.isEmpty)
                 }
             }
             .padding(12)
@@ -131,7 +151,7 @@ struct ProcessTrafficCard: View {
         .contextMenu {
             let entries = traffic.entries
             Button("Export Traffic by Process…") {
-                ExportPanel.save(title: "Export Traffic by Process", baseName: "traffic by process") { _ in MonitorExport.traffic(entries) }
+                ExportPanel.save(title: "Export Traffic by Process", baseName: "traffic by process", formats: MonitorExport.Format.table) { MonitorExport.traffic(entries, format: $0) }
             }
             .disabled(entries.isEmpty)
         }
@@ -233,7 +253,10 @@ struct ListeningCard: View {
     let forward: (ListeningSocket) -> Void
 
     var body: some View {
-        Card(title: "Listening ports (\(sockets.count))") {
+        Card(title: "Listening ports (\(sockets.count))", onExport: sockets.isEmpty ? nil : {
+            let list = sockets
+            ExportPanel.save(title: "Export Listening Ports", baseName: "listening ports", formats: MonitorExport.Format.table) { MonitorExport.listening(list, format: $0) }
+        }) {
             if sockets.isEmpty {
                 Text("Loading…").foregroundStyle(.secondary)
             }
@@ -251,6 +274,13 @@ struct ListeningCard: View {
             }
             Text("Process names of other users' services are only visible with root rights.")
                 .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .contextMenu {
+            let list = sockets
+            Button("Export Listening Ports…") {
+                ExportPanel.save(title: "Export Listening Ports", baseName: "listening ports", formats: MonitorExport.Format.table) { MonitorExport.listening(list, format: $0) }
+            }
+            .disabled(list.isEmpty)
         }
     }
 
@@ -411,7 +441,7 @@ private struct RemoteSessionRow: View {
                     state.connect(target, remoteSessionName: entry.name,
                                   persistence: entry.kind == .tmux ? .tmux : .screen)
                 }
-                .buttonStyle(.glass)
+                .glassButtonStyle()
             }
         }
         .contextMenu {

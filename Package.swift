@@ -1,10 +1,10 @@
-// swift-tools-version:6.2
+// swift-tools-version:6.0
 import PackageDescription
 
 let package = Package(
     name: "Tether",
     defaultLocalization: "en",
-    platforms: [.macOS(.v26)],
+    platforms: [.macOS("14.4")],
     products: [
         .executable(name: "Tether", targets: ["TetherApp"]),
         .executable(name: "tether-askpass", targets: ["TetherAskPass"]),
@@ -30,13 +30,19 @@ let package = Package(
 
         // Live terminal sessions: persistence strategies, reconnect state machine.
         .target(name: "SessionKit", dependencies: [
-            "TetherCore", "SSHTransport", "TmuxControl", "RecordingKit",
+            "TetherCore", "SSHTransport", "TmuxControl", "RecordingKit", "TerminalText",
+            .product(name: "SwiftTerm", package: "SwiftTerm"),
+        ]),
+
+        // What a terminal shows, without a view: the scrollback rule (output never erases history)
+        // and the text of a recording as the screen showed it (for search and export).
+        .target(name: "TerminalText", dependencies: [
             .product(name: "SwiftTerm", package: "SwiftTerm"),
         ]),
 
         // Terminal view, theme and keyboard handling.
         .target(name: "TerminalUI", dependencies: [
-            "TetherCore", "SessionKit", "RecordingKit",
+            "TetherCore", "SessionKit", "RecordingKit", "TerminalText",
             .product(name: "SwiftTerm", package: "SwiftTerm"),
         ]),
 
@@ -50,7 +56,7 @@ let package = Package(
         .target(name: "MonitorKit", dependencies: ["SSHTransport"]),
 
         // Search across live terminals and recorded transcripts.
-        .target(name: "SearchKit", dependencies: ["TetherCore", "RecordingKit"]),
+        .target(name: "SearchKit", dependencies: ["TetherCore", "RecordingKit", "TerminalText"]),
 
         // SSH key generation and installation.
         .target(name: "KeySetupKit", dependencies: ["TetherCore", "SSHTransport"]),
@@ -74,7 +80,7 @@ let package = Package(
         .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore", "SearchKit"]),
         .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore", "TestSupport"]),
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
-        .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit"]),
+        .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit", "TerminalText"]),
         .testTarget(name: "SessionKitTests", dependencies: ["SessionKit", "TetherCore", "TestSupport"]),
         .testTarget(name: "TerminalUITests", dependencies: ["TerminalUI", "SessionKit", "TetherCore", "SearchKit", "RecordingKit", "TestSupport",
                                                             .product(name: "SwiftTerm", package: "SwiftTerm")]),

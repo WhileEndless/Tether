@@ -37,7 +37,7 @@ struct LockScreen: View {
                     }
                     HStack(spacing: 10) {
                         Button("Unlock", action: unlock)
-                            .buttonStyle(.glassProminent)
+                            .prominentGlassButtonStyle()
                             .keyboardShortcut(.defaultAction)
                             .disabled(password.isEmpty || lock.unlocking)
                         if lock.canUseSystemUnlock {
@@ -47,7 +47,7 @@ struct LockScreen: View {
                     }
                 } else {
                     Button("Unlock with \(lock.methodName)") { Task { await lock.unlockWithSystem() } }
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                         .keyboardShortcut(.defaultAction)
                         .disabled(lock.unlocking)
                 }

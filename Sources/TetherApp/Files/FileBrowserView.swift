@@ -416,7 +416,7 @@ struct FileBrowserView: View {
                     .background(Color.accentColor.opacity(0.08))
                     .overlay {
                         Label("Upload to \((b.directory as NSString).lastPathComponent)", systemImage: "arrow.up.doc")
-                            .font(.headline).padding().glassEffect()
+                            .font(.headline).padding().glassBackground()
                     }
                     .padding(6)
             }
@@ -733,8 +733,8 @@ struct FileDetailView: View {
                     }
                     .font(.callout)
                     HStack {
-                        Button("Download") { download(f) }.buttonStyle(.glassProminent)
-                        if !f.isDirectory { Button("Quick Look") { quickLook(f) }.buttonStyle(.glass) }
+                        Button("Download") { download(f) }.prominentGlassButtonStyle()
+                        if !f.isDirectory { Button("Quick Look") { quickLook(f) }.glassButtonStyle() }
                     }
                 }
                 .padding(12)
@@ -746,7 +746,7 @@ struct FileDetailView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "doc.on.doc").font(.largeTitle).foregroundStyle(.secondary)
                     Text("\(files.count) items · \(files.reduce(0) { $0 + $1.size }.byteString)")
-                    Button("Download All") { files.forEach(download) }.buttonStyle(.glassProminent)
+                    Button("Download All") { files.forEach(download) }.prominentGlassButtonStyle()
                 }
                 .frame(maxWidth: .infinity).padding(20)
             } else {
@@ -829,7 +829,7 @@ private struct BulkActionSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(button) { run() }.keyboardShortcut(.defaultAction).buttonStyle(.glassProminent)
+                Button(button) { run() }.keyboardShortcut(.defaultAction).prominentGlassButtonStyle()
             }
         }
         .padding(22)

@@ -17,6 +17,17 @@ public enum RecordingCompression {
         let out = url.appendingPathExtension(compressedExtension)
         let tmp = out.appendingPathExtension("tmp")
         let fm = FileManager.default
+        // A crash between finishing the compressed copy and removing the original left both: the
+        // compressed file is only ever moved into place complete, so the original can go — unless
+        // it changed since (a session reopened it and wrote more): then both stay, nothing is lost.
+        if fm.fileExists(atPath: out.path) {
+            func modified(_ u: URL) -> Date? { (try? fm.attributesOfItem(atPath: u.path)[.modificationDate]) as? Date }
+            guard let original = modified(url), let compressed = modified(out), original <= compressed else {
+                throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: out.path])
+            }
+            try fm.removeItem(at: url)
+            return out
+        }
         let key = try RecordingCrypto.readingKey(for: url, loaded: loaded) ?? (encryptPlain ? loaded : nil)
         fm.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600])
         // Never leave a half-written file behind (it may hold the recording in plain text).
@@ -42,7 +53,7 @@ public enum RecordingCompression {
         let filter = try OutputFilter(.compress, using: .lzfse) { data in
             if let data { try emit(data, final: false) }
         }
-        try RecordingReader.forEachChunk(of: url, key: loaded) { chunk in
+        try RecordingReader.forEachChunk(ofFile: url, key: loaded) { chunk in
             try filter.write(chunk)
             return true
         }

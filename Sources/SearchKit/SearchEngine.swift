@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import RecordingKit
+import TerminalText
 
 /// What to look for.
 public struct SearchQuery: Sendable, Equatable {
@@ -53,9 +54,11 @@ public struct SearchSource: Identifiable, Sendable, Hashable {
     public var status: String
     /// For live sources: the lines, captured on the main thread before searching.
     public var lines: [String]?
-    /// For recordings of live sessions: skip this many lines at the end (they are still in memory
-    /// and searched there), so long sessions are searched completely without duplicates.
+    /// For recordings of live sessions: about this many lines at the end are still in memory and
+    /// searched there, so long sessions are searched completely without duplicates. The exact cut is
+    /// found by content with `memoryHead`, the first logical lines in memory (`HistorySeam`).
     public var skipTrailingLines = 0
+    public var memoryHead: [String] = []
 
     public init(id: String, kind: Kind, title: String, host: String, date: Date?, status: String, lines: [String]? = nil) {
         self.id = id
@@ -148,7 +151,12 @@ public enum SearchEngine {
             lines = l
         } else if case .recording(let url, _) = source.kind {
             let all = try readLines(url)
-            lines = source.skipTrailingLines > 0 ? Array(all.dropLast(source.skipTrailingLines)) : all
+            if source.skipTrailingLines > 0 {
+                let tail = Array(all.suffix(max(source.skipTrailingLines, 0) * 2 + HistorySeam.margin))
+                lines = Array(all.dropLast(HistorySeam.overlap(tail: tail, memoryHead: source.memoryHead, expected: source.skipTrailingLines)))
+            } else {
+                lines = all
+            }
         } else {
             lines = []
         }
@@ -172,16 +180,17 @@ public enum SearchEngine {
         return result
     }
 
-    /// Reads a recording (compressed or not) as plain text lines, in chunks so large files stay manageable.
+    /// Reads a recording (compressed, encrypted or in parts) as the text the terminal showed
+    /// (`ScreenText`), in chunks so large files stay manageable.
     public static func readLines(_ url: URL, key: SymmetricKey? = RecordingCrypto.key) throws -> [String] {
-        var converter = PlainTextConverter()
+        let text = ScreenText()
         var lines: [String] = []
         try RecordingReader.forEachChunk(of: url, key: key) { chunk in
             try Task.checkCancellation()
-            lines.append(contentsOf: converter.feed(chunk))
+            lines.append(contentsOf: text.feed(chunk))
             return true
         }
-        if let last = converter.finish() { lines.append(last) }
+        lines.append(contentsOf: text.finish())
         return lines
     }
 }

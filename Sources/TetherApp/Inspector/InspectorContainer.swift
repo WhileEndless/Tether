@@ -135,7 +135,7 @@ struct HostHeader: View {
             } label: {
                 Image(systemName: "terminal")
             }
-            .buttonStyle(.glass)
+            .glassButtonStyle()
             .help("New terminal")
         }
         .padding(12)

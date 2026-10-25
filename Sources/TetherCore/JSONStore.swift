@@ -12,11 +12,33 @@ public struct JSONStore<Value: Codable> {
         self.url = url
     }
 
+    /// The stored value. A file that is there but cannot be read as one (damaged, or written by an
+    /// incompatible version) is moved aside first — `name.unreadable-<date>.json` next to it — so the
+    /// next save never overwrites what it held.
     public func load() -> Value? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(Value.self, from: data)
+        do {
+            return try decoder.decode(Value.self, from: data)
+        } catch {
+            moveAside()
+            return nil
+        }
+    }
+
+    private func moveAside() {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let base = url.deletingPathExtension().lastPathComponent + ".unreadable-" + f.string(from: Date())
+        var aside = url.deletingLastPathComponent().appendingPathComponent(base + ".json")
+        var n = 1
+        while FileManager.default.fileExists(atPath: aside.path) {
+            aside = url.deletingLastPathComponent().appendingPathComponent("\(base)-\(n).json")
+            n += 1
+        }
+        try? FileManager.default.moveItem(at: url, to: aside)
     }
 
     public func save(_ value: Value) {

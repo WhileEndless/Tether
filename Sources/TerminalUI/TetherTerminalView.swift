@@ -138,7 +138,39 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// Output from the remote side, with Terminal.app's handling of screen clears (see
     /// `feedKeepingScrollback`). ⌘K (`clearBuffer`) still clears everything.
     public func feed(_ bytes: ArraySlice<UInt8>) {
-        feedKeepingScrollback(bytes)
+        // A clear can arrive cut in two by the network (`ESC[` now, `3J` next): the start is held
+        // back until the rest comes (or 50 ms later), so the scrollback rule always sees it whole.
+        var chunk = heldEscape + Array(bytes)
+        heldEscape = []
+        if let cut = Self.partialEraseStart(chunk) {
+            heldEscape = Array(chunk[cut...])
+            chunk.removeSubrange(cut...)
+            let held = heldEscape
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, self.heldEscape == held, !held.isEmpty else { return }
+                self.heldEscape = []
+                self.feedKeepingScrollback(held[...], programsMayClear: self.settings.programsMayClearScrollback)
+            }
+        }
+        if !chunk.isEmpty { feedKeepingScrollback(chunk[...], programsMayClear: settings.programsMayClearScrollback) }
+    }
+
+    /// Bytes held back by `feed` (the start of an erase sequence).
+    private var heldEscape: [UInt8] = []
+
+    /// Where an erase-in-display sequence starts but is cut off at the end of `bytes`
+    /// (`ESC`, `ESC[`, `ESC[2`, `ESC[3`, `ESC[0`), or nil.
+    static func partialEraseStart(_ bytes: [UInt8]) -> Int? {
+        let n = bytes.count
+        for length in (1...3).reversed() where n >= length {
+            let tail = bytes[(n - length)...]
+            guard tail.first == 0x1b else { continue }
+            if length == 1 { return n - 1 }
+            guard tail[tail.startIndex + 1] == 0x5b else { continue }
+            if length == 2 { return n - 2 }
+            if [0x30, 0x32, 0x33].contains(tail[tail.startIndex + 2]) { return n - 3 }
+        }
+        return nil
     }
 
     public var cellSize: (cols: Int, rows: Int) {
@@ -353,7 +385,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         var logical = 0
         var row = base
         while let line = t.getScrollInvariantLine(row: row) {
-            lines.append(line.translateToString(trimRight: true).replacingOccurrences(of: "\0", with: " "))
+            lines.append(line.translateToString(trimRight: true, skipNullCellsFollowingWide: true) { t.getCharacter(for: $0) }
+                .replacingOccurrences(of: "\0", with: " "))
             if !line.isWrapped { logical += 1 }
             row += 1
         }
@@ -374,7 +407,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         var lines: [String] = []
         var row = base
         while let line = t.getScrollInvariantLine(row: row) {
-            let text = line.translateToString(trimRight: false).replacingOccurrences(of: "\0", with: " ")
+            let text = line.translateToString(trimRight: false, skipNullCellsFollowingWide: true) { t.getCharacter(for: $0) }
+                .replacingOccurrences(of: "\0", with: " ")
             if line.isWrapped, !lines.isEmpty { lines[lines.count - 1] += text } else { lines.append(text) }
             row += 1
         }
@@ -488,6 +522,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public var historySource: (() -> URL?)?
     /// Lines read back each time the top of memory is reached.
     public var historyChunkLines = 10_000
+    /// The most lines scrolling back brings into memory, however long the recording is (older
+    /// output is in the transcript and search, which read the recording in pieces).
+    public var historyMaxLines = 250_000
     private var loadingHistory = false
     private var historyExtended = false
 
@@ -515,17 +552,30 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         defer { loadingHistory = false }
 
         let oldCount = bufferLineCount
+        guard oldCount < historyMaxLines else { return false }
         let oldEnd = t.buffer.totalLinesTrimmed + oldCount
         let selectionRange = selection.active ? (selection.start, selection.end) : nil
-        let wanted = oldCount + historyChunkLines
-        guard let bytes = Self.tail(of: url, lines: wanted + t.rows) else { return false }
+        let wanted = min(oldCount + historyChunkLines, historyMaxLines)
         let markDistances = markLines.map { oldEnd - $0 }
 
-        t.resetToInitialState()
-        changeScrollback(wanted)
-        feed(bytes[...])
-
-        let newCount = bufferLineCount
+        // Output that redraws a lot (Claude Code) has far more line breaks than lines it leaves
+        // in the terminal: when the replay gives no more lines than memory had, more of the
+        // recording is read (within RecordingReader.tailMaxBytes).
+        var request = wanted + t.rows
+        var newCount = 0
+        var lastSize = -1
+        for _ in 0..<2 {        // each round replays on the main thread: at most one retry
+            guard let bytes = Self.tail(of: url, lines: request), bytes.count > lastSize else { break }
+            lastSize = bytes.count
+            t.resetToInitialState()
+            changeScrollback(wanted)
+            // The same rule as live output: a replayed `clear` never erases the history.
+            feedKeepingScrollback(bytes[...], programsMayClear: settings.programsMayClearScrollback)
+            newCount = bufferLineCount
+            // Enough, or nothing more to read (the start of the recording, or its size limit).
+            if newCount > oldCount || bytes.count >= RecordingReader.tailMaxBytes / 2 { break }
+            request *= 4
+        }
         guard newCount > oldCount else { return false }
         historyExtended = true
         let delta = newCount - oldCount

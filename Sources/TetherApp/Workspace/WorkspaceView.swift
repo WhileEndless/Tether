@@ -72,7 +72,7 @@ struct SessionPane: View {
                             Button("Open Full History") {
                                 openWindow(id: "transcript", value: TranscriptRequest(path: url.path, revealFraction: 1))
                             }
-                            .buttonStyle(.glass)
+                            .glassButtonStyle()
                         }
                     }
                     .padding(.top, 10)
@@ -161,7 +161,7 @@ struct SessionBanner: View {
                             }
                         }
                         Button("Reconnect Now") { session.reconnectNow() }
-                            .buttonStyle(.glass)
+                            .glassButtonStyle()
                     }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -174,7 +174,7 @@ struct SessionBanner: View {
                             Text("The session keeps running on the server.").font(.caption).foregroundStyle(.secondary)
                         }
                         Button("Reconnect") { session.resume() }
-                            .buttonStyle(.glassProminent)
+                            .prominentGlassButtonStyle()
                     }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -187,9 +187,9 @@ struct SessionBanner: View {
                             Text(reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         }
                         Button("New Session") { state.connect(session.descriptor.target, isPrivate: session.descriptor.isPrivate) }
-                            .buttonStyle(.glassProminent)
+                            .prominentGlassButtonStyle()
                         Button("Close") { state.closeTab(session) }
-                            .buttonStyle(.glass)
+                            .glassButtonStyle()
                     }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -237,7 +237,7 @@ struct SessionFooter: View {
             // The terminal's folder, one click from a file manager there (⇧⌘O). A real button, so it
             // reads as one and is never squeezed away by the labels beside it.
             Button {
-                state.openFiles(session.descriptor.target, path: session.currentDirectory)
+                state.browse(session.descriptor.target, path: session.currentDirectory)
             } label: {
                 Label(session.currentDirectory.map(folderName).map { "Browse \($0)" } ?? "Browse Files",
                       systemImage: "folder")
@@ -246,7 +246,9 @@ struct SessionFooter: View {
             .controlSize(.small)
             .fixedSize()
             .disabled(session.phase.isDead)
-            .help("Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⇧⌘O)")
+            .help(state.browsesInFinder(session.descriptor.target)
+                  ? "Open \(session.currentDirectory ?? "the home folder") in Finder (⇧⌘O)"
+                  : "Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⇧⌘O)")
             Text(session.descriptor.target.displayName).foregroundStyle(.secondary)
                 .truncationMode(.middle)
                 .help("Host of this terminal")

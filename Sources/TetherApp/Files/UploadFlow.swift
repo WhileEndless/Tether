@@ -156,7 +156,7 @@ struct UploadSheet: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Upload") { upload() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
             }
         }
         .padding(22)

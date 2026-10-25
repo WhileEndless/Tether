@@ -298,6 +298,10 @@ public final class TransferManager {
             item.state = .cancelled
             item.finishedAt = Date()
             item.completion?(item)
+        } else if item.state == .running {
+            // Still checking the name on the server: the copy will not start (`start`).
+            item.state = .cancelled
+            item.finishedAt = Date()
         }
     }
 
@@ -367,9 +371,52 @@ public final class TransferManager {
                 args += ["--", "\(host):\(item.remotePath)", item.localURL.path]
             }
         }
-        let job = ScpJob(item: item) { _ in done() }
-        jobs[item.id] = job
-        job.start(executable: executable, arguments: args, environment: env)
+        let launch: @MainActor (_ cleanUp: @escaping () -> Void) -> Void = { [weak self] cleanUp in
+            guard let self, item.state == .running else { done(); return }
+            let job = ScpJob(item: item) { job in
+                if !job.succeeded { cleanUp() }
+                done()
+            }
+            self.jobs[item.id] = job
+            job.start(executable: executable, arguments: args, environment: env)
+        }
+        // An upload to a server under a new name: only when nothing has that name right before the
+        // copy starts is a partial copy removed after a failure (it is then this copy's own).
+        if item.direction == .upload, let name = item.remoteName, !item.target.isLocal {
+            let fs = RemoteFileSystem(executor: RemoteExecutor(target: item.target, options: options))
+            let path = item.uploadedPath
+            Task { @MainActor in
+                let free = (try? await fs.uniqueNames(in: item.remotePath, for: [name]))?.first == name
+                launch(free ? { Task { try? await fs.delete(path) } } : {})
+            }
+            return
+        }
+        launch(partialCleanup(for: item))
+    }
+}
+
+extension TransferManager {
+    /// What a cancelled or failed copy leaves behind is removed — only a file or folder this copy
+    /// created: a download into a name that did not exist when it started, an upload under a name
+    /// (`remoteName`) that was still free when it started. Nothing that was there before is touched.
+    func partialCleanup(for item: TransferItem) -> () -> Void {
+        let fm = FileManager.default
+        switch item.direction {
+        case .download:
+            var isDir: ObjCBool = false
+            let exists = fm.fileExists(atPath: item.localURL.path, isDirectory: &isDir)
+            // Into an existing folder: scp creates the file inside it.
+            let made = exists && isDir.boolValue
+                ? item.localURL.appendingPathComponent((item.remotePath as NSString).lastPathComponent)
+                : item.localURL
+            guard !fm.fileExists(atPath: made.path) else { return {} }
+            return { try? fm.removeItem(at: made) }
+        case .upload:
+            guard item.remoteName != nil else { return {} }
+            let path = item.uploadedPath
+            guard item.target.isLocal, !fm.fileExists(atPath: path) else { return {} }   // servers: see `start`
+            return { try? fm.removeItem(atPath: path) }
+        }
     }
 }
 
@@ -381,6 +428,8 @@ final class ScpJob: TransferJob {
     private var bridge: ScpBridge?
     private var output = ""
     private var cancelled = false
+    /// The copy finished completely (set when the process ends).
+    private(set) var succeeded = false
     private let onFinish: (ScpJob) -> Void
 
     init(item: TransferItem, onFinish: @escaping (ScpJob) -> Void) {
@@ -431,6 +480,7 @@ final class ScpJob: TransferJob {
         } else if code == 0 {
             item.progress = 1
             item.state = .completed
+            succeeded = true
         } else {
             let lines = output.split(whereSeparator: { $0 == "\r" || $0 == "\n" })
                 .map { $0.trimmingCharacters(in: .whitespaces) }

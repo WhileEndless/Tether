@@ -93,6 +93,23 @@ final class WindowState {
         present(tab.id, mode: mode)
     }
 
+    /// "Browse" a terminal's folder: on this Mac in Finder (Settings ▸ General ▸ Tabs & Windows ▸
+    /// Browse folders of this Mac in Finder), elsewhere in a file manager tab.
+    func browse(_ target: ConnectionTarget, path: String? = nil) {
+        guard target.isLocal, model.settings.browseLocalInFinder else { openFiles(target, path: path); return }
+        // The folder itself in a Finder window (also for packages such as Foo.app, which `open`
+        // would launch); a folder that is gone gives its nearest existing parent.
+        var folder = URL(fileURLWithPath: ((path ?? "~") as NSString).expandingTildeInPath, isDirectory: true)
+        var isDir: ObjCBool = false
+        while !(FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDir) && isDir.boolValue), folder.path != "/" {
+            folder.deleteLastPathComponent()
+        }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: folder.path)
+    }
+
+    /// Whether `browse` opens Finder for this target.
+    func browsesInFinder(_ target: ConnectionTarget) -> Bool { target.isLocal && model.settings.browseLocalInFinder }
+
     /// Shows a file tab: selects it where it is open, or brings it here from the background.
     func show(_ tab: FileTab) {
         if !model.workspaces.focus(tab.id) { present(tab.id, mode: .tab) }
@@ -241,8 +258,9 @@ final class WindowState {
         }
         if !session.phase.isOnline {
             // Never connected: nothing to keep, so nothing is left behind on the server either.
-            // (A session that was online and lost its connection keeps running there.)
-            model.sessions.close(session.id, killRemote: !session.wasOnline)
+            // A session that was online and lost its connection, or one restored or opened to
+            // attach to an existing server session, keeps running there.
+            model.sessions.close(session.id, killRemote: !session.mayHoldServerWork)
             return
         }
         if !model.settings.confirmCloseOnlineSessions {

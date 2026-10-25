@@ -4,6 +4,8 @@ APP          := dist/Tether.app
 VERSION      := $(shell tr -d '[:space:]' < VERSION)
 ZIP          := dist/Tether-$(VERSION).zip
 INSTALL_DIR  ?= /Applications
+# `make install INSTALL_DIR=~/Applications`: the shell leaves ~ alone after =, so expand it here.
+override INSTALL_DIR := $(patsubst ~%,$(HOME)%,$(INSTALL_DIR))
 NOTES        := release-notes/v$(VERSION).md
 
 .DEFAULT_GOAL := app
@@ -46,7 +48,8 @@ demo: ## Open the app with synthetic demo data (your data is not used). SHOTS=1 
 	rm -rf "$$D" "$$T"; defaults delete tether.demo >/dev/null 2>&1; true
 
 install: app ## Build and copy Tether.app to /Applications (INSTALL_DIR=… to change)
-	@if pgrep -xq Tether; then echo "Quit Tether first, then run make install again."; exit 1; fi
+	@if pgrep -qf "$(INSTALL_DIR)/Tether.app/Contents/MacOS/Tether"; then echo "Quit Tether first, then run make install again."; exit 1; fi
+	mkdir -p "$(INSTALL_DIR)"
 	rm -rf "$(INSTALL_DIR)/Tether.app"
 	ditto $(APP) "$(INSTALL_DIR)/Tether.app"
 	@echo "Installed to $(INSTALL_DIR)/Tether.app"
@@ -55,7 +58,8 @@ uninstall: ## Remove Tether.app from /Applications (settings and recordings are 
 	rm -rf "$(INSTALL_DIR)/Tether.app"
 	@echo "Removed. Your data is still in ~/Library/Application Support/Tether."
 
-zip: app ## Package dist/Tether-<version>.zip for a GitHub release
+zip: ## Package dist/Tether-<version>.zip for a GitHub release (Apple silicon and Intel)
+	UNIVERSAL=1 scripts/build-app.sh release
 	rm -f $(ZIP)
 	ditto -c -k --keepParent $(APP) $(ZIP)
 	@echo "Created $(ZIP)"

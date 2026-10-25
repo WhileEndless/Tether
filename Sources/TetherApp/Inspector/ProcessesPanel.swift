@@ -24,6 +24,13 @@ struct ProcessesPanel: View {
                 TextField("Filter processes", text: $search).textFieldStyle(.roundedBorder)
                 Button { Task { await monitor.refreshProcesses() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
+                Button {
+                    let shown = rows
+                    ExportPanel.save(title: "Export Processes", baseName: "processes", formats: MonitorExport.Format.table) { MonitorExport.processes(shown, format: $0) }
+                } label: { Image(systemName: "square.and.arrow.up") }
+                    .buttonStyle(.borderless)
+                    .disabled(rows.isEmpty)
+                    .help("Export the processes shown as CSV")
                 Menu {
                     Button("Terminate (TERM)") { askSignal("TERM") }
                     Button("Kill (KILL)", role: .destructive) { askSignal("KILL") }

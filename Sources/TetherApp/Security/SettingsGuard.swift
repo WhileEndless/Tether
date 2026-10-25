@@ -60,7 +60,7 @@ struct GuardedPathRow: View {
                         model.guardedSetting(keyPath, reason: "change the \(title.lowercased())") { _, _ in true }.wrappedValue = value
                     }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                 }
             }
             .padding(22)

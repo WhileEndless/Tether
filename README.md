@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.4.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.5.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.4.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.5.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -34,7 +34,7 @@ Search across every terminal, the archive and recordings.
   - **Neither** → a plain login shell, with automatic reconnects and a local transcript.
 - **Clear states.** *Online*, *Waiting* (connection lost: history stays visible, input is paused) and *Dead* (the remote session is confirmed gone: read-only and archived). A lost network is detected immediately, and a stalled server within seconds. Tabs reattach when the network returns, and also after the app is quit or crashes.
 - **Background sessions.** Close a tab and keep its session running in the background. Your own tmux sessions on a server are listed too, and you can attach to them. Leftover sessions can be cleaned up.
-- **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex and opencode show the name of their session — the one you gave it or the one the agent chose — on server sessions and on open tabs, and whether Claude Code is working. Names come from the agents' own files on the server (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
+- **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex and opencode show the name of their session — the one you gave it or the one the agent chose — on server sessions and on open tabs, and whether Claude Code is working. Tabs you have not renamed take the agent session's name. Names come from the agents' own files on the server (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
 - **Save a session** with ⌘S (*File ▸ Save Session…*): everything it has shown, including output no longer in memory (read from its recording), as plain text or as the raw output with colors. Tether remembers the folder and format you chose last.
 
 **Passwords, Touch ID and sudo**
@@ -46,7 +46,7 @@ Search across every terminal, the archive and recordings.
 
 **Security**
 - **App Lock** (off by default): Touch ID or the Mac password, or a separate Tether password. Every window is covered until Tether is unlocked; sessions keep running meanwhile. Coming back to Tether asks for Touch ID right away. Optionally locks when the Mac sleeps or its screen locks; ⌃⌘L or the toolbar's lock button locks at once.
-- **Encrypted recordings** (off by default, a simple on/off switch): AES-256-GCM, hardware accelerated, with the key kept behind your Tether password (set when you turn it on, typed twice). Turning it on encrypts every recording, existing and compressed ones too; turning it off decrypts them again. Search, transcripts and scrolling back work as usual. Forgot the password? *Reset* (after typing RESET and the Mac's own check) removes it and the recordings nobody can open any more, and keeps everything else.
+- **Encrypted recordings** (off by default, a simple on/off switch): AES-256-GCM, hardware accelerated, with the key kept behind your Tether password (set when you turn it on, typed twice). Turning it on encrypts every recording, existing and compressed ones too; turning it off decrypts them again. While Tether is locked, output and command history are still kept: they are sealed to the key's public half, and only unlocking opens them. Search, transcripts and scrolling back work as usual. Forgot the password? *Reset* (after typing RESET and the Mac's own check) removes it and the recordings nobody can open any more, and keeps everything else.
 - Security settings are also kept in the keychain, so other programs cannot quietly switch them off; weakening one asks for Touch ID or the Mac password.
 
 **Windows servers**
@@ -102,12 +102,13 @@ Search across every terminal, the archive and recordings.
   - per-interface download/upload rates, addresses, MAC and link speed
   - real interfaces first, virtual ones folded away
 - System, auth and kernel logs, logged-in users, and connections (SSH detected by sshd's real ports).
+- Every table exports as CSV (processes, listening ports, logged-in users, TCP connections, services, containers, pods, GPUs, traffic by process); the command history also as JSON.
 - Monitoring streams over one channel and only runs while something is visible.
 
 **Files**
 - Remote file browser as a tab, a panel or a full window, with drag and drop in both directions, Quick Look and details.
 - Directories you have visited open instantly from a cache and refresh in the background, keeping scroll position and selection.
-- *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*.
+- *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*. In a terminal of this Mac, Browse opens the folder in Finder (or Tether's file manager, Settings ▸ General).
 - Transfers show what went where, speed, amount transferred and ETA. Many files travel as one packed stream (tar on both ends, nothing written to disk in between); others are copied several at a time. Both are configurable.
 - **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead. In local terminals (this Mac) nothing is copied: the file's own path is typed (a pasted image is saved as a PNG first, and kept for a week).
 - Copy files in the file manager and paste them in Finder (and the other way round). Bulk move, copy, permissions, compress, rename and delete.
@@ -118,6 +119,7 @@ Search across every terminal, the archive and recordings.
 - Results show highlighted context. Double-click a result to open the terminal (or transcript) at that line; the terminal keeps the search, so ⌘G / ⇧⌘G step through the other matches there.
 - Copy lines, matches or ranges. Export results as text, CSV or JSON, or export full transcripts.
 - Long sessions are covered too: output that was dropped from memory is searched in the recording, without duplicates.
+- The text is what the terminal showed: full-screen programs (vim, less, htop) leave nothing behind, progress bars and spinners count once in their final state, and programs that redraw everything (Claude Code) appear once, not once per redraw. The same goes for plain-text export and Save Session.
 - A progress bar shows which source is being searched, and you can stop at any time. Compressed recordings are skipped unless you include them.
 
 **Long sessions and the menu bar**
@@ -128,9 +130,11 @@ Search across every terminal, the archive and recordings.
 - Monitoring pauses while no Tether window is visible, and recordings are written in large batches to spare the SSD.
 
 **Local backups.**
-- Every session's output is recorded locally and can be replayed read-only.
-- Recordings older than 7 days are compressed (LZFSE, typically 5–10× smaller).
-- The 1 GB limit (default) removes the oldest recordings first.
+- Every session's output is recorded locally and can be replayed read-only, at the size the terminal had.
+- Long sessions are compressed while they run, in pieces of 16 MB (default); the latest output stays uncompressed, so scrolling back stays fast. Recordings older than 7 days are compressed as a whole (LZFSE, typically 5–10× smaller).
+- The 1 GB limit (default) removes the oldest recordings first; a session holding more than half of it loses its own oldest output before any other recording goes.
+- Programs cannot erase the history on screen (`clear`, Claude Code's redraws) unless you allow it (Settings ▸ Terminal); the recording keeps everything either way.
+- What is kept where, for how long and what goes first: [docs/data-storage.md](docs/data-storage.md).
 - Only a configurable number of lines stays in memory. Older output is opened from disk with "Open Full History", which loads large recordings in slices.
 
 ## Keyboard shortcuts
@@ -160,15 +164,15 @@ Menu shortcuts can be changed in System Settings ▸ Keyboard ▸ Keyboard Short
 
 ### Requirements
 
-- macOS 26 or later. Release downloads are built for Apple silicon; on an Intel Mac, build from source.
-- To build: Xcode 26 or the matching Command Line Tools (Swift 6.2). Check with `swift --version`.
+- macOS 14.4 (Sonoma) or later. Release downloads run on Apple silicon and Intel Macs. On macOS 26 Tether uses Liquid Glass; earlier systems get the standard look.
+- To build: Xcode 26 or its Command Line Tools (Swift 6.2), which is what Tether is built and tested with. Xcode 16 (Swift 6.0, needed on macOS 14) is meant to work too, without Liquid Glass, but is not tested. Check with `swift --version`.
 - On servers: nothing. tmux or GNU screen make sessions persistent if they are there; `tar` (present almost everywhere) speeds up transfers of many files.
 
 ### From a release
 
 1. Download `Tether-<version>.zip` from [Releases](https://github.com/WhileEndless/tether/releases) and unzip it.
 2. Move `Tether.app` to `/Applications`.
-3. The app is not notarized yet, so macOS blocks the first launch. Either **right-click Tether.app ▸ Open ▸ Open**, or allow it in **System Settings ▸ Privacy & Security ▸ Open Anyway**. From a terminal you can instead run:
+3. The app is not notarized yet, so macOS blocks the first launch. Allow it in **System Settings ▸ Privacy & Security ▸ Open Anyway** (on macOS 14 you can also **right-click Tether.app ▸ Open ▸ Open**). From a terminal you can instead run:
    ```sh
    xattr -dr com.apple.quarantine /Applications/Tether.app
    ```
@@ -178,8 +182,10 @@ Menu shortcuts can be changed in System Settings ▸ Keyboard ▸ Keyboard Short
 ```sh
 git clone https://github.com/WhileEndless/tether.git
 cd tether
-make install          # builds a release and copies it to /Applications
+make install          # builds a release for this Mac and copies it to /Applications
 ```
+
+`make install INSTALL_DIR="$HOME/Applications"` installs for your user only. `make zip` builds the release download (Apple silicon and Intel in one app).
 
 Or `make run` to build and open it from `dist/` without installing. A build made on your own Mac is not quarantined, so it opens without the warning.
 
@@ -240,8 +246,9 @@ Tether is a Swift package split into small modules:
 | `SSHTransport` | ssh/scp arguments, ControlMaster, askpass bridge, remote command runner |
 | `TmuxControl` | tmux control mode protocol parser and command encoder |
 | `SessionKit` | Terminal sessions, remote bootstrap, persistence and reconnect state machine |
+| `TerminalText` | What a terminal shows without a view: the scrollback rule and the text of recordings (for search and export) |
 | `TerminalUI` | SwiftTerm-based terminal view, themes, key mappings |
-| `RecordingKit` | Session transcripts and storage quota |
+| `RecordingKit` | Session transcripts in compressed parts, encryption, storage quota |
 | `FileTransferKit` | Remote file listing and scp transfers |
 | `MonitorKit` | System, process, log and connection probes |
 | `KeySetupKit` | Key generation and installation |
@@ -259,7 +266,7 @@ When a terminal connects, Tether runs a short POSIX `sh` script on the server. I
 
 Tether talks only to the hosts you connect to. Settings, host groups, recordings and the command history stay in `~/Library/Application Support/Tether` (recordings and the history can be encrypted, see Security). Passwords stay in your login keychain.
 
-Tether installs nothing on your hosts. Every script it runs there — when, what it reads, what it changes and how it ends — is listed in [docs/remote-commands.md](docs/remote-commands.md) and in Settings ▸ Monitoring ▸ What Runs on Hosts.
+Tether installs nothing on your hosts. Every script it runs there — when, what it reads, what it changes and how it ends — is listed in [docs/remote-commands.md](docs/remote-commands.md) and in Settings ▸ Monitoring ▸ What Runs on Hosts. What Tether keeps on this Mac, where, and for how long is described in [docs/data-storage.md](docs/data-storage.md).
 
 Nothing else is sent anywhere: no analytics, no telemetry. At launch Tether asks GitHub once whether a newer release exists (Settings ▸ General can turn this off); if GitHub cannot be reached, nothing happens.
 

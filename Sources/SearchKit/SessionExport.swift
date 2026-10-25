@@ -1,13 +1,14 @@
 import Foundation
 import CryptoKit
 import RecordingKit
+import TerminalText
 
 /// Saves a whole session to a file (⌘S). Recordings are streamed chunk by chunk, so even a very
 /// long session is written without holding it in memory.
 public enum SessionExport {
     public enum Format: String, CaseIterable, Identifiable, Sendable {
-        /// What the terminal shows, as plain text: older output from the recording, then the
-        /// scrollback and screen.
+        /// What the terminal showed, as plain text: the recording's text (`ScreenText`), or the
+        /// scrollback and screen when there is no recording.
         case text
         /// The recording as it was received, with colors and control sequences (`cat` replays it).
         case raw
@@ -22,22 +23,24 @@ public enum SessionExport {
         public var fileExtension: String { self == .text ? "txt" : "log" }
     }
 
-    /// Writes plain text: the recording's lines without its last `dropLast` lines (they are still
-    /// on screen and come with `lines`), then `lines`. With no recording, only `lines`.
-    /// `length` stops reading the recording there (what it held when `lines` were taken).
+    /// Writes plain text: the recording's text as the terminal showed it (`ScreenText`), without
+    /// its last lines that are still in memory and come with `lines`, then `lines`. With no
+    /// recording, only `lines`. Where the two meet is found by content (`HistorySeam`); `dropLast`
+    /// (the count of lines in memory) is used when it cannot be. `length` stops reading the
+    /// recording there (what it held when `lines` were taken).
     public static func writeText(recording: URL?, length: Int? = nil, dropLast: Int, lines: [String], to url: URL,
                                  key: SymmetricKey? = RecordingCrypto.key) throws {
         try write(to: url) { out in
             if let recording {
-                // Lines are held back `dropLast` deep, so the ones also in `lines` are never written.
+                // Lines are held back deep enough to find the seam, so none also in `lines` is written.
+                let depth = dropLast > 0 ? dropLast * 2 + HistorySeam.margin : 0
                 var held: [String] = []
-                held.reserveCapacity(min(dropLast, 100_000) + 1)
                 var start = 0
-                var converter = PlainTextConverter()
+                let text = ScreenText()
                 func take(_ new: [String]) throws {
                     for line in new {
                         held.append(line)
-                        if held.count - start > dropLast {
+                        if held.count - start > depth {
                             try out.write(contentsOf: Data((held[start] + "\n").utf8))
                             start += 1
                         }
@@ -46,9 +49,12 @@ public enum SessionExport {
                     if start > 4_096 { held.removeFirst(start); start = 0 }
                 }
                 try forEachChunk(of: recording, length: length, key: key) { chunk in
-                    try take(converter.feed(chunk))
+                    try take(text.feed(chunk))
                 }
-                if let last = converter.finish() { try take([last]) }
+                try take(text.finish())
+                let tail = Array(held[start...])
+                let cut = dropLast > 0 ? HistorySeam.overlap(tail: tail, memoryHead: lines, expected: dropLast) : 0
+                for line in tail.dropLast(cut) { try out.write(contentsOf: Data((line + "\n").utf8)) }
             }
             for line in lines { try out.write(contentsOf: Data((line + "\n").utf8)) }
         }

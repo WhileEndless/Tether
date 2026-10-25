@@ -79,7 +79,7 @@ struct TranscriptWindow: View {
                         let s = model.sessions.open(item.target)
                         openWindow(id: "workspace", value: s.id)
                     }
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                 }
             }
             .font(.caption)

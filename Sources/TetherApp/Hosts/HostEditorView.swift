@@ -159,7 +159,7 @@ struct HostEditorView: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(request.alias == nil ? "Add Host" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .disabled(alias.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding()

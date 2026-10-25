@@ -177,7 +177,7 @@ struct WorkspaceToolbar: ToolbarContent {
 
             Button {
                 guard let session = state.session else { return }
-                state.openFiles(session.descriptor.target, path: session.currentDirectory)
+                state.browse(session.descriptor.target, path: session.currentDirectory)
             } label: {
                 Label("Browse Files Here", systemImage: "folder")
             }

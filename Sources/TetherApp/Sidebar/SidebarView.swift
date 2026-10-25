@@ -503,6 +503,8 @@ private struct ServerSessionRow: View {
 struct PaneSummary: View {
     let pane: RemoteSessionPane
     var showPath = true
+    /// The tab's title already names the agent session: only whether it is working is shown.
+    var stateOnly = false
 
     var body: some View {
         HStack(spacing: 3) {
@@ -512,12 +514,47 @@ struct PaneSummary: View {
                     .foregroundStyle(agent.isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     .help(agent.isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
             }
-            Text(showPath ? pane.summary : pane.displayCommand)
+            Text(stateOnly ? (pane.agent?.isWorking == true ? "working" : "waiting") : showPath ? pane.summary : pane.displayCommand)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+    }
+}
+
+extension View {
+    /// A middle click on this sidebar row closes it, as its close button would (`TabBarCenter`).
+    func middleClickCloses(_ item: SidebarItem) -> some View { modifier(SidebarMiddleClick(item: item)) }
+}
+
+private struct SidebarMiddleClick: ViewModifier {
+    @Environment(WindowState.self) private var state
+    let item: SidebarItem
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .background(SidebarRowMarker(workspace: state.workspaceID, item: item))
+    }
+}
+
+/// An invisible view in a sidebar row that says which row it is: a middle click finds it inside the
+/// table row under the pointer (`TabBarCenter.closeTab`), whatever the list has scrolled to.
+struct SidebarRowMarker: NSViewRepresentable {
+    let workspace: UUID
+    let item: SidebarItem
+
+    func makeNSView(context: Context) -> MarkerView { MarkerView() }
+    func updateNSView(_ view: MarkerView, context: Context) {
+        view.workspace = workspace
+        view.item = item
+    }
+
+    final class MarkerView: NSView {
+        var workspace: UUID?
+        var item: SidebarItem?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 
@@ -818,13 +855,14 @@ struct SessionRow: View {
         }
             // A coding agent in the tab: its session name, under the title.
             if let pane = agentPane {
-                PaneSummary(pane: pane, showPath: false)
+                PaneSummary(pane: pane, showPath: false, stateOnly: session.agentTitle != nil)
                     .padding(.leading, 22)
             }
         }
         .padding(.leading, 22)
         .tag(SidebarItem.session(session.id))
         .id(SidebarItem.session(session.id))
+        .middleClickCloses(.session(session.id))
         .help(elsewhere.map { "Open in \($0) — click to go there · right-click to move it here" }
               ?? (inBackground ? "In the background — click to open in a tab · double-click to rename" : "Double-click to rename"))
     }
@@ -935,7 +973,7 @@ struct SessionContextMenu: View {
                 if let source { model.workspaces.closeIfEmpty(source) }
             }
         }
-        Button("Browse Files Here") { state.openFiles(session.descriptor.target, path: session.currentDirectory) }
+        Button("Browse Files Here") { state.browse(session.descriptor.target, path: session.currentDirectory) }
         SearchInSessionButton(session: session)
         Button("Rename…") { state.renamingSession = session }
         Menu("Color") {
@@ -997,10 +1035,12 @@ struct FileTabRow: View {
             if !open {
                 Text("background").font(.caption2).foregroundStyle(.secondary)
             }
+            Spacer(minLength: 0)
         }
         .padding(.leading, 22)
         .tag(SidebarItem.files(tab.id))
         .id(SidebarItem.files(tab.id))
+        .middleClickCloses(.files(tab.id))
         .help(elsewhere.map { "Open in \($0) — click to go there" }
               ?? (open ? "File manager tab" : "File manager in the background — click to open"))
     }

@@ -169,13 +169,24 @@ final class SearchModel {
                 if !statusMatches(status) { continue }
                 if let path = s.recordingURL?.path { usedRecordings.insert(path) }
                 guard let view = TerminalRegistry.shared.existingView(for: s.id) else { continue }
-                let (base, lines, logical) = view.scrollbackText()
+                // A full-screen program (vim, less) is up: memory holds only its screen, so the
+                // session's text all comes from the recording (without the program's screens).
+                if view.showsAlternateScreen, let url = s.flushedRecordingURL() {
+                    sources.append(SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
+                                                title: s.displayTitle, host: s.descriptor.target.displayName,
+                                                date: s.startedAt, status: status))
+                    continue
+                }
+                let (base, lines, _) = view.scrollbackText()
                 // Older output no longer in memory is searched in the session's recording.
                 if base > 0, let url = s.flushedRecordingURL() {
                     var earlier = SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
                                                title: "\(s.displayTitle) — earlier output", host: s.descriptor.target.displayName,
                                                date: s.startedAt, status: status)
-                    earlier.skipTrailingLines = logical
+                    // Logical lines in memory (wrapped rows joined, empty rows below the cursor left out).
+                    let memory = view.logicalText().lines
+                    earlier.skipTrailingLines = memory.count
+                    earlier.memoryHead = Array(memory.prefix(64))
                     sources.append(earlier)
                 }
                 sources.append(SearchSource(id: "live-\(s.id)", kind: .live(sessionID: s.id, lineBase: base),
@@ -255,8 +266,15 @@ final class SearchModel {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "tether-search.\(format.fileExtension)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let text = SearchExport.render(groups.map { (source: $0.0, matches: $0.1) }, format: format, includeContext: context)
-        try? Data(text.utf8).write(to: url)
+        let list = groups.map { (source: $0.0, matches: $0.1) }
+        // Rendered off the main thread and written whole (never half a file); a failure is shown.
+        Task.detached(priority: .utility) {
+            do {
+                try Data(SearchExport.render(list, format: format, includeContext: context).utf8).write(to: url, options: [.atomic])
+            } catch {
+                _ = await MainActor.run { NSAlert(error: error).runModal() }
+            }
+        }
     }
 
     /// Saves the full plain text of every source with matches into a folder.
@@ -272,12 +290,25 @@ final class SearchModel {
             // Existing files are never replaced: a taken name becomes "name 2.txt".
             let names = sources.map { String((($0.host + " - " + $0.title).replacingOccurrences(of: "/", with: "-")).prefix(120)) + ".txt" }
             let free = LocalFiles.uniqueNames(in: dir, for: names)
+            var failed: [String] = []
             for (s, name) in zip(sources, free) {
-                let lines: [String]
-                if let l = s.lines { lines = l }
-                else if case .recording(let url, _) = s.kind { lines = (try? SearchEngine.readLines(url)) ?? [] }
-                else { lines = [] }
-                try? Data(lines.joined(separator: "\n").utf8).write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+                do {
+                    let lines: [String]
+                    if let l = s.lines { lines = l }
+                    else if case .recording(let url, _) = s.kind { lines = try SearchEngine.readLines(url) }
+                    else { lines = [] }
+                    try Data(lines.joined(separator: "\n").utf8).write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+                } catch {
+                    failed.append("\(name): \(error.localizedDescription)")
+                }
+            }
+            guard !failed.isEmpty else { return }
+            let report = failed.prefix(10).joined(separator: "\n")
+            _ = await MainActor.run {
+                let alert = NSAlert()
+                alert.messageText = "Some transcripts could not be exported"
+                alert.informativeText = report
+                alert.runModal()
             }
         }
     }

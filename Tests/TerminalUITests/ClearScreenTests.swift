@@ -104,4 +104,13 @@ import TetherCore
         feed(view, "\u{1b}[H\u{1b}[2J\u{1b}[H\u{1b}[2J$ ")
         #expect(view.scrollbackText().lines.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } == ["$"])
     }
+
+    /// A clear cut in two by the network is held until it is whole (the scrollback rule must see it).
+    @Test func partialEraseIsHeldBack() {
+        #expect(TetherTerminalView.partialEraseStart(Array("abc\u{1b}[".utf8)) == 3)
+        #expect(TetherTerminalView.partialEraseStart(Array("abc\u{1b}[3".utf8)) == 3)
+        #expect(TetherTerminalView.partialEraseStart(Array("abc\u{1b}".utf8)) == 3)
+        #expect(TetherTerminalView.partialEraseStart(Array("abc\u{1b}[31m".utf8)) == nil)
+        #expect(TetherTerminalView.partialEraseStart(Array("abc\u{1b}[1".utf8)) == nil)
+    }
 }

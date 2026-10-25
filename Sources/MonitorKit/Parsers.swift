@@ -221,14 +221,15 @@ public enum ProbeParser {
     public static func gpus(nvidia: [String]?, rocm: [String]?, amdSysfs: [String]?) -> [GPUInfo] {
         var result: [GPUInfo] = []
         for line in nvidia ?? [] {
-            // index, name, utilization.gpu, memory.used, memory.total, temperature.gpu, power.draw, power.limit
+            // index, name, utilization.gpu, memory.used, memory.total, temperature.gpu, power.draw, power.limit, uuid
             let f = line.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
             guard f.count >= 8, let index = Int(f[0]) else { continue }
             result.append(GPUInfo(index: index, vendor: .nvidia, name: f[1],
                                   utilization: number(f[2]).map { $0 / 100 },
                                   memoryUsed: number(f[3]).map { Int64($0 * 1_048_576) },
                                   memoryTotal: number(f[4]).map { Int64($0 * 1_048_576) },
-                                  temperature: number(f[5]), power: number(f[6]), powerLimit: number(f[7])))
+                                  temperature: number(f[5]), power: number(f[6]), powerLimit: number(f[7]),
+                                  uuid: f.count > 8 && !f[8].isEmpty ? f[8] : nil))
         }
         if let rocm, let data = rocm.joined(separator: "\n").data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {

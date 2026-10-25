@@ -47,7 +47,7 @@ struct AskPassPromptView: View {
                         .keyboardShortcut(.cancelAction)
                     Button("Trust and Continue") { model.resolvePrompt(prompt, answer: "yes", save: false) }
                         .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                         // A fingerprint that was checked and does not match must not be accepted by accident.
                         .disabled(!armed || (unknownKey.map { k in !expected.trimmingCharacters(in: .whitespaces).isEmpty && !k.matches(expected) } ?? false))
                 }
@@ -84,7 +84,7 @@ struct AskPassPromptView: View {
                         .keyboardShortcut(.cancelAction)
                     Button("Continue") { submit() }
                         .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.glassProminent)
+                        .prominentGlassButtonStyle()
                 }
             }
         }

@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import TetherCore
 import SSHTransport
+import RecordingKit
 
 /// Owns every open terminal session, the archive of dead ones, and restoring tabs on launch.
 @MainActor
@@ -227,7 +228,7 @@ public final class SessionManager {
 
     public func deleteArchived(_ id: UUID, deleteRecording: Bool) {
         if deleteRecording, let path = archive.first(where: { $0.id == id })?.recordingPath {
-            try? FileManager.default.removeItem(atPath: path)
+            RecordingStore.delete(path: path)     // compressed or not, with its parts
         }
         archive.removeAll { $0.id == id }
         archiveStore.saveSoon(archive)

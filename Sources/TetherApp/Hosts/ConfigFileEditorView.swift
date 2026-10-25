@@ -36,7 +36,7 @@ struct ConfigFileEditorView: View {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Save") { save() }
                     .keyboardShortcut("s")
-                    .buttonStyle(.glassProminent)
+                    .prominentGlassButtonStyle()
                     .disabled(text == original)
             }
             .padding()

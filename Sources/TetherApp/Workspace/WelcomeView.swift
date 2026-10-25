@@ -37,7 +37,7 @@ struct WelcomeView: View {
                 } label: {
                     Label("New Connection", systemImage: "bolt.fill").padding(.horizontal, 12)
                 }
-                .buttonStyle(.glassProminent)
+                .prominentGlassButtonStyle()
                 .controlSize(.large)
 
                 Button {
@@ -45,7 +45,7 @@ struct WelcomeView: View {
                 } label: {
                     Label("Local Terminal", systemImage: "laptopcomputer").padding(.horizontal, 12)
                 }
-                .buttonStyle(.glass)
+                .glassButtonStyle()
                 .controlSize(.large)
 
                 Button {
@@ -53,7 +53,7 @@ struct WelcomeView: View {
                 } label: {
                     Label("Search", systemImage: "text.magnifyingglass").padding(.horizontal, 12)
                 }
-                .buttonStyle(.glass)
+                .glassButtonStyle()
                 .controlSize(.large)
                 .help("Search every session and the archive (⇧⌘F)")
 
@@ -62,7 +62,7 @@ struct WelcomeView: View {
                 } label: {
                     Label("Add Host", systemImage: "plus").padding(.horizontal, 12)
                 }
-                .buttonStyle(.glass)
+                .glassButtonStyle()
                 .controlSize(.large)
             }
             .opacity(appeared ? 1 : 0)
@@ -136,7 +136,7 @@ struct HostCard: View {
             .contentShape(RoundedRectangle(cornerRadius: 14))
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 14))
+        .glassBackground(cornerRadius: 14, interactive: true)
         .scaleEffect(hovering ? 1.03 : 1)
         .animation(.snappy, value: hovering)
         .onHover { hovering = $0 }

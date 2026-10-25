@@ -55,6 +55,12 @@ struct KubernetesPanel: View {
                 Button { Task { await monitor.refreshKubernetes() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
                     .help("Refresh")
+                Button {
+                    ExportPanel.save(title: "Export Pods", baseName: "pods", formats: MonitorExport.Format.table) { MonitorExport.pods(pods, format: $0) }
+                } label: { Image(systemName: "square.and.arrow.up") }
+                    .buttonStyle(.borderless)
+                    .disabled(pods.isEmpty)
+                    .help("Export the pods shown as CSV")
             }
             .padding(.horizontal, 10).padding(.top, 10)
             HStack(spacing: 8) {

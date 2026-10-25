@@ -57,6 +57,36 @@ public enum AppPaths {
         return ensure(FileManager.default.temporaryDirectory.appendingPathComponent("tether", isDirectory: true), permissions: 0o700)
     }()
 
+    /// Removes what earlier runs left behind, once it is a day old: ssh connection logs (a crash
+    /// while connecting leaves them), copies of remote files made for Quick Look and dragging, and
+    /// the socket folders of test and demo runs and of their tmux servers. Only this user's own
+    /// folders are touched.
+    public static func removeLeftovers(now: Date = Date()) {
+        let fm = FileManager.default
+        let dayAgo = now.addingTimeInterval(-86_400)
+        func old(_ path: String) -> Bool {
+            ((try? fm.attributesOfItem(atPath: path)[.modificationDate]) as? Date).map { $0 < dayAgo } ?? false
+        }
+        let dir = socketDirectory.path
+        for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasPrefix("connect-") && name.hasSuffix(".log") {
+            let path = dir + "/" + name
+            if old(path) { try? fm.removeItem(atPath: path) }
+        }
+        // Copies of remote files made for Quick Look and dragging: one folder each.
+        let previews = previewDirectory.path
+        for name in (try? fm.contentsOfDirectory(atPath: previews)) ?? [] {
+            let path = previews + "/" + name
+            if old(path) { try? fm.removeItem(atPath: path) }
+        }
+        // Socket folders of test and demo runs, and the private tmux servers of self-tests.
+        let prefixes = ["tether-\(getuid())-dbg-", "tether-\(getuid())-tmux-"]
+        for name in (try? fm.contentsOfDirectory(atPath: "/tmp")) ?? [] where prefixes.contains(where: name.hasPrefix) {
+            let path = "/tmp/" + name
+            guard path != dir, isPrivateDirectory(path), old(path) else { continue }
+            try? fm.removeItem(atPath: path)
+        }
+    }
+
     /// A real directory owned by this user with no access for others (tightened if only the mode is off).
     static func isPrivateDirectory(_ path: String) -> Bool {
         var st = stat()

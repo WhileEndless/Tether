@@ -67,7 +67,7 @@ if [ "$1" = 1 ]; then
 fi
 if [ -n "$HAS_NVIDIA" ]; then
   echo "@@nvidia"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,uuid --format=csv,noheader,nounits 2>/dev/null
 fi
 if [ -n "$HAS_ROCM" ]; then
   echo "@@rocm"; rocm-smi --showproductname --showuse --showmeminfo vram --showtemp --showpower --json 2>/dev/null

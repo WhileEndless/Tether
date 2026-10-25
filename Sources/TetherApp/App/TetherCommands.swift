@@ -77,7 +77,7 @@ struct TetherCommands: Commands {
                 .shortcut(.newWindow)
             Divider()
             Button("Browse Files Here") {
-                if let t = active?.descriptor.target ?? window?.inspectedTarget { window?.openFiles(t, path: active?.currentDirectory) }
+                if let t = active?.descriptor.target ?? window?.inspectedTarget { window?.browse(t, path: active?.currentDirectory) }
             }
             .shortcut(.browseHere)
             .disabled(window?.inspectedTarget == nil)

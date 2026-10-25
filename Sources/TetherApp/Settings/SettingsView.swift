@@ -9,16 +9,16 @@ struct SettingsView: View {
 
     var body: some View {
         TabView {
-            Tab("General", systemImage: "gearshape") { GeneralSettings() }
-            Tab("Terminal", systemImage: "terminal") { TerminalSettings() }
-            Tab("Keyboard", systemImage: "keyboard") { KeyboardSettings() }
-            Tab("Sessions", systemImage: "arrow.triangle.2.circlepath") { SessionSettings() }
-            Tab("Recordings", systemImage: "record.circle") { RecordingSettings() }
-            Tab("Transfers", systemImage: "arrow.up.arrow.down.circle") { TransferSettings() }
-            Tab("Monitoring", systemImage: "gauge.with.dots.needle.33percent") { MonitoringSettings() }
-            Tab("Security", systemImage: "lock") { SecuritySettingsPane() }
-            Tab("Passwords", systemImage: "key") { PasswordSettings() }
-            Tab("SSH", systemImage: "lock.shield") { SSHSettings() }
+            GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
+            TerminalSettings().tabItem { Label("Terminal", systemImage: "terminal") }
+            KeyboardSettings().tabItem { Label("Keyboard", systemImage: "keyboard") }
+            SessionSettings().tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
+            RecordingSettings().tabItem { Label("Recordings", systemImage: "record.circle") }
+            TransferSettings().tabItem { Label("Transfers", systemImage: "arrow.up.arrow.down.circle") }
+            MonitoringSettings().tabItem { Label("Monitoring", systemImage: "gauge.with.dots.needle.33percent") }
+            SecuritySettingsPane().tabItem { Label("Security", systemImage: "lock") }
+            PasswordSettings().tabItem { Label("Passwords", systemImage: "key") }
+            SSHSettings().tabItem { Label("SSH", systemImage: "lock.shield") }
         }
         .frame(width: 620, height: 520)
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
@@ -53,6 +53,10 @@ private struct GeneralSettings: View {
                 .help("⌘T and New Session to Same Host: the folder the current tab's shell is in, or the home folder")
                 Toggle("Ask before closing an online session", isOn: $store.settings.confirmCloseOnlineSessions)
                 Toggle("Show archive in sidebar", isOn: $store.settings.showSidebarArchive)
+                Toggle("Name tabs after coding agent sessions", isOn: $store.settings.tabTitleFromAgent)
+                    .help("A tab running Claude Code, Codex or opencode (in tmux) takes the name of its session, unless you renamed the tab yourself")
+                Toggle("Browse folders of this Mac in Finder", isOn: $store.settings.browseLocalInFinder)
+                    .help("Browse (⇧⌘O) in a terminal of this Mac opens its folder in Finder; off, in Tether's file manager. Hosts always use the file manager.")
                 Picker("Sort sessions under a host", selection: $store.settings.sessionSortOrder) {
                     ForEach(SessionSortOrder.allCases) { Text($0.title).tag($0) }
                 }
@@ -113,6 +117,9 @@ private struct TerminalSettings: View {
                 Stepper("Lines kept in memory: \(store.settings.scrollbackLines.formatted())",
                         value: $store.settings.scrollbackLines, in: 1_000...200_000, step: 5_000)
                 Text("Older output stays in the session recording on disk: it is still searchable and can be opened with “Open Full History” when you scroll to the top. Fewer lines in memory keep long sessions light.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Programs may clear the scrollback", isOn: $store.settings.programsMayClearScrollback)
+                Text("Off: `clear`, and programs that redraw everything (Claude Code), clear the screen but never erase the history above it. On: they erase it as in other terminals. Either way the recording keeps everything, for search, export and the transcript, where repeated redraws appear once.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Bell", selection: $store.settings.bell) {
                     ForEach(BellMode.allCases) { Text($0.title).tag($0) }
@@ -353,6 +360,13 @@ private struct RecordingSettings: View {
                     Text("Until the limit is reached").tag(0)
                     ForEach([7, 30, 90, 365], id: \.self) { Text("\($0) days").tag($0) }
                 }
+                Picker("Compress long sessions while they run", selection: $store.settings.recordingPartMB) {
+                    Text("Never").tag(0)
+                    ForEach([8, 16, 32, 64], id: \.self) { mb in Text("Every \(Int64(mb * 1024 * 1024).byteString)").tag(mb) }
+                }
+                .help("A session's earlier output is compressed in pieces of this size while it runs; the latest output stays as it is, so scrolling back stays fast")
+                Toggle("When space runs out, shorten the largest session first", isOn: $store.settings.recordingShortenLargestFirst)
+                    .help("A session holding more than half of the storage limit loses its oldest output before any other recording is removed (sessions compressed while they run, in pieces; not with Never above)")
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: Double(total), total: Double(max(quota, 1)))
                         .animation(.smooth, value: total)
@@ -370,8 +384,12 @@ private struct RecordingSettings: View {
                     Button("Open Folder") { NSWorkspace.shared.open(AppPaths.recordingsDirectory) }
                     Spacer()
                     Button("Delete All Inactive…", role: .destructive) {
-                        RecordingStore.deleteAll()
-                        recordings = RecordingStore.all()
+                        Task {
+                            recordings = await RecordingStore.perform {
+                                RecordingStore.deleteAll()
+                                return RecordingStore.all()
+                            }
+                        }
                     }
                 }
                 ForEach(recordings.prefix(50)) { r in
@@ -629,7 +647,7 @@ private struct ReplacePasswordSheet: View {
                     if PasswordVault.setPassword(password, for: account) { dismiss() } else { failed = true }
                 }
                 .keyboardShortcut(.defaultAction)
-                .buttonStyle(.glassProminent)
+                .prominentGlassButtonStyle()
                 .disabled(password.isEmpty || password != repeated)
             }
         }

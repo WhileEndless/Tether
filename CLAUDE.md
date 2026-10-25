@@ -1,6 +1,6 @@
 # Tether — notes for AI assistants and contributors
 
-Tether is a native macOS (26+) SSH client written in Swift (SwiftPM, SwiftUI + AppKit, SwiftTerm).
+Tether is a native macOS (14.4+, Liquid Glass on 26) SSH client written in Swift (SwiftPM, SwiftUI + AppKit, SwiftTerm).
 This file is public: it is committed to GitHub like everything else.
 
 ## Hard rules
@@ -54,6 +54,10 @@ make check     # privacy + release notes + tests
 ```
 
 - Build with zero warnings.
+- The oldest macOS is 14.4 (`platforms` in Package.swift and `MIN_MACOS` in scripts/build-app.sh,
+  kept in step). Newer APIs need `#available` with a fallback, through the helpers in
+  `Sources/TetherApp/Shared/Styling.swift` (Liquid Glass buttons and backgrounds, symbol effects,
+  scroll geometry); symbols only in the macOS 26 SDK also go inside `#if compiler(>=6.2)`.
 - Parsers, protocol code and remote scripts get tests. Remote scripts are tested by running
   them with the local shell (`ConnectionTarget.local`) or through a fake `ssh` that executes
   its last argument.
@@ -74,8 +78,9 @@ build). Copy the ones the README uses to `docs/screenshots/`. Never take screens
 | `SSHTransport` | ssh/scp arguments, ControlMaster, askpass bridge, remote command runner |
 | `TmuxControl` | tmux control-mode parser and encoder |
 | `SessionKit` | Terminal sessions, bootstrap, persistence, reconnect, port forwards |
+| `TerminalText` | Headless terminal text: the scrollback rule shared with the view, recordings as the screen showed them |
 | `TerminalUI` | SwiftTerm view, themes, key mappings, pasteboard handling |
-| `RecordingKit` | Transcripts, quota, compression |
+| `RecordingKit` | Transcripts (in compressed parts), encryption (also while locked), quota |
 | `FileTransferKit` | Remote file system, scp and packed (tar stream) transfers |
 | `MonitorKit` | Host probes (CPU, memory, GPU, services, containers, ports, logs) |
 | `KeySetupKit` | Key generation and installation |
