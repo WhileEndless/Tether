@@ -33,6 +33,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let content = UNMutableNotificationContent()
         let host = session.descriptor.target.displayName
         switch attention {
+        case _ where session.descriptor.isPrivate:
+            // Notification Center keeps what it shows: a private tab's text is not given to it.
+            content.title = "Private tab"
+            content.body = "A program wants your attention"
         case .message(let n):
             content.title = n.title ?? session.displayTitle
             content.subtitle = n.title == nil ? host : "\(session.displayTitle) — \(host)"

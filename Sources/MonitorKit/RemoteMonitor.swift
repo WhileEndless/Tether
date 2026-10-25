@@ -21,6 +21,8 @@ public final class RemoteMonitor {
     }
 
     public let executor: RemoteExecutor
+    /// Traffic per process on this host (streamed only while someone looks).
+    public let traffic: ProcessTraffic
     public private(set) var snapshot: SystemSnapshot?
     public private(set) var history: [Sample] = []
     public private(set) var processes: [ProcessEntry] = []
@@ -57,6 +59,7 @@ public final class RemoteMonitor {
 
     public init(executor: RemoteExecutor) {
         self.executor = executor
+        traffic = ProcessTraffic(executor: executor)
     }
 
     // MARK: Interest
@@ -270,6 +273,33 @@ public final class RemoteMonitor {
         (try? await executor.output(RemoteScript(#"journalctl -u "$1" -n "$2" --no-pager -o short-iso 2>&1"#,
                                                  windows: WindowsProbeScripts.serviceLogs),
                                     arguments: [unit, String(lines)], timeout: 30, purpose: "logs")) ?? ""
+    }
+
+    /// The name the host gives an address (for "where does this connection go"); nil when it has none.
+    public func hostName(of address: String) async -> String? {
+        guard !frozen, !address.isEmpty, address != "*" else { return nil }
+        let r = await executor.run(RemoteScript(ProbeScripts.reverseLookup, windows: WindowsProbeScripts.reverseLookup),
+                                   arguments: [address], timeout: 10, purpose: "monitor")
+        let name = r.output.split(whereSeparator: \.isNewline).first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
+        return name.isEmpty || name == address ? nil : name
+    }
+
+    /// Stops a running command and everything it started (`ProbeScripts.stopCommand`). Returns a
+    /// message when something could not be stopped, nil when all of it ended.
+    public func stopCommand(_ processes: [CommandProcess], shellPid: Int?, signal: String) async -> String? {
+        guard !frozen, let leader = processes.first else { return nil }
+        let args = [signal, String(shellPid ?? 0), leader.group.map(String.init) ?? ""] + processes.map { String($0.pid) }
+        let r = await executor.run(RemoteScript(ProbeScripts.stopCommand, windows: WindowsProbeScripts.stopCommand),
+                                   arguments: args, timeout: 20, purpose: "kill")
+        guard r.succeeded else {
+            let msg = DiagnosticLog.tail(r.errorOutput)
+            return msg.isEmpty ? "Stopping failed with code \(r.status)." : msg
+        }
+        let alive = r.output.split(whereSeparator: \.isNewline).filter { $0.hasPrefix("alive ") }.count
+        guard alive > 0 else { return nil }
+        return signal == "KILL"
+            ? "\(alive) process\(alive == 1 ? "" : "es") could not be stopped (owned by another user, e.g. started with sudo)."
+            : "\(alive) process\(alive == 1 ? "" : "es") still running after \(signal) — use Kill to end them at once."
     }
 
     /// Sends a signal to a remote process. Returns an error message on failure.

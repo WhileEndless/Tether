@@ -89,6 +89,8 @@ struct Shortcut: Identifiable {
     static let newTab = Shortcut("New Tab to Same Host", .connections, k("t"),
                                  note: "Opens a new session to the host of the current tab; in a file manager, another file manager")
     static let newLocalTerminal = Shortcut("New Local Terminal", .connections, k("t", [.command, .option]))
+    static let newPrivateTab = Shortcut("New Private Tab", .connections, k("t", [.command, .option, .shift]),
+                                        note: "Nothing is kept on this Mac: no recording, archive or command history")
     static let newWindow = Shortcut("New Window", .connections, k("n", [.command, .shift]))
     static let addHost = Shortcut("Add Host…", .connections, k("h", [.command, .shift]))
     static let editConfig = Shortcut("Edit SSH Config File…", .connections, k("h", [.command, .option, .shift]))
@@ -163,13 +165,15 @@ struct Shortcut: Identifiable {
     static let hostPanel = Shortcut("Show / Hide Host Panel", .view, k("i", [.command, .option]))
     static let showArchive = Shortcut("Show Archive in Sidebar", .view, k("a", [.command, .option]))
     static let statusBar = Shortcut("Show Host Status Bar", .view, k("s", [.command, .option]))
+    static let runningCommand = Shortcut("Show Running Command", .view, k("u", [.command, .option]),
+                                         note: "PID, time, CPU, memory and network of what runs in the terminal")
     static let settings = Shortcut("Settings…", .view, display: "⌘,")
     static let lockApp = Shortcut("Lock Tether", .view, k("l", [.command, .control]),
                                   note: "With App Lock on (Settings ▸ Security)")
     static let shortcuts = Shortcut("Keyboard Shortcuts", .view, k("/"))
 
     static let all: [Shortcut] = [
-        newConnection, quickConnect, newTab, newLocalTerminal, newWindow, addHost, editConfig,
+        newConnection, quickConnect, newTab, newLocalTerminal, newPrivateTab, newWindow, addHost, editConfig,
         closeTab, middleClick, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
         reconnect, moveToBackground, disconnect, fillPassword, terminate, saveSession,
@@ -177,7 +181,7 @@ struct Shortcut: Identifiable {
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
         browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
-        toggleSidebar, hostPanel, showArchive, statusBar, settings, lockApp, shortcuts,
+        toggleSidebar, hostPanel, runningCommand, showArchive, statusBar, settings, lockApp, shortcuts,
     ]
 }
 

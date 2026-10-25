@@ -67,21 +67,26 @@ struct HostStatusStrip: View {
 
     private func row(_ s: SystemSnapshot, _ monitor: RemoteMonitor, _ density: Density) -> some View {
         HStack(spacing: density == .full ? 14 : 10) {
-            meter("CPU", "cpu", s.cpuUsage, tab: .processes, density)
-            meter("Memory", "memorychip", s.memFraction, tab: .overview, density)
+            meter("CPU", "CPU", s.cpuUsage, tab: .processes, density,
+                  help: "CPU use of the whole server" + (s.cpuCount > 0 ? " (\(s.cpuCount) cores)" : "") + ". Click for its processes.")
+            meter("Memory", "RAM", s.memFraction, tab: .overview, density,
+                  help: "Memory (RAM) in use on the server: \(s.memUsed.byteString) of \(s.memTotal.byteString).")
             if density != .minimal {
                 if let root = s.disks.first(where: { $0.mount == "/" }) ?? s.disks.first {
-                    meter("Disk", "internaldrive", root.fraction, tab: .overview, density)
+                    meter("Disk", "Disk", root.fraction, tab: .overview, density,
+                          help: "Disk \(root.mount) in use, \((root.availableKB * 1024).byteString) free.")
                 }
                 if let load = s.load.first {
                     Button { open(.overview) } label: {
-                        item(density == .full ? "Load" : nil, "chart.line.uptrend.xyaxis", String(format: "%.2f", load))
+                        item("Load", "chart.line.uptrend.xyaxis", String(format: "%.2f", load))
                     }
-                    .help("Load average (1 min)")
+                    .help("Load average over 1, 5 and 15 minutes: " + s.load.prefix(3).map { String(format: "%.2f", $0) }.joined(separator: " ")
+                          + (s.cpuCount > 0 ? " (\(s.cpuCount) cores: above \(s.cpuCount) means work is waiting)" : ""))
                 }
                 if let net = s.networkRates {
-                    Button { open(.overview) } label: {
+                    Button { open(.connections) } label: {
                         HStack(spacing: 4) {
+                            if density == .full { Text("Net").foregroundStyle(.secondary) }
                             Image(systemName: "arrow.down").foregroundStyle(.blue)
                             Text(net.rx.rateString)
                             Image(systemName: "arrow.up").foregroundStyle(.orange)
@@ -89,11 +94,13 @@ struct HostStatusStrip: View {
                         }
                         .fixedSize()
                     }
-                    .help("Network traffic on the server (download / upload)")
+                    .help("Network traffic of the whole server: download ↓ \(net.rx.rateString), upload ↑ \(net.tx.rateString). Click for traffic by process.")
                 }
                 ForEach(s.gpus) { g in
-                    meter("GPU\(s.gpus.count > 1 ? " \(g.index)" : "")", "rectangle.3.group", g.utilization, tab: .gpu, density,
-                          extra: density == .full ? g.temperature.map { " \(Int($0))°" } : nil)
+                    let name = "GPU\(s.gpus.count > 1 ? " \(g.index)" : "")"
+                    meter(name, name, g.utilization, tab: .gpu, density,
+                          extra: density == .full ? g.temperature.map { " \(Int($0))°" } : nil,
+                          help: "\(name) use (\(g.name))" + (g.temperature.map { ", \(Int($0)) °C" } ?? "") + ".")
                 }
             }
             Spacer(minLength: 8)
@@ -111,20 +118,20 @@ struct HostStatusStrip: View {
 
     private func item(_ title: String?, _ symbol: String, _ value: String) -> some View {
         HStack(spacing: 4) {
-            Image(systemName: symbol).foregroundStyle(.secondary)
-            if let title { Text(title).foregroundStyle(.secondary) }
+            if let title { Text(title).foregroundStyle(.secondary) } else { Image(systemName: symbol).foregroundStyle(.secondary) }
             Text(value)
         }
         .fixedSize()
     }
 
-    private func meter(_ title: String, _ symbol: String, _ value: Double?, tab: InspectorTab, _ density: Density,
-                       extra: String? = nil) -> some View {
+    /// A labelled value with a small bar. The label stays (shortened when narrow), so every value
+    /// says what it is; the tooltip explains it.
+    private func meter(_ title: String, _ short: String, _ value: Double?, tab: InspectorTab, _ density: Density,
+                       extra: String? = nil, help: String) -> some View {
         let v = value ?? 0
         return Button { open(tab) } label: {
             HStack(spacing: 4) {
-                Image(systemName: symbol).foregroundStyle(.secondary)
-                if density == .full { Text(title).foregroundStyle(.secondary) }
+                Text(density == .full ? title : short).foregroundStyle(.secondary)
                 if density != .minimal {
                     Capsule().fill(.quaternary)
                         .frame(width: 30, height: 5)
@@ -136,7 +143,7 @@ struct HostStatusStrip: View {
             }
             .fixedSize()
         }
-        .help("\(title) — show in host panel")
+        .help(help)
     }
 
     @ViewBuilder
@@ -147,12 +154,12 @@ struct HostStatusStrip: View {
             Button { open(.overview) } label: {
                 HStack(spacing: 4) {
                     Circle().fill(LatencyBadge(stats: stats).color(quality)).frame(width: 7, height: 7)
-                    if density == .full { Text("Latency").foregroundStyle(.secondary) }
+                    if density != .minimal { Text(density == .full ? "Latency" : "Ping").foregroundStyle(.secondary) }
                     Text(LatencyStats.format(median))
                 }
                 .fixedSize()
             }
-            .help("Latency (round-trip time) \(LatencyStats.format(median)) · \(quality.rawValue)"
+            .help("Latency: how long a round trip to the server takes, \(LatencyStats.format(median)) · \(quality.rawValue)"
                   + (stats?.jitter.map { " · jitter ±\(LatencyStats.format($0))" } ?? ""))
         }
     }

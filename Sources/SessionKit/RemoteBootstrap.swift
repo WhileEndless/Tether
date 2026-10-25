@@ -8,10 +8,12 @@ import TetherCore
 ///
 ///     ESC ] 7770 ; mode=tmux;v=3.4 BEL     tmux control mode follows
 ///     ESC ] 7770 ; mode=screen BEL         GNU screen follows
-///     ESC ] 7770 ; mode=plain BEL          a plain login shell follows
+///     ESC ] 7770 ; mode=plain;pid=123 BEL  a plain login shell (with this pid) follows
 ///     ESC ] 7770 ; gone BEL                re-attach requested but the session no longer exists
 public enum RemoteBootstrap {
-    public static let markerPrefix: [UInt8] = Array("\u{1b}]7770;".utf8)
+    /// The private OSC code of the marker.
+    public static let markerCode = 7770
+    public static let markerPrefix: [UInt8] = Array("\u{1b}]\(markerCode);".utf8)
 
     /// - Parameters:
     ///   - mode: requested persistence. On re-attach pass the backend that was negotiated originally.
@@ -69,7 +71,8 @@ public enum RemoteBootstrap {
                 + "fi; fi",
             // Plain shell: nothing survives a disconnect, so a re-attach always reports gone.
             "if [ \"$A\" = 1 ]; then mark gone; exit 0; fi",
-            "mark mode=plain",
+            // `exec` keeps the process id: $$ is the shell's pid (to find what runs in it).
+            "mark \"mode=plain;pid=$$\"",
             "exec \"${SHELL:-/bin/sh}\" -l",
         ]
         let script = parts.joined(separator: "; ")
@@ -87,11 +90,7 @@ public enum RemoteBootstrap {
 
         init(payload: String) {
             if payload == "gone" { self = .gone; return }
-            var fields: [String: String] = [:]
-            for f in payload.split(separator: ";") {
-                let kv = f.split(separator: "=", maxSplits: 1).map(String.init)
-                if kv.count == 2 { fields[kv[0]] = kv[1] }
-            }
+            let fields = Self.fields(payload)
             switch fields["mode"] {
             case "tmux": self = .tmux(version: fields["v"] ?? "")
             case "screen": self = .screen
@@ -99,17 +98,27 @@ public enum RemoteBootstrap {
             default: self = .unknown(payload)
             }
         }
+
+        /// `key=value` pairs of a marker payload (`mode=plain;pid=123`); unknown keys are ignored.
+        public static func fields(_ payload: String) -> [String: String] {
+            var fields: [String: String] = [:]
+            for f in payload.split(separator: ";") {
+                let kv = f.split(separator: "=", maxSplits: 1).map(String.init)
+                if kv.count == 2 { fields[kv[0]] = kv[1] }
+            }
+            return fields
+        }
     }
 
     /// Finds and removes the first marker in `buffer`.
     /// Returns bytes before the marker, the marker, and bytes after it.
     /// If no complete marker is present, returns nil.
-    public static func extractMarker(from buffer: [UInt8]) -> (before: [UInt8], marker: Marker, after: [UInt8])? {
+    public static func extractMarker(from buffer: [UInt8]) -> (before: [UInt8], marker: Marker, after: [UInt8], fields: [String: String])? {
         guard let start = indexOf(markerPrefix, in: buffer) else { return nil }
         let payloadStart = start + markerPrefix.count
         guard let end = buffer[payloadStart...].firstIndex(of: 0x07) else { return nil }
         let payload = String(decoding: buffer[payloadStart..<end], as: UTF8.self)
-        return (Array(buffer[..<start]), Marker(payload: payload), Array(buffer[(end + 1)...]))
+        return (Array(buffer[..<start]), Marker(payload: payload), Array(buffer[(end + 1)...]), Marker.fields(payload))
     }
 
     /// Number of trailing bytes that might be the beginning of a marker, to hold back.

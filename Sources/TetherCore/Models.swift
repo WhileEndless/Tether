@@ -241,6 +241,14 @@ public struct SessionDescriptor: Codable, Identifiable, Hashable, Sendable {
     /// Directory to start a new session in (e.g. "Open Terminal Here" from the file browser).
     public var initialDirectory: String?
     public var createdAt: Date
+    /// Stored optional so sessions saved by older versions still decode.
+    private var privateSession: Bool?
+    /// A private session leaves nothing behind on this Mac: no recording, no archive entry, no
+    /// command history.
+    public var isPrivate: Bool {
+        get { privateSession ?? false }
+        set { privateSession = newValue ? true : nil }
+    }
 
     public init(id: UUID = UUID(), target: ConnectionTarget, title: String? = nil, color: TagColor = .none,
                 persistence: PersistenceMode, createdAt: Date = Date()) {

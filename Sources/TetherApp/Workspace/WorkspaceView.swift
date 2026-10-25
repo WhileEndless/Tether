@@ -186,7 +186,7 @@ struct SessionBanner: View {
                             Text("Session ended").fontWeight(.semibold)
                             Text(reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         }
-                        Button("New Session") { state.connect(session.descriptor.target) }
+                        Button("New Session") { state.connect(session.descriptor.target, isPrivate: session.descriptor.isPrivate) }
                             .buttonStyle(.glassProminent)
                         Button("Close") { state.closeTab(session) }
                             .buttonStyle(.glass)
@@ -211,6 +211,7 @@ struct SessionFooter: View {
                 Text(session.phase.label)
             }
             .fixedSize()
+            .help("Connection state of this terminal")
             // The host status bar already shows latency; only repeat it here when that bar is hidden.
             if !model.settings.showStatusStrip, session.phase.isOnline, let median = session.latency.median {
                 Label("Latency \(LatencyStats.format(median)) · \(session.latency.quality.rawValue)", systemImage: "antenna.radiowaves.left.and.right")
@@ -223,9 +224,15 @@ struct SessionFooter: View {
                 Image(systemName: persistenceIcon)
             }
             .help(persistenceText)
-            if session.recordingURL != nil {
-                Label("Recording", systemImage: "record.circle").foregroundStyle(.secondary)
+            // Only an icon: whether output is kept on this Mac (the tooltip says where to change it).
+            if session.descriptor.isPrivate {
+                Image(systemName: "eye.slash").foregroundStyle(.secondary)
+                    .help("Private tab: no recording, archive or command history is kept")
+            } else if session.recordingURL != nil {
+                Image(systemName: "record.circle").foregroundStyle(.red.opacity(0.8))
+                    .help("This terminal's output is recorded on this Mac (Settings ▸ Recordings; ⌥⇧⌘T opens a private tab)")
             }
+            CommandStatsPill(session: session)
             Spacer()
             // The terminal's folder, one click from a file manager there (⇧⌘O). A real button, so it
             // reads as one and is never squeezed away by the labels beside it.
@@ -242,6 +249,7 @@ struct SessionFooter: View {
             .help("Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⇧⌘O)")
             Text(session.descriptor.target.displayName).foregroundStyle(.secondary)
                 .truncationMode(.middle)
+                .help("Host of this terminal")
         }
         .lineLimit(1)
         .font(.caption)

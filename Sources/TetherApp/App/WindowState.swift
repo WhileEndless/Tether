@@ -114,6 +114,15 @@ final class WindowState {
         if case .terminal(let s) = item { model.sessions.setBackground(s.id, true) }
     }
 
+    /// Opens the host panel on what runs in the selected terminal (an explicit request: the panel
+    /// is shown even when it was closed).
+    func showRunningCommand(_ session: TerminalSession? = nil) {
+        guard let s = session ?? self.session else { return }
+        sidebarSelection = .session(s.id)
+        inspectorTab = .command
+        showInspectorRequest = true
+    }
+
     /// The host shown in the inspector: the sidebar selection, else the selected tab's host.
     var inspectedTarget: ConnectionTarget? {
         if case .host(let key) = sidebarSelection { return model.target(forKey: key) }
@@ -124,25 +133,27 @@ final class WindowState {
     /// Opens a new session to `target`.
     @discardableResult
     func connect(_ target: ConnectionTarget, mode: OpenMode = .tab, remoteSessionName: String? = nil,
-                 persistence: PersistenceMode? = nil, directory: String? = nil) -> TerminalSession {
+                 persistence: PersistenceMode? = nil, directory: String? = nil, isPrivate: Bool = false) -> TerminalSession {
         let meta = model.metadata(for: target.key)
         let session = model.sessions.open(target, color: meta.color, persistence: persistence ?? meta.persistence,
-                                          remoteSessionName: remoteSessionName, directory: directory)
+                                          remoteSessionName: remoteSessionName, directory: directory, isPrivate: isPrivate)
         present(session.id, mode: model.settings.openNewSessionsInWindow ? .window : mode)
         return session
     }
 
     /// A new session to the same host as `session` — in the folder its shell is in now, unless
-    /// Settings ▸ General says new tabs start in the home folder.
-    func newSession(like session: TerminalSession, mode: OpenMode = .tab) {
+    /// Settings ▸ General says new tabs start in the home folder. A private tab's new tab is private
+    /// too, as is every tab when `isPrivate` is set.
+    func newSession(like session: TerminalSession, mode: OpenMode = .tab, isPrivate: Bool = false) {
         let target = session.descriptor.target
+        let isPrivate = isPrivate || session.descriptor.isPrivate
         guard model.settings.newTabDirectory == .current else {
-            connect(target, mode: mode)
+            connect(target, mode: mode, isPrivate: isPrivate)
             return
         }
         Task {
             let directory = await session.workingDirectory()
-            connect(target, mode: mode, directory: directory)
+            connect(target, mode: mode, directory: directory, isPrivate: isPrivate)
         }
     }
 

@@ -74,6 +74,111 @@ enum SelfTest {
             return
         }
 
+        // The running command: found in a local tmux pane and in a plain shell, shown below the
+        // terminal and in the host panel, and kept in the history when it ends. TETHER_SELFTEST_COMMANDS=1.
+        if env["TETHER_SELFTEST_COMMANDS"] != nil {
+            Task { @MainActor in
+                model.settings.keepCommandHistory = true
+                model.settings.showCommandStats = true
+                model.commandHistory.load()
+                // Every process the test saw: none may be left running when it ends.
+                var seenPids = Set<Int32>()
+                for mode in [PersistenceMode.tmux, .off] {
+                    let s = state.connect(.local, persistence: mode)
+                    for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                    try? await Task.sleep(for: .seconds(1.5))
+                    s.send(Array("sh -c 'yes > /dev/null'\r".utf8)[...])
+                    try? await Task.sleep(for: .seconds(8))
+                    let sampler = model.commandSamplers[s.id]
+                    let leader = sampler?.frame?.leader
+                    say("\(mode) persistence=\(s.persistence) status=\(String(describing: sampler?.status)) leader=\(leader?.name ?? "-") pid=\(leader?.pid ?? 0) cpu=\(sampler?.latest?.cpu ?? -1) mem=\(sampler?.latest?.memory ?? -1) procs=\(sampler?.frame?.processes.count ?? 0)")
+                    say(sampler?.status == .running && (sampler?.latest?.cpu ?? 0) > 30 ? "PASS \(mode) command found with CPU use" : "FAIL \(mode) command not found")
+                    snapshot(state.window, "command-pill-\(mode)")
+                    state.showRunningCommand(s)
+                    try? await Task.sleep(for: .seconds(3))
+                    snapshot(state.window, "command-panel-\(mode)")
+                    let id = sampler?.recordID
+                    let procs = sampler?.frame?.processes ?? []
+                    procs.forEach { seenPids.insert(Int32($0.pid)) }
+                    if mode == .tmux {
+                        s.send(Array("\u{03}".utf8)[...])
+                    } else {
+                        // The Kill button: the command and everything it started (sh and yes here).
+                        let err = await model.monitor(for: .local).stopCommand(procs, shellPid: sampler?.frame?.shellPid, signal: "KILL")
+                        let alive = procs.filter { kill(Int32($0.pid), 0) == 0 }
+                        say(err == nil && alive.isEmpty ? "PASS Kill ended the whole command (\(procs.count) processes)"
+                                                        : "FAIL Kill left \(alive.map(\.pid)) \(err ?? "")")
+                    }
+                    try? await Task.sleep(for: .seconds(7))
+                    let r = id.flatMap { model.commandHistory.record($0) }
+                    say("record status=\(String(describing: r?.status)) duration=\(r?.duration ?? -1) cpu avg=\(r?.cpu?.mean ?? -1) peak=\(r?.cpu?.max ?? -1) mem peak=\(r?.memory?.max ?? -1) cmd=\(r?.commandLine ?? "-")")
+                    say(r?.status == .finished && (r?.cpu?.mean ?? 0) > 30 ? "PASS \(mode) history record finished" : "FAIL \(mode) history record")
+                    say(sampler?.status == .idle ? "PASS \(mode) idle after Control-C" : "FAIL \(mode) status \(String(describing: sampler?.status))")
+                    state.inspectorTab = .command
+                    snapshot(state.window, "command-history-\(mode)")
+                    model.sessions.close(s.id, killRemote: true)
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                // Network: a local TCP transfer is measured per process and per connection.
+                let s = state.connect(.local, persistence: .tmux)
+                for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(1.5))
+                s.send(Array("sh -c '(yes | nc -l 127.0.0.1 45679 >/dev/null &); sleep 1; nc 127.0.0.1 45679 >/dev/null'\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(9))
+                let sampler = model.commandSamplers[s.id]
+                let fast = sampler?.connections.filter { $0.rate > 0 } ?? []
+                say("network rx=\(sampler?.latest?.received ?? -1) tx=\(sampler?.latest?.sent ?? -1) connections=\(sampler?.connections.count ?? 0) moving=\(fast.count) diagnostics=\(sampler?.diagnostics.text ?? "")")
+                say((sampler?.latest?.received ?? 0) > 0 && !fast.isEmpty ? "PASS network measured per process and connection" : "FAIL network not measured")
+                state.showRunningCommand(s)
+                try? await Task.sleep(for: .seconds(2))
+                snapshot(state.window, "command-network")
+                s.send(Array("\u{03}".utf8)[...])
+                try? await Task.sleep(for: .seconds(2))
+
+                // A one-second command is seen by the watcher and kept, with its command line.
+                s.send(Array("sleep 1\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(4))
+                let short = model.commandHistory.records(sessionID: s.id).first { $0.commandLine == "sleep 1" }
+                say("short duration=\(short?.duration ?? -1) short=\(String(describing: short?.short)) recent=\(model.commandHistory.records(sessionID: s.id).prefix(4).map { "\($0.commandLine)|\($0.short == true)|\($0.status.rawValue)" }) diagnostics=\(model.commandSamplers[s.id]?.diagnostics.text ?? "")")
+                say(short != nil ? "PASS a one-second command is in the history" : "FAIL the one-second command was missed")
+
+                // ping: its ICMP socket and target appear among the connections.
+                s.send(Array("ping -c 6 127.0.0.1\r".utf8)[...])
+                try? await Task.sleep(for: .seconds(4))
+                let icmp = model.commandSamplers[s.id]?.connections.first { $0.proto == "ICMP" }
+                say("icmp \(icmp.map { "\($0.peer) \($0.state)" } ?? "none")")
+                say(icmp?.peer == "127.0.0.1" ? "PASS ping shows as an ICMP connection to its target" : "FAIL ping not shown")
+                s.send(Array("\u{03}".utf8)[...])
+
+                // Three terminals on one host share one watcher.
+                let more = [state.connect(.local, persistence: .tmux), state.connect(.local, persistence: .tmux)]
+                for _ in 0..<100 where more.contains(where: { !$0.phase.isOnline }) { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(4))
+                let ps = Process()
+                ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+                ps.arguments = ["-A", "-o", "ppid=,args="]
+                let pipe = Pipe()
+                ps.standardOutput = pipe
+                try? ps.run()
+                let list = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                ps.waitUntilExit()
+                let mine = String(getpid())
+                let watchers = list.split(separator: "\n").filter { $0.contains("sh -s -- -i ") && $0.trimmingCharacters(in: .whitespaces).hasPrefix(mine + " ") }
+                say("watchers=\(watchers.count) for \(model.commandSamplers.count) terminals")
+                say(watchers.count == 1 ? "PASS one watcher for all terminals of the host" : "FAIL \(watchers.count) watchers")
+                for t in more { model.sessions.close(t.id, killRemote: true) }
+                model.sessions.close(s.id, killRemote: true)
+                try? await Task.sleep(for: .seconds(3))
+                // Nothing the test started is left behind (killed here only if it was).
+                let left = seenPids.filter { kill($0, 0) == 0 }
+                left.forEach { kill($0, SIGKILL) }
+                say(left.isEmpty ? "PASS no test process left running" : "FAIL left running: \(left.sorted())")
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
         // Real sshd, a key with a passphrase saved in Tether: ssh asks through askpass and only the ssh
         // the token was given to gets an answer. TETHER_SELFTEST_PASSPHRASE=<sshd test dir>.
         if let rig = env["TETHER_SELFTEST_PASSPHRASE"] {

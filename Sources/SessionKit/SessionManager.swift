@@ -75,10 +75,11 @@ public final class SessionManager {
     @discardableResult
     public func open(_ target: ConnectionTarget, title: String? = nil, color: TagColor = .none,
                      persistence: PersistenceMode? = nil, remoteSessionName: String? = nil,
-                     directory: String? = nil) -> TerminalSession {
+                     directory: String? = nil, isPrivate: Bool = false) -> TerminalSession {
         var descriptor = SessionDescriptor(target: target, title: title, color: color,
                                            persistence: persistence ?? settings.settings.defaultPersistence)
         descriptor.initialDirectory = directory
+        descriptor.isPrivate = isPrivate
         if let remoteSessionName { descriptor.remoteSessionName = remoteSessionName }
         let session = makeSession(descriptor)
         session.controlSlot = nextControlSlot(for: target)
@@ -111,7 +112,7 @@ public final class SessionManager {
     @discardableResult
     public func openNew(like session: TerminalSession) -> TerminalSession {
         open(session.descriptor.target, title: session.descriptor.customTitle ? session.descriptor.title : nil,
-             color: session.descriptor.color, persistence: session.descriptor.persistence)
+             color: session.descriptor.color, persistence: session.descriptor.persistence, isPrivate: session.descriptor.isPrivate)
     }
 
     private func makeSession(_ descriptor: SessionDescriptor) -> TerminalSession {
@@ -205,6 +206,12 @@ public final class SessionManager {
     // MARK: Archive
 
     private func archiveSession(_ s: TerminalSession) {
+        // Private sessions are not remembered.
+        guard !s.descriptor.isPrivate else {
+            if background.contains(s.id) { close(s.id, killRemote: false) }
+            saveOpenSessions()
+            return
+        }
         let entry = ArchivedSession(id: s.id, target: s.descriptor.target, title: s.displayTitle,
                                     startedAt: s.startedAt, endedAt: s.endedAt ?? Date(),
                                     reason: { if case .dead(let r) = s.phase { r } else { "" } }(),
@@ -235,7 +242,8 @@ public final class SessionManager {
 
     public func saveOpenSessions() {
         let saved = sessions.compactMap { s -> SavedSession? in
-            guard !s.phase.isDead, s.persistence == .tmux || s.persistence == .screen else { return nil }
+            // Private sessions leave nothing on this Mac: they are not brought back after quitting.
+            guard !s.phase.isDead, !s.descriptor.isPrivate, s.persistence == .tmux || s.persistence == .screen else { return nil }
             return SavedSession(descriptor: s.descriptor, persistence: s.persistence,
                                 background: background.contains(s.id), suspended: s.phase.isSuspended)
         }

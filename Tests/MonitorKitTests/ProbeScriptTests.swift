@@ -29,6 +29,87 @@ import TestSupport
         #expect(snap.osInfo["hardware"] != nil)
     }
 
+    /// The command probe finds the processes below a shell and what they use. The tree runs inside
+    /// the bounded shell, so it is stopped with it whatever happens.
+    @Test func commandProbeReadsProcessTree() throws {
+        let driver = """
+        sh -c 'sleep 30 & yes >/dev/null & wait' &
+        P=$!
+        sleep 1
+        sh -s -- pid "$P" <<'TETHER_PROBE'
+        \(ProbeScripts.command)
+        TETHER_PROBE
+        # Children first: once the parent is gone they would belong to init and be missed.
+        pkill -P $P 2>/dev/null
+        kill $P 2>/dev/null
+        true
+        """
+        let out = try run(driver, [], seconds: 10)
+        let s = ProbeParser.sections(out)
+        let root = try #require(s["root"]?.first.flatMap { Int($0) })
+        let procs = s["procs"] ?? []
+        #expect(procs.count == 3, "output: \(out.prefix(600))")
+        // Without a terminal there is no foreground job: the parser sees an idle shell, not an error.
+        let frame = ProbeParser.command(out, anchor: .posix(pid: root))
+        #expect(frame.problem == nil)
+        #expect(frame.shellPid == root)
+        #expect(ProbeParser.command(try run(ProbeScripts.command, ["pid", "999999"], seconds: 5), anchor: .posix(pid: 999_999)).problem == .noShell)
+    }
+
+    /// Two terminals (shells in panes of a private tmux server, never the user's): one watcher says
+    /// when a command starts and ends in either, and one look measures both. The watcher ends when
+    /// it is stopped; nothing of it stays behind.
+    @Test func watcherAndBatchedLookOnTwoShells() throws {
+        guard let tmux = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return }
+        let dir = URL(fileURLWithPath: "/tmp").appendingPathComponent("tether-w-\(UUID().uuidString.prefix(6))")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "TMUX")
+        env["TMUX_TMPDIR"] = dir.path
+        env["PATH"] = URL(fileURLWithPath: tmux).deletingLastPathComponent().path + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        defer { BoundedProcess.run(tmux, ["kill-server"], environment: env, timeout: 10) }
+        let watch = dir.appendingPathComponent("watch.sh")
+        let look = dir.appendingPathComponent("look.sh")
+        try ProbeScripts.commandWatch.write(to: watch, atomically: true, encoding: .utf8)
+        try ProbeScripts.command.write(to: look, atomically: true, encoding: .utf8)
+        let driver = """
+        tmux new-session -d -s a /bin/sh; tmux new-session -d -s b /bin/sh
+        sleep 0.5
+        A=$(tmux display -p -t a '#{pane_pid}'); B=$(tmux display -p -t b '#{pane_pid}')
+        sh '\(watch.path)' -i 0.5 pid "$A" pid "$B" > '\(dir.path)/w.out' 2>&1 & W=$!
+        sleep 1
+        tmux send-keys -t b 'sleep 3' Enter
+        sleep 1.5
+        sh '\(look.path)' pid "$A" pid "$B" > '\(dir.path)/l.out' 2>&1
+        sleep 3
+        kill $W; sleep 0.3
+        echo "@@watch"; cat '\(dir.path)/w.out'
+        echo "@@left"; ps -A -o args= | grep -F 'sh \(watch.path)' | grep -v grep || true
+        cat '\(dir.path)/l.out'
+        """
+        let out = try run(driver, [], seconds: 20, environment: env)
+        let watched = ProbeParser.sections(out)["watch"] ?? []
+        #expect(watched.contains("0 idle") && watched.contains("1 idle"), "output: \(out.prefix(800))")
+        #expect(watched.contains { $0.hasPrefix("1 busy ") && $0.hasSuffix("sleep 3") })
+        #expect(watched.filter { $0 == "1 idle" }.count == 2)   // idle, busy, idle again
+        #expect((ProbeParser.sections(out)["left"] ?? []).isEmpty)
+        let lookText = out.components(separatedBy: "@@now").dropFirst().joined(separator: "@@now")
+        let frames = ProbeParser.commandBatch("@@now" + lookText, anchors: [.posix(pid: 1), .posix(pid: 2)])
+        #expect(frames.count == 2)
+        #expect(frames[0].problem == nil && frames[0].isIdle)
+        #expect(frames[1].leader?.name == "sleep", "output: \(lookText.prefix(800))")
+    }
+
+    /// The traffic stream names its source first, then sends records until it is stopped.
+    @Test func processTrafficStreams() throws {
+        let out = try run(ProbeScripts.processTraffic, ["1"], seconds: 4)
+        let records = out.components(separatedBy: "@@end\n").filter { !$0.isEmpty }
+        #expect(records.first?.hasPrefix("@@source\n") == true, "output: \(out.prefix(300))")
+        #expect(records.count >= 2)
+    }
+
     @Test func otherScriptsRun() throws {
         _ = try run(ProbeScripts.processes, [], seconds: 1)
         _ = try run(ProbeScripts.connections, [], seconds: 1)

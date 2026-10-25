@@ -4,13 +4,14 @@ import MonitorKit
 import SessionKit
 
 enum InspectorTab: String, CaseIterable, Identifiable {
-    case overview = "Overview", processes = "Processes", gpu = "GPU", services = "Services",
+    case overview = "Overview", command = "Command", processes = "Processes", gpu = "GPU", services = "Services",
          containers = "Containers", kubernetes = "Kubernetes", files = "Files", ports = "Ports", logs = "Logs", connections = "Network",
          sessions = "Sessions"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .overview: "gauge.with.dots.needle.67percent"
+        case .command: "terminal"
         case .processes: "list.bullet.rectangle"
         case .gpu: "cpu"
         case .services: "gearshape.2"
@@ -41,6 +42,7 @@ struct InspectorContainer: View {
                 Group {
                     switch state.inspectorTab {
                     case .overview: OverviewPanel(target: target, monitor: monitor)
+                    case .command: CommandPanel(target: target, monitor: monitor)
                     case .processes: ProcessesPanel(monitor: monitor)
                     case .gpu: GPUPanel(monitor: monitor)
                     case .services: ServicesPanel(monitor: monitor)

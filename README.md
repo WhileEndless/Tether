@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.3.2 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.4.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 26 or later. Tether is an early release (0.3.2): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 26 or later. Tether is an early release (0.4.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -257,7 +257,9 @@ When a terminal connects, Tether runs a short POSIX `sh` script on the server. I
 
 ## Privacy
 
-Tether talks only to the hosts you connect to. Settings, host groups and recordings stay in `~/Library/Application Support/Tether` (recordings can be encrypted, see Security). Passwords stay in your login keychain.
+Tether talks only to the hosts you connect to. Settings, host groups, recordings and the command history stay in `~/Library/Application Support/Tether` (recordings and the history can be encrypted, see Security). Passwords stay in your login keychain.
+
+Tether installs nothing on your hosts. Every script it runs there — when, what it reads, what it changes and how it ends — is listed in [docs/remote-commands.md](docs/remote-commands.md) and in Settings ▸ Monitoring ▸ What Runs on Hosts.
 
 Nothing else is sent anywhere: no analytics, no telemetry. At launch Tether asks GitHub once whether a newer release exists (Settings ▸ General can turn this off); if GitHub cannot be reached, nothing happens.
 

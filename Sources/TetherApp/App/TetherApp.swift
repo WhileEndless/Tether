@@ -189,6 +189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             AppModel.shared.fileTabs.saveDirectories()
             AppModel.shared.sessions.prepareForTermination()
+            AppModel.shared.stopCommandHubs()
+            AppModel.shared.commandHistory.flush()
             DeferredWrites.shared.flush()
         }
     }

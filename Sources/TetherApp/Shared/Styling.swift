@@ -90,6 +90,14 @@ extension Double {
 }
 
 extension TimeInterval {
+    /// "0:42", "12:04", "1:02:03", "2d 3:04:05" — a running time, like a stopwatch.
+    var clockString: String {
+        let s = Int(max(self, 0))
+        let d = s / 86_400, h = (s % 86_400) / 3600, m = (s % 3600) / 60, sec = s % 60
+        let hms = h > 0 || d > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+        return d > 0 ? "\(d)d \(hms)" : hms
+    }
+
     var uptimeString: String {
         let s = Int(self)
         let d = s / 86_400, h = (s % 86_400) / 3600, m = (s % 3600) / 60

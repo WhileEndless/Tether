@@ -287,6 +287,27 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var showStatusStrip = true
     public var confirmKill = true
     public var logLines = 300
+    /// The command running in a terminal (PID, time, CPU, memory, network) in the bar below it.
+    public var showCommandStats = true
+    /// Remember the commands run in Tether's terminals with their duration and usage (on this Mac only).
+    public var keepCommandHistory = true
+    /// Also keep the processes each command ran (name, PID, CPU and memory of each).
+    public var keepCommandProcesses = true
+    /// Also keep the connections each command had (remote addresses, bytes moved).
+    public var keepCommandConnections = true
+    /// A tiny watcher on each host notices commands the moment they start or end (also short ones),
+    /// so nothing is looked at while shells wait. Off: terminals are looked at every few seconds.
+    public var commandWatchEnabled = true
+    /// How often the watcher checks the shells, in seconds.
+    public var commandWatchInterval: Double = 0.5
+    /// How often a running command is measured, in seconds.
+    public var commandLookInterval: Double = 3
+    /// How often traffic by process is sampled, in seconds.
+    public var trafficInterval: Double = 2
+    /// Days the command history is kept (0 = until the per-host limit).
+    public var commandHistoryDays = 90
+    /// Disk space the command history may take; the oldest commands go first.
+    public var commandHistoryMaxMB = 50
 
     // Transfers
     /// Files sent at the same time (each with its own scp).
@@ -409,6 +430,16 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.showStatusStrip, &showStatusStrip)
         d(.confirmKill, &confirmKill)
         d(.logLines, &logLines)
+        d(.showCommandStats, &showCommandStats)
+        d(.keepCommandHistory, &keepCommandHistory)
+        d(.commandHistoryDays, &commandHistoryDays)
+        d(.commandHistoryMaxMB, &commandHistoryMaxMB)
+        d(.keepCommandProcesses, &keepCommandProcesses)
+        d(.commandWatchEnabled, &commandWatchEnabled)
+        d(.commandWatchInterval, &commandWatchInterval)
+        d(.commandLookInterval, &commandLookInterval)
+        d(.trafficInterval, &trafficInterval)
+        d(.keepCommandConnections, &keepCommandConnections)
         d(.transferParallel, &transferParallel)
         d(.transferArchiveMode, &transferArchiveMode)
         d(.transferArchiveThreshold, &transferArchiveThreshold)

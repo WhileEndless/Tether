@@ -415,12 +415,17 @@ private struct TabChip: View {
                         .help(attentionHelp)
                 } else {
                     StatusDot(phase: session.phase, size: 6)
+                        .help(session.phase.label)
                 }
             }
             .frame(width: 16, height: 16)
 
             if let c = session.descriptor.color.color {
                 RoundedRectangle(cornerRadius: 1.5).fill(c).frame(width: 3, height: 14)
+            }
+            if session.descriptor.isPrivate {
+                Image(systemName: "eye.slash").font(.caption).foregroundStyle(.secondary)
+                    .help("Private tab: no recording, archive or command history")
             }
 
             if editing {

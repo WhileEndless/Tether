@@ -67,6 +67,12 @@ struct TetherCommands: Commands {
                 if let window { window.connect(.local) } else { openWindow(id: "workspace") }
             }
             .shortcut(.newLocalTerminal)
+            Button("New Private Tab") {
+                if let window, let active { window.newSession(like: active, isPrivate: true) }
+                else if let window { window.connect(window.inspectedTarget ?? .local, isPrivate: true) }
+                else { openWindow(id: "workspace") }
+            }
+            .shortcut(.newPrivateTab)
             Button("New Window") { openWindow(id: "workspace", value: UUID()) }
                 .shortcut(.newWindow)
             Divider()
@@ -171,6 +177,9 @@ struct TetherCommands: Commands {
         CommandGroup(after: .toolbar) {
             Button("Show or Hide Host Panel") { window?.toggleInspector.toggle() }
                 .shortcut(.hostPanel)
+            Button("Show Running Command") { window?.showRunningCommand() }
+                .shortcut(.runningCommand)
+                .disabled(window?.session == nil)
             Toggle("Show Archive in Sidebar", isOn: Binding(get: { model.settings.showSidebarArchive },
                                                             set: { model.settings.showSidebarArchive = $0 }))
                 .shortcut(.showArchive)

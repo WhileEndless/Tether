@@ -42,12 +42,24 @@ public struct SessionConfiguration: Sendable {
 public final class TerminalSession: Identifiable {
     public let id: UUID
     public var descriptor: SessionDescriptor
-    public private(set) var phase: SessionPhase = .connecting
+    public private(set) var phase: SessionPhase = .connecting {
+        didSet { if phase != oldValue { onStateChange?(self) } }
+    }
     public private(set) var persistence: ActivePersistence = .unknown
     /// Title reported by the remote program (OSC 0/2 or a screen/tmux name sequence).
     public var remoteTitle: String = ""
     /// What is running in the session (tmux only): foreground command and working directory.
-    public private(set) var activity: (command: String, path: String)?
+    public private(set) var activity: (command: String, path: String)? {
+        didSet { if activity?.command != oldValue?.command { onStateChange?(self) } }
+    }
+    /// Called when the phase or the foreground program changes (to watch what runs in the terminal).
+    @ObservationIgnored public var onStateChange: ((TerminalSession) -> Void)?
+    /// The program in the foreground, as tmux reports it every 2 s (nil when it cannot tell:
+    /// screen, plain shells, Windows, or no answer yet).
+    public var foregroundName: String? {
+        guard persistence == .tmux, let command = activity?.command, !command.isEmpty else { return nil }
+        return command
+    }
     /// Step-by-step progress while connecting or re-attaching (nil once online).
     public private(set) var progress: ConnectionProgress?
     /// A password prompt currently waiting in the terminal (sudo, su, ssh, …), if any.
@@ -174,6 +186,10 @@ public final class TerminalSession: Identifiable {
     @ObservationIgnored private var tmux: TmuxDriver?
     @ObservationIgnored private var markerBuffer: [UInt8] = []
     @ObservationIgnored private var markerResolved = false
+    /// The plain shell's process id on the host, as the bootstrap (or PowerShell) reported it.
+    @ObservationIgnored private var shellPid: Int?
+    /// Windows: the unique part of the PowerShell command line this tab started (see `WindowsShell`).
+    @ObservationIgnored private var windowsShellTag: String?
     @ObservationIgnored private var recorder: SessionRecorder?
     @ObservationIgnored private var attempt = 0
     @ObservationIgnored private var retryTask: Task<Void, Never>?
@@ -213,6 +229,23 @@ public final class TerminalSession: Identifiable {
         let r = await executor.run(script: #"ps -t "$1" -o stat=,ruser=,args= 2>/dev/null"#, arguments: [name], timeout: 5, purpose: "monitor")
         guard r.succeeded, let found = ForegroundProcess.parse(ps: r.output, command: command) else { return nil }
         return found
+    }
+
+    /// Where this terminal's shell runs on the host, to find the command running in it. nil while
+    /// offline or when it cannot be told (an old bootstrap, an unanswered tmux question).
+    public func shellAnchor() async -> ShellAnchor? {
+        guard phase.isOnline else { return nil }
+        switch persistence {
+        case .tmux:
+            return await tmuxQuery("#{pane_pid}").flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }.map { .posix(pid: $0) }
+        case .screen:
+            return .screen(session: descriptor.remoteSessionName)
+        case .plain:
+            if platform.isWindows { return windowsShellTag.map { .windows(commandTag: $0) } }
+            return shellPid.map { .posix(pid: $0) }
+        case .unknown:
+            return nil
+        }
     }
 
     /// The shell's working directory now: asked from tmux (the pane's current path) when it can
@@ -415,13 +448,14 @@ public final class TerminalSession: Identifiable {
         intentionalStop = false
         markerBuffer = []
         markerResolved = false
+        shellPid = nil
         tmux = nil
         tmuxExitReason = nil
         stderrTail = ""
         if !wasOnline && !attachOnly { phase = .connecting }
         pendingAttachOnly = attachOnly
 
-        if recorder == nil, config.recordingEnabled {
+        if recorder == nil, config.recordingEnabled, !descriptor.isPrivate {
             recorder = SessionRecorder(targetKey: descriptor.target.key, sessionID: id)
         }
 
@@ -570,13 +604,9 @@ public final class TerminalSession: Identifiable {
             finish(reason: "The Windows shell ended with the connection", archive: wasOnline)
             return
         }
-        var command: String?
-        if let dir = descriptor.initialDirectory, !dir.isEmpty {
-            let quoted = "'" + dir.replacingOccurrences(of: "'", with: "''") + "'"
-            command = "powershell -NoLogo -NoExit -Command \"Set-Location -LiteralPath \(quoted)\""
-        } else if platform == .windowsCmd {
-            command = "powershell -NoLogo"
-        }
+        let shell = WindowsShell(platform: platform, directory: descriptor.initialDirectory)
+        windowsShellTag = shell.tag
+        let command = shell.command
         let args = sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: command)
         AskPassBridge.shared.revoke(environment: askPassEnv)
         askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
@@ -620,6 +650,7 @@ public final class TerminalSession: Identifiable {
             if let found = RemoteBootstrap.extractMarker(from: markerBuffer) {
                 markerResolved = true
                 markerBuffer = []
+                shellPid = found.fields["pid"].flatMap(Int.init)
                 display(found.before)
                 handleMarker(found.marker)
                 if !found.after.isEmpty { routeOutput(found.after[...]) }

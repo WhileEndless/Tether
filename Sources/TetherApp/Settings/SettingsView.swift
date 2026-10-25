@@ -1,4 +1,5 @@
 import SwiftUI
+import MonitorKit
 import TetherCore
 import RecordingKit
 import TerminalUI
@@ -394,6 +395,8 @@ private struct RecordingSettings: View {
 
 private struct MonitoringSettings: View {
     @Environment(AppModel.self) private var model
+    @State private var confirmClear = false
+    @State private var showRemoteCommands = false
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
@@ -401,6 +404,71 @@ private struct MonitoringSettings: View {
                 Toggle("Show host status above each terminal", isOn: $store.settings.showStatusStrip)
                 Text("CPU, memory, disk, load, GPU and latency, streamed over the existing connection.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Running Commands") {
+                Toggle("Show the running command below each terminal", isOn: $store.settings.showCommandStats)
+                Text("Name, running time, PID, CPU, memory and network of what runs in the terminal (⌥⌘U for details).")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Notice commands the moment they start", isOn: $store.settings.commandWatchEnabled)
+                    .help("One small watcher per host for all its terminals: it only reads the shells' state, writes nothing and ends by itself when Tether stops reading")
+                Picker("Check every", selection: $store.settings.commandWatchInterval) {
+                    Text("0.5 s").tag(0.5)
+                    Text("1 s").tag(1.0)
+                    Text("2 s").tag(2.0)
+                }
+                .disabled(!store.settings.commandWatchEnabled)
+                .padding(.leading, 18)
+                Picker("Measure running commands every", selection: $store.settings.commandLookInterval) {
+                    Text("2 s").tag(2.0)
+                    Text("3 s").tag(3.0)
+                    Text("5 s").tag(5.0)
+                    Text("10 s").tag(10.0)
+                }
+                Picker("Sample traffic by process every", selection: $store.settings.trafficInterval) {
+                    Text("1 s").tag(1.0)
+                    Text("2 s").tag(2.0)
+                    Text("5 s").tag(5.0)
+                }
+                Text("All terminals of a host share one watcher and one measurement. Commands shorter than the check interval are not seen; commands that end before they are measured are kept with their command line and duration only.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Keep a history of commands", isOn: $store.settings.keepCommandHistory)
+                Toggle("With the processes each command ran", isOn: $store.settings.keepCommandProcesses)
+                    .disabled(!store.settings.keepCommandHistory)
+                    .padding(.leading, 18)
+                Toggle("With the connections each command had", isOn: $store.settings.keepCommandConnections)
+                    .disabled(!store.settings.keepCommandHistory)
+                    .padding(.leading, 18)
+                    .help("Remote addresses and bytes moved, up to \(CommandRecord.maxDetails) per command")
+                Picker("Keep for", selection: $store.settings.commandHistoryDays) {
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("1 year").tag(365)
+                    Text("Until 500 per host").tag(0)
+                }
+                .disabled(!store.settings.keepCommandHistory)
+                Picker("Disk space", selection: $store.settings.commandHistoryMaxMB) {
+                    Text("10 MB").tag(10)
+                    Text("50 MB").tag(50)
+                    Text("200 MB").tag(200)
+                    Text("1 GB").tag(1024)
+                }
+                .disabled(!store.settings.keepCommandHistory)
+                LabeledContent("In use") {
+                    Text("\(Int64(model.commandHistory.storageBytes).byteString) · \(model.commandHistory.records.count) commands")
+                }
+                .help("Compressed on disk; the oldest commands go first when the limit is reached")
+                HStack {
+                    Text("Duration and lowest, average and peak use of each command, kept on this Mac only (encrypted when recordings are). Secrets in command lines are masked.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Export…") {
+                        let all = model.commandHistory.records()
+                        ExportPanel.save(title: "Export Command History", baseName: "tether-command-history",
+                                         formats: MonitorExport.Format.allCases) { MonitorExport.history(all, format: $0) }
+                    }
+                    Button("Clear History…", role: .destructive) { confirmClear = true }
+                }
             }
             Section("Host Panel") {
                 Stepper("Refresh every \(Int(store.settings.monitorRefreshInterval)) s",
@@ -412,9 +480,17 @@ private struct MonitoringSettings: View {
             Section {
                 Text("Monitoring runs small read-only shell commands over the existing SSH connection (/proc, ps, df, journalctl). Nothing is installed on the server.")
                     .font(.caption).foregroundStyle(.secondary)
+                Button("What Runs on Hosts…") { showRemoteCommands = true }
+                    .help("Every script the host panel and the running-command features run on a host, when, and what it reads or changes")
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showRemoteCommands) { RemoteCommandsView() }
+        .confirmationDialog("Clear the whole command history?", isPresented: $confirmClear) {
+            Button("Clear History", role: .destructive) { model.commandHistory.clear() }
+        } message: {
+            Text("Commands still running are kept. This cannot be undone.")
+        }
     }
 }
 

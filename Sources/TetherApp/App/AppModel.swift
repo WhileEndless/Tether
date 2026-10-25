@@ -54,6 +54,12 @@ final class AppModel {
 
     @ObservationIgnored private let libraryStore = JSONStore<HostLibrary>(filename: "hosts.json")
     @ObservationIgnored private var monitors: [String: RemoteMonitor] = [:]
+    /// Commands run in Tether's terminals, with their duration and usage (this Mac only).
+    let commandHistory = CommandHistoryStore(directory: AppPaths.commandHistoryDirectory, codec: .recordingKey)
+    /// One per host: the watcher and batched looks for all its terminals.
+    @ObservationIgnored var commandHubs: [String: CommandHub] = [:]
+    /// What runs in each terminal (see `AppModel+Commands`).
+    var commandSamplers: [UUID: CommandSampler] = [:]
     @ObservationIgnored private var configWatcher: DispatchSourceFileSystemObject?
 
     var settings: AppSettings {
@@ -79,6 +85,7 @@ final class AppModel {
             _ = TerminalRegistry.shared.view(for: session)
             session.onPasswordPrompt = { s, prompt in AppModel.shared.passwordPromptAppeared(prompt, in: s) }
             session.onAttention = { s, attention in Notifier.shared.attention(attention, in: s) }
+            session.onStateChange = { s in AppModel.shared.commandStateChanged(s) }
             session.onOnline = { s in
                 let model = AppModel.shared
                 model.forwards.sessionConnected(to: s.descriptor.target,
@@ -96,6 +103,7 @@ final class AppModel {
         sessions.didRemove = { id in
             TerminalRegistry.shared.remove(id)
             AppModel.shared.workspaces.sessionRemoved(id)
+            AppModel.shared.commandSessionRemoved(id)
         }
 
         AskPassBridge.shared.start { request in
@@ -126,6 +134,10 @@ final class AppModel {
         AppLock.shared.start { [weak self] in
             guard let self else { return }
             self.sessions.restoreOpenSessions()
+            self.commandHistory.load()
+            self.applyCommandSettings()
+            // Commands of terminals that did not come back cannot be followed any more.
+            self.commandHistory.stopTracking(exceptSessions: Set(self.sessions.sessions.map(\.id)))
             self.sessionsRestored = true
             self.afterRestore.forEach { $0() }
             self.afterRestore = []
@@ -571,6 +583,7 @@ final class AppModel {
         RecordingStore.configure(quotaMB: settings.recordingQuotaMB, retentionDays: settings.recordingRetentionDays,
                                  compressAfterDays: settings.compressRecordingsAfterDays)
         if config.mainURL != settings.resolvedSSHConfigURL { reloadConfig() }
+        applyCommandSettings()
     }
 }
 

@@ -207,7 +207,10 @@ struct ConnectionProgressCard: View {
 
     private func retry() {
         if session.endedByConnectionFailure { session.retryAfterFailure() }
-        else if session.phase.isDead { state.connect(session.descriptor.target); model.sessions.close(session.id, killRemote: false) }
+        else if session.phase.isDead {
+            state.connect(session.descriptor.target, isPrivate: session.descriptor.isPrivate)
+            model.sessions.close(session.id, killRemote: false)
+        }
         else { session.reconnectNow() }
     }
 

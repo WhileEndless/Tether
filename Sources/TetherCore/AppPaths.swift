@@ -19,6 +19,11 @@ public enum AppPaths {
         ensure(supportDirectory.appendingPathComponent("Recordings", isDirectory: true))
     }
 
+    /// The command history (one file per host, see MonitorKit's `CommandHistoryStore`).
+    public static var commandHistoryDirectory: URL {
+        ensure(supportDirectory.appendingPathComponent("Command History", isDirectory: true))
+    }
+
     /// Temporary downloads used for previews.
     public static var previewDirectory: URL {
         ensure(FileManager.default.temporaryDirectory.appendingPathComponent("TetherPreview", isDirectory: true))

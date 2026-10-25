@@ -119,9 +119,9 @@ struct SidebarView: View {
             case .files(let id):
                 if id != state.workspace.selected, let t = model.fileTabs.tab(id) { state.show(t); keepOwnSelection(id) }
             case .host:
-                // Clicking a host shows its details in the host panel.
+                // Clicking a host shows its details in the host panel — if it is open. A panel the
+                // user closed stays closed (View ▸ Show or Hide Host Panel opens it again).
                 state.inspectorTab = .overview
-                state.showInspectorRequest = true
             default: break
             }
         }
@@ -864,6 +864,8 @@ struct HostContextMenu: View {
     var body: some View {
         Button("Connect") { state.connect(.alias(alias), mode: .tab) }
         Button("Connect in New Window") { state.connect(.alias(alias), mode: .window) }
+        Button("Connect in Private Tab") { state.connect(.alias(alias), mode: .tab, isPrivate: true) }
+            .help("Nothing is kept on this Mac: no recording, archive or command history")
         Button("Open Files in a Tab") { state.openFiles(.alias(alias)) }
         Button("Open Files in a Window") { openWindow(id: "files", value: FilesRequest(target: .alias(alias), path: nil)) }
         Button("Search on This Host…") {

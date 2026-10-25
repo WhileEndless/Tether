@@ -111,6 +111,8 @@ final class AppLock {
     func installKey(_ key: SymmetricKey?) {
         RecordingCrypto.key = key
         RecordingCrypto.encryptNew = settings.encryptRecordings
+        // Command history files encrypted with this key can be read now.
+        if key != nil { AppModel.shared.commandHistory.reload() }
     }
 
     // MARK: Locking

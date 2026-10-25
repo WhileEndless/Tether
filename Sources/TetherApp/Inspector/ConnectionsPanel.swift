@@ -10,6 +10,7 @@ struct ConnectionsPanel: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                ProcessTrafficCard(monitor: monitor)
                 ListeningCard(sockets: monitor.listeningPorts) { s in
                     if let target = state.inspectedTarget { model.quickForward(target, port: s.port, address: s.address) }
                 }
@@ -53,6 +54,175 @@ struct ConnectionsPanel: View {
                 await monitor.refreshListeningPorts()
                 try? await Task.sleep(for: .seconds(10))
             }
+        }
+    }
+}
+
+/// Network use per process on the whole host (nettop, the TCP counters, nethogs, or socket
+/// counts), streamed while the card is shown. The list stays calm: ordered by what each process
+/// moved since the card opened (or by name, or by speed now), quiet processes fade out after a
+/// minute, and Pause holds what is shown.
+struct ProcessTrafficCard: View {
+    let monitor: RemoteMonitor
+    @State private var expanded: Set<Int> = []
+    @AppStorage("trafficSort") private var sort = Sort.total
+    @State private var filter = ""
+    @State private var frozen: [ProcessTrafficEntry]?
+
+    enum Sort: String, CaseIterable, Identifiable {
+        case total = "Total", now = "Now", name = "Name"
+        var id: String { rawValue }
+    }
+
+    private var traffic: ProcessTraffic { monitor.traffic }
+
+    private var rows: [ProcessTrafficEntry] {
+        var list = frozen ?? traffic.entries
+        if !filter.isEmpty {
+            list = list.filter { $0.name.localizedCaseInsensitiveContains(filter) || String($0.pid).hasPrefix(filter) }
+        }
+        switch sort {
+        case .total: return list      // already ordered by total, which changes slowly
+        case .now: return list.sorted { ($0.rate, $1.pid) > ($1.rate, $0.pid) }
+        case .name: return list.sorted { ($0.name.lowercased(), $0.pid) < ($1.name.lowercased(), $1.pid) }
+        }
+    }
+
+    var body: some View {
+        Card(title: title) {
+            VStack(alignment: .leading, spacing: 6) {
+                if let message = traffic.message {
+                    Label(message, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                suggestion
+                switch traffic.source {
+                case nil:
+                    Text("Loading…").foregroundStyle(.secondary)
+                case .unavailable(let why)?:
+                    Text(why).foregroundStyle(.secondary)
+                default:
+                    controls
+                    let list = rows
+                    if list.isEmpty {
+                        Text(filter.isEmpty ? (traffic.source?.hasRates == true ? "No traffic yet" : "No connections") : "No match")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(list.prefix(40)) { e in
+                        if e.flows.isEmpty {
+                            processRow(e)
+                        } else {
+                            DisclosureGroup(isExpanded: Binding(get: { expanded.contains(e.pid) },
+                                                                set: { if $0 { expanded.insert(e.pid) } else { expanded.remove(e.pid) } })) {
+                                ConnectionRows(connections: e.flows, monitor: monitor, limit: 20)
+                                    .padding(.leading, 4)
+                            } label: {
+                                processRow(e)
+                            }
+                            .help("Show the connections of \(e.name)")
+                        }
+                    }
+                    if list.count > 40 {
+                        Text("and \(list.count - 40) more — filter to find one").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .contextMenu {
+            let entries = traffic.entries
+            Button("Export Traffic by Process…") {
+                ExportPanel.save(title: "Export Traffic by Process", baseName: "traffic by process") { _ in MonitorExport.traffic(entries) }
+            }
+            .disabled(entries.isEmpty)
+        }
+        .onAppear { traffic.retain(interval: max(AppModel.shared.settings.trafficInterval, 1)) }
+        .onDisappear { traffic.release() }
+    }
+
+    private var controls: some View {
+        HStack(spacing: 8) {
+            Picker("Sort", selection: $sort) {
+                ForEach(Sort.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("Total: data moved since this card opened (the steadiest order) · Now: current speed · Name")
+            TextField("Filter", text: $filter).textFieldStyle(.roundedBorder).controlSize(.small)
+            Button {
+                frozen = frozen == nil ? traffic.entries : nil
+            } label: {
+                Image(systemName: frozen == nil ? "pause.fill" : "play.fill")
+            }
+            .buttonStyle(.borderless)
+            .help(frozen == nil ? "Pause: keep the list as it is now" : "Resume live updates")
+            DiagnosticsButton(log: traffic.diagnostics) { traffic.clearDiagnostics() }
+        }
+    }
+
+    /// What could be installed on the host for (better) traffic per process — a suggestion only.
+    @ViewBuilder private var suggestion: some View {
+        let isLinux = !(monitor.platform?.isWindows ?? false) && monitor.snapshot?.osInfo["id"] != "macos"
+        let wanted: String? = switch traffic.source {
+        case .connections?: "Speeds need ss (iproute2) with a Linux kernel 4.1 or later."
+        case .tcp?: "For UDP and other users' processes too, nethogs can be used when it may run as root or with passwordless sudo."
+        default: nil
+        }
+        if isLinux, let wanted {
+            let command = ProcessTraffic.installSuggestion(osID: monitor.snapshot?.osInfo["id"])
+            VStack(alignment: .leading, spacing: 4) {
+                Text(wanted).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if let command {
+                    HStack(spacing: 6) {
+                        Text(command).font(.caption.monospaced()).textSelection(.enabled).lineLimit(2)
+                        Button { CommandFormat.copy(command) } label: { Image(systemName: "doc.on.doc") }
+                            .buttonStyle(.borderless)
+                            .help("Copy — run it on the server yourself if you want it (Tether installs nothing)")
+                    }
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.6)))
+                }
+            }
+        }
+    }
+
+    private func processRow(_ e: ProcessTrafficEntry) -> some View {
+        let quiet = e.rate == 0
+        return HStack(spacing: 6) {
+            Text(e.name.isEmpty ? "?" : e.name).lineLimit(1)
+            Text(verbatim: String(e.pid)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).help("Process ID")
+            Spacer(minLength: 4)
+            if let c = e.connections {
+                Text("\(c) connection\(c == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+            } else {
+                if e.history.count > 2 {
+                    Sparkline(values: normalized(e.history), tint: .indigo, filled: false)
+                        .frame(width: 40, height: 12)
+                        .help("Speed over the last \(e.history.count) samples")
+                }
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text("↓ \((e.received ?? 0).rateString)  ↑ \((e.sent ?? 0).rateString)")
+                        .help("Speed now: download ↓ and upload ↑ per second")
+                    if e.total > 0 {
+                        Text("\(Int64(e.total).byteString) total").foregroundStyle(.secondary)
+                            .help("Moved since this card opened: ↓ \(Int64(e.totalReceived).byteString) ↑ \(Int64(e.totalSent).byteString)")
+                    }
+                }
+                .font(.caption.monospacedDigit())
+                .fixedSize()
+            }
+        }
+        .font(.callout)
+        .opacity(quiet && e.connections == nil ? 0.5 : 1)
+    }
+
+    private var title: String {
+        switch traffic.source {
+        case .nettop?: "Traffic by process (nettop)"
+        case .nethogs?: "Traffic by process (nethogs)"
+        case .tcp?: "Traffic by process (TCP)"
+        case .connections?: "Connections by process"
+        default: "Traffic by process"
         }
     }
 }

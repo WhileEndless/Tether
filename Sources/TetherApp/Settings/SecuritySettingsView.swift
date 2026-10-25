@@ -136,6 +136,8 @@ struct SecuritySettingsPane: View {
     private func applyEncryption(_ on: Bool) {
         model.settings.encryptRecordings = on
         lock.installKey(RecordingCrypto.key)
+        // The command history follows: every file is written again, sealed or plain.
+        model.commandHistory.rewriteAll()
         message = on ? "Recordings are encrypted from now on." : "Recordings are no longer encrypted."
         if on { encryptExisting() } else { Task { await refreshStatus() } }
     }
