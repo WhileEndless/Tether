@@ -49,6 +49,16 @@ final class TmuxDriver {
     var catchUpLimit = 100_000
     /// First catch-up attempt: this many history rows (enough unless a lot was printed meanwhile).
     static let catchUpProbe = 1_000
+    /// Second attempt, before everything the server kept: a whole history can be many megabytes,
+    /// which takes minutes over a slow link.
+    static let catchUpStep = 10_000
+
+    /// How many history rows the next catch-up asks for after `rows` did not reach the last thing
+    /// seen locally; nil when the server has no more.
+    static func nextCatchUp(after rows: Int, available: Int) -> Int? {
+        guard rows < available else { return nil }
+        return rows < catchUpStep ? min(catchUpStep, available) : available
+    }
 
     /// Questions to tmux, in the order they were sent: tmux answers in that order. A question that
     /// timed out keeps its place (without a continuation) so its late answer is not taken for the
@@ -212,11 +222,10 @@ final class TmuxDriver {
                                                 height: info.height, cursor: (info.cursorX, info.cursorY))
                 display(out.stream)
                 refresh(out.redraw)
-            } else if success, rows < min(info.historySize, catchUpLimit) {
-                // More was printed than the first look covered: fetch everything the server kept.
-                let all = min(info.historySize, catchUpLimit)
-                send(TmuxCommands.capturePane(pane: info.paneID, historyLines: all, join: false),
-                     expect: .catchUp(info: info, anchor: anchor, rows: all))
+            } else if success, let more = Self.nextCatchUp(after: rows, available: min(info.historySize, catchUpLimit)) {
+                // More was printed than this look covered: look further back, in steps.
+                send(TmuxCommands.capturePane(pane: info.paneID, historyLines: more, join: false),
+                     expect: .catchUp(info: info, anchor: anchor, rows: more))
                 return
             } else if success, !lines.isEmpty {
                 // The last thing seen locally is gone from the server's history (cleared, or older than

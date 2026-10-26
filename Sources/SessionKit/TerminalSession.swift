@@ -278,6 +278,16 @@ public final class TerminalSession: Identifiable {
     @ObservationIgnored private var tmux: TmuxDriver?
     @ObservationIgnored private var markerBuffer: [UInt8] = []
     @ObservationIgnored private var markerResolved = false
+    /// The bootstrap never answered and the tab was taken as a plain session (see
+    /// `watchForMissingMarker`): until `guessedUntil`, a marker that still comes is honoured.
+    @ObservationIgnored private var guessedPlain = false
+    @ObservationIgnored private var guessedUntil = Date.distantPast
+    @ObservationIgnored private var onlineBeforeGuess = false
+    /// Output arrived from the ssh process of this attempt (not an earlier one).
+    @ObservationIgnored private var receivedThisAttempt = false
+    /// Bytes received while restoring the screen, shown in the progress.
+    @ObservationIgnored private var restoredBytes = 0
+    @ObservationIgnored private var restoreShownAt = Date.distantPast
     /// The plain shell's process id on the host, as the bootstrap (or PowerShell) reported it.
     @ObservationIgnored private var shellPid: Int?
     /// Windows: the unique part of the PowerShell command line this tab started (see `WindowsShell`).
@@ -732,6 +742,7 @@ public final class TerminalSession: Identifiable {
     /// Runs the terminal process: ssh (attaching to the shared connection) with the bootstrap command.
     private func startTerminal(attachOnly: Bool) {
         let config = configurationProvider()
+        resetAttempt()
         progress?.step = .startSession
         progress?.detail = descriptor.target.isLocal ? "Starting a local shell" : "Starting the session on the server"
 
@@ -791,22 +802,49 @@ public final class TerminalSession: Identifiable {
     /// for a password: a device that ignores the command it was given and shows its own command
     /// line, or a menu. After a while the tab is used as it is (a plain session) instead of waiting
     /// for ever behind "Connecting".
+    /// Re-attaching to a known tmux/screen session is never guessed: only a slow server or link keeps
+    /// its answer away, and a guess would show tmux's control stream as text and end in "Shell exited".
     private func watchForMissingMarker(_ started: LocalProcess) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
             guard let self, self.process === started, !self.markerResolved, !self.phase.isDead, !self.intentionalStop else { return }
-            guard self.fedAnything, self.passwordPrompt == nil, Date().timeIntervalSince(self.lastReceivedAt) >= 5 else {
+            let guess = Self.shouldGuessPlain(
+                reattachingPersistent: self.pendingAttachOnly && (self.persistence == .tmux || self.persistence == .screen),
+                receivedThisAttempt: self.receivedThisAttempt,
+                quietFor: Date().timeIntervalSince(self.lastReceivedAt),
+                promptShown: self.passwordPrompt != nil,
+                asking: AskPassBridge.shared.isAsking(environment: self.askPassEnv))
+            guard guess else {
                 self.watchForMissingMarker(started)          // still busy (a slow profile, a prompt): look again
                 return
             }
             self.markerResolved = true
+            self.guessedPlain = true
+            self.guessedUntil = Date().addingTimeInterval(120)
+            self.onlineBeforeGuess = self.wasOnline
             self.handleMarker(.plain)
         }
+    }
+
+    /// Whether a terminal whose bootstrap has not answered is taken as a plain session now: only when
+    /// this attempt's ssh showed something, then nothing for 5 s, and nothing asks for a password.
+    nonisolated static func shouldGuessPlain(reattachingPersistent: Bool, receivedThisAttempt: Bool,
+                                             quietFor: TimeInterval, promptShown: Bool, asking: Bool) -> Bool {
+        !reattachingPersistent && receivedThisAttempt && quietFor >= 5 && !promptShown && !asking
+    }
+
+    /// Forgets what an earlier ssh process of this tab received.
+    private func resetAttempt() {
+        receivedThisAttempt = false
+        guessedPlain = false
+        restoredBytes = 0
+        restoreShownAt = .distantPast
     }
 
     /// A login without Tether's bootstrap: PowerShell on Windows, or — for a network device or
     /// limited shell — the device's own command line, exactly as `ssh host` gives it. Neither can be
     /// kept running by tmux or screen.
     private func startPlainLogin(attachOnly: Bool, config: SessionConfiguration, windows: Bool) {
+        resetAttempt()
         if attachOnly {
             if windows {
                 progress?.failure = "Windows sessions end when the connection drops."
@@ -864,11 +902,19 @@ public final class TerminalSession: Identifiable {
 
     fileprivate func processOutput(_ slice: ArraySlice<UInt8>) {
         lastReceivedAt = Date()
-        if !markerResolved {
+        receivedThisAttempt = true
+        if progress?.step == .restore { noteRestored(slice.count) }
+        if guessedPlain, Date() > guessedUntil { guessedPlain = false; markerBuffer = [] }
+        if !markerResolved || guessedPlain {
             markerBuffer.append(contentsOf: slice)
             if let found = RemoteBootstrap.extractMarker(from: markerBuffer) {
                 markerResolved = true
                 markerBuffer = []
+                if guessedPlain {
+                    // The server answered after all (slowly): it was not a plain session.
+                    guessedPlain = false
+                    wasOnline = onlineBeforeGuess
+                }
                 shellPid = found.fields["pid"].flatMap(Int.init)
                 display(found.before)
                 handleMarker(found.marker)
@@ -877,12 +923,21 @@ public final class TerminalSession: Identifiable {
                 let hold = RemoteBootstrap.pendingPrefixLength(markerBuffer)
                 let emit = Array(markerBuffer.dropLast(hold))
                 markerBuffer = Array(markerBuffer.suffix(hold))
-                rememberStderr(emit)
+                if !markerResolved { rememberStderr(emit) }
                 display(emit)
             }
             return
         }
         routeOutput(slice)
+    }
+
+    /// Shows how much of the screen and history has arrived, at most twice a second.
+    private func noteRestored(_ count: Int) {
+        restoredBytes += count
+        guard restoredBytes >= 64 << 10, Date().timeIntervalSince(restoreShownAt) >= 0.5 else { return }
+        restoreShownAt = Date()
+        let amount = ByteCountFormatter.string(fromByteCount: Int64(restoredBytes), countStyle: .file)
+        progress?.detail = "Restoring screen and history — \(amount) received"
     }
 
     private func routeOutput(_ slice: ArraySlice<UInt8>) {
@@ -973,8 +1028,10 @@ public final class TerminalSession: Identifiable {
             let text = reason ?? ""
             if text.contains("detached") {
                 finish(reason: "Detached from tmux", archive: true)
-            } else {
+            } else if descriptor.target.isLocal {
                 finish(reason: "Session ended", archive: true)
+            } else {
+                confirmTmuxEnded(reason: text)
             }
             return
         }
@@ -1011,6 +1068,28 @@ public final class TerminalSession: Identifiable {
             retryPausedReason = "The server did not accept the sign-in. Check the password or key, then press Reconnect."
         }
         scheduleReconnect()
+    }
+
+    /// tmux ended this client without saying "detached". It also does so while the session keeps
+    /// running — a client too far behind on a slow link — so the server is asked before the tab is
+    /// called ended: still there → reconnect and re-attach; no answer → reconnect too (the bootstrap
+    /// then says whether the session is gone).
+    private func confirmTmuxEnded(reason: String) {
+        activityTask?.cancel()
+        tmux = nil
+        tmuxExitReason = nil
+        let executor = RemoteExecutor(target: descriptor.target, options: sshOptions(configurationProvider()))
+        let name = descriptor.remoteSessionName
+        Task { [weak self] in
+            let r = await executor.run(RemoteScript(#"tmux has-session -t "=$1" 2>/dev/null"#), arguments: [name],
+                                       timeout: 10, purpose: "monitor")
+            guard let self, !self.intentionalStop, !self.phase.isDead, self.process == nil, self.retryTask == nil else { return }
+            if r.status == 1 && !r.timedOut {
+                self.finish(reason: "Session ended", archive: true)
+            } else {
+                self.connectionLost(reason.isEmpty ? "tmux closed the connection" : "tmux closed the connection (\(reason))")
+            }
+        }
     }
 
     private func scheduleReconnect() {

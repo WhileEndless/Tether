@@ -123,6 +123,8 @@ public final class AskPassBridge: @unchecked Sendable {
         /// The processes this token was given to: only they (and what they start, e.g. the ssh for a
         /// jump host, then the helper) may use it.
         var pids: Set<pid_t> = []
+        /// Questions sent to the app that have no answer yet.
+        var asking = 0
     }
 
     private let lock = NSLock()
@@ -228,6 +230,13 @@ public final class AskPassBridge: @unchecked Sendable {
             "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
             "TETHER_ASKPASS_TOKEN": token,
         ]
+    }
+
+    /// Whether a question of the ssh given this environment waits for an answer right now.
+    public func isAsking(environment env: [String: String]) -> Bool {
+        guard let token = env["TETHER_ASKPASS_TOKEN"] else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return (contexts[token]?.asking ?? 0) > 0
     }
 
     /// Whether an answer for this token can still reach its ssh (not revoked, helper still there).
@@ -376,6 +385,8 @@ public final class AskPassBridge: @unchecked Sendable {
         var request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
                                      prompt: prompt, sequence: ctx.count)
         request.sessionID = ctx.sessionID
+        lock.lock(); contexts[token]?.asking += 1; lock.unlock()
+        defer { lock.lock(); contexts[token]?.asking -= 1; lock.unlock() }
         let semaphore = DispatchSemaphore(value: 0)
         let box = AnswerBox()
         Task {
