@@ -93,7 +93,7 @@ private struct InspectorTabBar: View {
         return Menu {
             HostFeaturesMenu(target: target, showAll: editHost)
         } label: {
-            Image(systemName: "slider.horizontal.3").font(.system(size: 12)).foregroundStyle(.secondary)
+            Image(systemName: "slider.horizontal.3").uiFont(size: 12).foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
@@ -108,7 +108,7 @@ private struct InspectorTabBar: View {
                     selection = tab
                 } label: {
                     Image(systemName: tab.icon)
-                        .font(.system(size: 13))
+                        .uiFont(size: 13)
                         .frame(maxWidth: .infinity, minHeight: 26)
                         .foregroundStyle(selection == tab ? Color.accentColor : .secondary)
                         .background {
@@ -142,7 +142,7 @@ struct HostHeader: View {
         HStack(spacing: 10) {
             ZStack(alignment: .bottomTrailing) {
                 Image(systemName: "server.rack")
-                    .font(.title2)
+                    .uiFont(.title2)
                     .foregroundStyle(model.metadata(for: target.key).color.color ?? .accentColor)
                 Circle()
                     .fill(monitor.isStreaming && monitor.error == nil ? Color.green : Color.secondary)
@@ -150,9 +150,9 @@ struct HostHeader: View {
                     .offset(x: 3, y: 2)
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text(target.displayName).font(.headline).lineLimit(1)
+                Text(target.displayName).uiFont(.headline).lineLimit(1)
                 Text(snapshot.map { "\($0.osName) · \($0.architecture) · up \($0.uptime.uptimeString)" } ?? "Connecting…")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                     .contentTransition(.opacity)
             }
             Spacer()

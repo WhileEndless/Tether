@@ -19,3 +19,17 @@ public extension String {
         return out + "'"
     }
 }
+
+public extension String {
+    /// Quoted for PowerShell: single quotes, a quote inside doubled ('it''s').
+    var powerShellQuoted: String {
+        if !isEmpty, allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "-_./\\:".contains($0)) }) { return self }
+        // PowerShell also takes the typographic single quotes (‘ ’ ‚ ‛) as quotes.
+        var out = "'"
+        for c in self {
+            out.append(c)
+            if "'\u{2018}\u{2019}\u{201A}\u{201B}".contains(c) { out.append(c) }
+        }
+        return out + "'"
+    }
+}

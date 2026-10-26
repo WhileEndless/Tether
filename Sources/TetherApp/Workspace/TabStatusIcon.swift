@@ -5,6 +5,7 @@ import MonitorKit
 
 /// What a tab (and its sidebar row) shows in front of its title, most important first:
 ///
+/// 0. a login that needs your password (shown when you show the tab);
 /// 1. a coding agent waiting for you (plan approval, a question, a permission);
 /// 2. a program asking for attention (notification, bell);
 /// 3. a coding agent: its symbol, moving while it works;
@@ -19,8 +20,12 @@ struct TabStatusIcon: View {
     var size: CGFloat = 10
     /// Shown instead of the state dot when there is nothing else (the sidebar's terminal symbol).
     var restingSymbol: String?
+    /// Symbols move while something works (the tab bar). The sidebar shows them still: a looping
+    /// animation in every list row costs CPU for as long as an agent works, and the tab shows it.
+    var animates = true
 
     enum Shown: Equatable {
+        case signIn
         case waiting(AgentKind, String)
         case attention(String)
         case agent(AgentKind, working: Bool)
@@ -30,6 +35,7 @@ struct TabStatusIcon: View {
     }
 
     var shown: Shown {
+        if model.waitsForSignIn(session) { return .signIn }
         if let agent = session.agent, case .waiting(let why) = agent.activity {
             return .waiting(agent.kind, why)
         }
@@ -49,6 +55,11 @@ struct TabStatusIcon: View {
     var body: some View {
         Group {
             switch shown {
+            case .signIn:
+                Image(systemName: "key.fill")
+                    .font(.system(size: size))
+                    .foregroundStyle(.orange)
+                    .help("Needs your password — show this tab to sign in")
             case .waiting(let kind, let why):
                 Image(systemName: "hand.raised.fill")
                     .font(.system(size: size))
@@ -64,27 +75,27 @@ struct TabStatusIcon: View {
                 Image(systemName: kind.symbol)
                     .font(.system(size: size, weight: .semibold))
                     .foregroundStyle(Color(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue))
-                    .symbolEffect(.pulse, isActive: working)
+                    .symbolEffect(.pulse, isActive: working && animates)
                     .help(working ? "\(kind.title) is working" : kind.title)
             case .working(let why):
                 Image(systemName: "circle.dotted")
                     .font(.system(size: size, weight: .bold))
                     .foregroundStyle(Color.accentColor)
-                    .symbolEffect(.variableColor.iterative, isActive: true)
+                    .symbolEffect(.variableColor.iterative, isActive: animates)
                     .help("\(commandName) is working — \(why)")
             case .quiet(let name):
                 Circle().fill(Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
                     .help("\(name) is open, not doing anything")
             case .phase:
                 if let restingSymbol {
-                    Image(systemName: restingSymbol).font(.caption).foregroundStyle(session.phase.tint)
+                    Image(systemName: restingSymbol).font(.system(size: size)).foregroundStyle(session.phase.tint)
                 } else {
                     StatusDot(phase: session.phase, size: 6)
                         .help(session.phase.label)
                 }
             }
         }
-        .frame(width: 16, height: 16)
+        .frame(width: size + 6, height: size + 6)
     }
 
     /// Whether the terminal's command works, is only open, or the shell is at its prompt.

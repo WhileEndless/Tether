@@ -20,7 +20,7 @@ struct PortsPanel: View {
             Section {
                 if saved.isEmpty {
                     Text("No forwards yet. Add one, or forward a port the server listens on below.")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .uiFont(.callout).foregroundStyle(.secondary)
                 }
                 ForEach(saved) { f in ForwardRow(forward: f, target: target, onEdit: { isNew = false; editing = f }) }
             } header: {
@@ -39,10 +39,10 @@ struct PortsPanel: View {
                 Section("Listening on the server") {
                     ForEach(monitor.listeningPorts.filter { $0.proto == "tcp" }) { p in
                         HStack {
-                            Text(verbatim: String(p.port)).font(.callout.monospacedDigit()).frame(width: 56, alignment: .leading)
+                            Text(verbatim: String(p.port)).uiFont(.callout).monospacedDigit().frame(width: 56, alignment: .leading)
                             Text([p.container.map { "🐳 \($0)" }, p.process.isEmpty ? nil : p.process, p.address]
                                     .compactMap { $0 }.joined(separator: " · "))
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                .uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                             Spacer()
                             Button("Forward") { model.quickForward(target, port: p.port, address: p.address) }
                                 .buttonStyle(.borderless)
@@ -55,7 +55,7 @@ struct PortsPanel: View {
             let configured = configForwards
             if !configured.isEmpty {
                 Section {
-                    ForEach(configured, id: \.self) { Text($0).font(.callout.monospaced()) }
+                    ForEach(configured, id: \.self) { Text($0).uiFont(.callout, design: .monospaced) }
                 } header: {
                     Text("From SSH config")
                 } footer: {
@@ -104,14 +104,14 @@ private struct ForwardRow: View {
                 HStack(spacing: 6) {
                     Text(forward.label.isEmpty ? forward.summary : forward.label).lineLimit(1)
                     if forward.autoStart {
-                        Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow).help("Starts automatically")
+                        Image(systemName: "bolt.fill").uiFont(.caption2).foregroundStyle(.yellow).help("Starts automatically")
                     }
                 }
                 switch status {
-                case .failed(let msg): Text(msg).font(.caption).foregroundStyle(.red).lineLimit(2)
-                case .starting: Text("Starting…").font(.caption).foregroundStyle(.secondary)
-                case .active: Text(forward.label.isEmpty ? "Active" : forward.summary).font(.caption).foregroundStyle(.green)
-                case .inactive: Text(forward.kind.title).font(.caption).foregroundStyle(.secondary)
+                case .failed(let msg): Text(msg).uiFont(.caption).foregroundStyle(.red).lineLimit(2)
+                case .starting: Text("Starting…").uiFont(.caption).foregroundStyle(.secondary)
+                case .active: Text(forward.label.isEmpty ? "Active" : forward.summary).uiFont(.caption).foregroundStyle(.green)
+                case .inactive: Text(forward.kind.title).uiFont(.caption).foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -165,7 +165,7 @@ private struct ForwardEditor: View {
                 }
                 TextField("Bind address", text: $forward.bindAddress, prompt: Text("Default (loopback only)"))
                 Toggle("Start automatically when connected", isOn: $forward.autoStart)
-                Text(explanation).font(.caption).foregroundStyle(.secondary)
+                Text(explanation).uiFont(.caption).foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
             HStack {

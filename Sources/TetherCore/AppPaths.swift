@@ -24,6 +24,11 @@ public enum AppPaths {
         ensure(supportDirectory.appendingPathComponent("Command History", isDirectory: true))
     }
 
+    /// Remote files downloaded by "Copy" in the file manager, for pasting in Finder (removed after a day).
+    public static var clipboardDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("TetherClipboard", isDirectory: true)
+    }
+
     /// Temporary downloads used for previews.
     public static var previewDirectory: URL {
         ensure(FileManager.default.temporaryDirectory.appendingPathComponent("TetherPreview", isDirectory: true))
@@ -76,6 +81,12 @@ public enum AppPaths {
         let previews = previewDirectory.path
         for name in (try? fm.contentsOfDirectory(atPath: previews)) ?? [] {
             let path = previews + "/" + name
+            if old(path) { try? fm.removeItem(atPath: path) }
+        }
+        // Remote files downloaded for "Copy" so Finder can paste them: one folder each.
+        let clipboard = clipboardDirectory.path
+        for name in (try? fm.contentsOfDirectory(atPath: clipboard)) ?? [] {
+            let path = clipboard + "/" + name
             if old(path) { try? fm.removeItem(atPath: path) }
         }
         // Socket folders of test and demo runs, and the private tmux servers of self-tests.

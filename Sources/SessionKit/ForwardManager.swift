@@ -190,7 +190,7 @@ public final class ForwardManager {
             stream.start(executor: executor,
                          script: RemoteScript("while sleep 30; do echo; done",
                                               windows: "while ($true) { Start-Sleep -Seconds 30; '' }"),
-                         platform: platform, arguments: [], purpose: "forward")
+                         platform: platform, arguments: [], purpose: "forward-keepalive")
         }
     }
 }

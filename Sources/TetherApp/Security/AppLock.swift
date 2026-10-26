@@ -126,6 +126,7 @@ final class AppLock {
         RecordingCrypto.key = nil          // open recorders keep writing with their own copy
         SecretGate.shared.lock()
         AppModel.shared.transientPasswords.removeAll()
+        AppModel.shared.recentPasswords.removeAll()
         AskPassPanel.shared.update(nil)
         // Sheets show the lock screen themselves (`appLockCover`), so Tether can be unlocked from
         // them too and nothing behind them gets the keyboard. Rename prompts are closed.
@@ -148,7 +149,7 @@ final class AppLock {
             window.ignoresMouseEvents = false
         }
         hiddenWhileLocked = []
-        AskPassPanel.shared.update(AppModel.shared.prompts.first)
+        AppModel.shared.refreshPromptPanel()
     }
 
     /// The Mac is asleep, its display is off, or its screen is locked: no one is there to answer Touch ID.

@@ -127,6 +127,8 @@ struct Shortcut: Identifiable {
 
     // MARK: Terminal
     static let clearScrollback = Shortcut("Clear Scrollback", .terminal, k("k"))
+    static let pasteFilesTo = Shortcut("Paste Files To…", .files, k("v", [.command, .option]),
+                                       note: "Uploads copied files into a server folder you choose (⌘V uses the setting in Settings ▸ Transfers)")
     static let mouseReporting = Shortcut("Allow Mouse Reporting", .terminal, k("r"),
                                          note: "While connected, as in Terminal.app: in this terminal, programs that ask for the mouse (vim, htop, tmux) get it; ⌥-drag selects text anyway")
     static let clearScreen = Shortcut("Clear Screen", .terminal, display: "⌃L", note: "Handled by the shell")
@@ -174,6 +176,10 @@ struct Shortcut: Identifiable {
     static let lockApp = Shortcut("Lock Tether", .view, k("l", [.command, .control]),
                                   note: "With App Lock on (Settings ▸ Security)")
     static let shortcuts = Shortcut("Keyboard Shortcuts", .view, k("/"))
+    static let biggerInterface = Shortcut("Bigger Text and Icons", .view, k("+", [.command, .option]),
+                                          note: "Sidebar, tabs and host panel (Settings ▸ Appearance)")
+    static let smallerInterface = Shortcut("Smaller Text and Icons", .view, k("-", [.command, .option]))
+    static let defaultInterface = Shortcut("Default Text and Icon Size", .view, k("0", [.command, .option]))
 
     static let all: [Shortcut] = [
         newConnection, quickConnect, newTab, newLocalTerminal, newPrivateTab, newWindow, addHost, editConfig,
@@ -183,8 +189,9 @@ struct Shortcut: Identifiable {
         clearScrollback, mouseReporting, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
-        browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
-        toggleSidebar, hostPanel, runningCommand, showArchive, statusBar, settings, lockApp, shortcuts,
+        browseHere, pasteFilesTo, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
+        toggleSidebar, hostPanel, runningCommand, showArchive, statusBar,
+        biggerInterface, smallerInterface, defaultInterface, settings, lockApp, shortcuts,
     ]
 }
 

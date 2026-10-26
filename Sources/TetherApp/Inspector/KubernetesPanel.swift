@@ -48,7 +48,7 @@ struct KubernetesPanel: View {
         HStack(spacing: 8) {
             Image(systemName: "circle.hexagongrid").foregroundStyle(.secondary)
             Text(title).fontWeight(.medium)
-            Text(detail).font(.caption).foregroundStyle(warn ? .orange : .secondary)
+            Text(detail).uiFont(.caption).foregroundStyle(warn ? .orange : .secondary)
             Spacer()
             Button { Task { await monitor.refreshKubernetes() } } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
@@ -64,9 +64,9 @@ struct KubernetesPanel: View {
         let message: String
         var body: some View {
             VStack(alignment: .leading, spacing: 6) {
-                Label(title, systemImage: symbol).font(.headline)
+                Label(title, systemImage: symbol).uiFont(.headline)
                 Text(message)
-                    .font(.callout).foregroundStyle(.secondary)
+                    .uiFont(.callout).foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -86,7 +86,7 @@ struct KubernetesPanel: View {
                 Image(systemName: "circle.hexagongrid").foregroundStyle(.secondary)
                 Text(cluster.context.isEmpty ? cluster.tool : cluster.context).fontWeight(.medium).lineLimit(1)
                 Text("\(cluster.pods.count) pods\(failing > 0 ? " · \(failing) failing" : "")")
-                    .font(.caption).foregroundStyle(failing > 0 ? .orange : .secondary)
+                    .uiFont(.caption).foregroundStyle(failing > 0 ? .orange : .secondary)
                 Spacer()
                 Button { Task { await monitor.refreshKubernetes() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
@@ -110,7 +110,7 @@ struct KubernetesPanel: View {
             }
             .padding(10)
             if let message {
-                Text(message).font(.caption).foregroundStyle(.red).padding(.horizontal, 10).padding(.bottom, 6)
+                Text(message).uiFont(.caption).foregroundStyle(.red).padding(.horizontal, 10).padding(.bottom, 6)
             }
             List {
                 if !cluster.nodes.isEmpty {
@@ -120,7 +120,7 @@ struct KubernetesPanel: View {
                                 Circle().fill(node.ready ? Color.green : .red).frame(width: 7, height: 7)
                                 Text(node.name).lineLimit(1)
                                 Spacer()
-                                Text(node.version).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                Text(node.version).uiFont(.caption, design: .monospaced).foregroundStyle(.secondary)
                             }
                         }
                     } label: {
@@ -149,13 +149,13 @@ struct KubernetesPanel: View {
                 Text(pod.name).lineLimit(1)
                 Text([pod.namespace, pod.node, pod.created.map { $0.formatted(.relative(presentation: .named)) } ?? ""]
                         .filter { !$0.isEmpty }.joined(separator: " · "))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
-                Text(pod.status).font(.caption).foregroundStyle(pod.health == .failing ? .red : .secondary).lineLimit(1)
+                Text(pod.status).uiFont(.caption).foregroundStyle(pod.health == .failing ? .red : .secondary).lineLimit(1)
                 Text("\(pod.readyCount)/\(pod.containers.count)\(pod.restarts > 0 ? " · \(pod.restarts) restarts" : "")")
-                    .font(.caption2.monospacedDigit())
+                    .uiFont(.caption2).monospacedDigit()
                     .foregroundStyle(pod.restarts > 0 ? .orange : .secondary)
             }
             Menu {

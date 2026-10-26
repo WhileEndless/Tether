@@ -2,6 +2,7 @@ import SwiftUI
 import TetherCore
 import SessionKit
 import TerminalUI
+import SSHTransport
 
 /// The window's content: its terminal, or the welcome screen when the window has no session.
 struct WorkspaceView: View {
@@ -118,6 +119,7 @@ struct SessionPane: View {
                 guard let state else { return }
                 AppModel.shared.handleFiles(urls, for: session, in: state)
             }
+            view.onClick = { [weak state] in state?.follow(session) }
         }
     }
 }
@@ -147,21 +149,28 @@ struct SessionBanner: View {
                         Image(systemName: "wifi.exclamationmark")
                             .foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 1) {
-                            Text("Waiting for connection").fontWeight(.semibold)
+                            Text(session.retryPausedReason != nil || session.waitsForUser ? "Not connected" : "Waiting for connection").fontWeight(.semibold)
                             Group {
                                 if let next {
                                     Text("Attempt \(attempt) · retrying \(next, style: .relative)")
+                                } else if session.retryPausedReason != nil || session.waitsForUser {
+                                    Text("Attempt \(attempt) · waiting for you")
                                 } else {
                                     Text("Attempt \(attempt) · automatic retry is off")
                                 }
                             }
                             .font(.caption).foregroundStyle(.secondary)
                             if let err = session.lastError {
-                                Text(err).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                Text(err).font(.caption2).foregroundStyle(.secondary)
+                                    .lineLimit(session.retryPausedReason != nil ? 2 : 1)
+                                    .help(err)
                             }
                         }
                         Button("Reconnect Now") { session.reconnectNow() }
                             .glassButtonStyle()
+                        Button("Close") { state.closeTab(session) }
+                            .glassButtonStyle()
+                            .help("Close this tab (a tmux or screen session keeps running on the server)")
                     }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -223,7 +232,7 @@ struct SessionFooter: View {
                 Label(persistenceText, systemImage: persistenceIcon).fixedSize()
                 Image(systemName: persistenceIcon)
             }
-            .help(persistenceText)
+            .help(persistenceHelp)
             // Only an icon: whether output is kept on this Mac (the tooltip says where to change it).
             if session.descriptor.isPrivate {
                 Image(systemName: "eye.slash").foregroundStyle(.secondary)
@@ -276,6 +285,22 @@ struct SessionFooter: View {
         case .screen: "Persistent (screen)"
         case .plain: "Not persistent"
         case .unknown: "Negotiating…"
+        }
+    }
+
+    /// What persistence means for this tab, in words a user can act on.
+    private var persistenceHelp: String {
+        switch session.persistence {
+        case .tmux, .screen:
+            "\(persistenceText): the shell keeps running on the server when the connection drops, the Mac sleeps or the tab is closed in the background; Tether reattaches and adds what was printed meanwhile."
+        case .plain:
+            session.platform.isWindows
+                ? "Not persistent: Windows has no tmux or screen, so the shell ends when the connection drops or the tab is closed. What it printed stays in the recording."
+                : PlatformCache.shared.isDevice(session.descriptor.target.key)
+                ? "Not persistent: this is a network device or limited shell, so the session ends when the connection drops. Monitoring and background features are off here."
+                : "Not persistent: the server has no tmux or screen (or the host is set to a plain shell), so the shell ends when the connection drops, the Mac sleeps long or the tab is closed. What it printed stays in the recording; running commands stop. Install tmux on the server, or set the host's persistence, to keep shells running."
+        case .unknown:
+            "Finding out whether the server can keep the shell running (tmux or screen)…"
         }
     }
 

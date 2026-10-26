@@ -19,10 +19,10 @@ struct GPUPanel: View {
                     }
                     ForEach(monitor.gpuProcesses) { p in
                         HStack {
-                            Text(verbatim: String(p.pid)).font(.callout.monospacedDigit()).frame(width: 60, alignment: .leading)
+                            Text(verbatim: String(p.pid)).uiFont(.callout).monospacedDigit().frame(width: 60, alignment: .leading)
                             Text((p.name as NSString).lastPathComponent).lineLimit(1).help(p.name)
                             Spacer()
-                            Text(p.memoryUsed?.byteString ?? "—").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            Text(p.memoryUsed?.byteString ?? "—").uiFont(.caption).monospacedDigit().foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -95,7 +95,7 @@ struct ServicesPanel: View {
                         .help("Export the services shown as CSV")
                 }
                 if let message {
-                    Text(message).font(.caption).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(message).uiFont(.caption).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .padding(10)
@@ -105,7 +105,7 @@ struct ServicesPanel: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(s.name.replacingOccurrences(of: ".service", with: "")).lineLimit(1)
                         Text(s.description.isEmpty ? "\(s.active) · \(s.sub)" : s.description)
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
                     Menu {
@@ -165,7 +165,7 @@ struct ContainersPanel: View {
         VStack(spacing: 0) {
             HStack {
                 Text("\(monitor.containers.filter(\.isRunning).count) running · \(monitor.containers.count) total")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .uiFont(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button { Task { await monitor.refreshContainers() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
@@ -179,14 +179,14 @@ struct ContainersPanel: View {
             }
             .padding(10)
             if let message {
-                Text(message).font(.caption).foregroundStyle(.red).padding(.horizontal, 10)
+                Text(message).uiFont(.caption).foregroundStyle(.red).padding(.horizontal, 10)
             }
             List(monitor.containers) { c in
                 HStack(spacing: 8) {
                     Image(systemName: "shippingbox.fill").foregroundStyle(c.isRunning ? .green : .secondary)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(c.name).lineLimit(1)
-                        Text("\(c.image) · \(c.status)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text("\(c.image) · \(c.status)").uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                         if !c.portMappings.isEmpty {
                             PortChips(container: c, forward: forward)
                         }
@@ -246,7 +246,7 @@ private struct PortChips: View {
                             .help("Forward to this Mac")
                     }
                 }
-                .font(.caption2.monospaced())
+                .uiFont(.caption2, design: .monospaced)
                 .padding(.horizontal, 5).padding(.vertical, 2)
                 .background(Capsule().fill(.quaternary))
             }
@@ -262,14 +262,14 @@ struct LogSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(title).font(.headline)
+                Text(title).uiFont(.headline)
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
             .padding()
             ScrollView([.vertical, .horizontal]) {
                 Text(text.isEmpty ? "No output." : text)
-                    .font(.system(size: 11, design: .monospaced))
+                    .uiFont(size: 11, design: .monospaced)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)

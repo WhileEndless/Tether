@@ -14,11 +14,13 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// session so they stay valid when old scrollback lines are trimmed. See `marks`.
     private var markLines: [Int] = []
     private var pendingResize: DispatchWorkItem?
-    private var lastSentSize: (cols: Int, rows: Int)?
+    private(set) var lastSentSize: (cols: Int, rows: Int)?
     /// The display scale the cell size was worked out for (see `viewDidChangeBackingProperties`).
     private var metricsScale: CGFloat = 1
     /// Called with files dropped onto (or pasted into) the terminal.
     public var onFiles: (([URL]) -> Void)?
+    /// The user clicked into the terminal (the window then follows it: sidebar row, host panel).
+    public var onClick: (() -> Void)?
 
     /// Called when the background colour/translucency changes so SwiftUI can update the pane.
     public var onThemeChange: ((TerminalTheme) -> Void)?
@@ -91,6 +93,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyTheme()
+    }
+
+    public override func mouseDown(with event: NSEvent) {
+        onClick?()
+        super.mouseDown(with: event)
     }
 
     public override func mouseUp(with event: NSEvent) {
@@ -282,6 +289,23 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         font = newFont
         setFrameSize(size)
         metricsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        reportFontResize()
+    }
+
+    /// A new font changes the grid at once, so the program must hear the new size at once too:
+    /// waiting (the resize debounce, or a hidden tab until it is shown) leaves full-screen programs
+    /// (vim, htop) drawn for the old size on the new grid. A tab not in a window still has the frame
+    /// of its last layout, so its size is the real one — once it has been laid out at all.
+    private func reportFontResize() {
+        guard hasRealSize, bounds.width > 0, bounds.height > 0 else { return }
+        let size = cellSize
+        guard size.cols > 0, size.rows > 0 else { return }
+        pendingResize?.cancel()
+        pendingResize = nil
+        needsDisplay = true
+        if let last = lastSentSize, last == size { return }
+        lastSentSize = size
+        session?.terminalDidResize(cols: size.cols, rows: size.rows)
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -550,9 +574,22 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     /// OSC 7 (`file://host/path`) from shells that report their working directory.
     public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
-        guard let directory else { return }
-        let path = URL(string: directory)?.path ?? directory
+        guard let directory, let path = Self.reportedPath(directory) else { return }
         if !path.isEmpty, session?.reportedDirectory != path { session?.reportedDirectory = path }
+    }
+
+    /// The path in an OSC 7 report (`file://host/path`, percent-encoded — though some shells send
+    /// spaces as they are). Never the raw `file://` text.
+    static func reportedPath(_ report: String) -> String? {
+        if let url = URL(string: report), url.scheme == "file", !url.path.isEmpty { return url.path }
+        var rest = Substring(report)
+        if rest.hasPrefix("file://") {
+            rest = rest.dropFirst("file://".count)
+            guard let slash = rest.firstIndex(of: "/") else { return nil }
+            rest = rest[slash...]
+        }
+        let path = String(rest).removingPercentEncoding ?? String(rest)
+        return path.hasPrefix("/") ? path : nil
     }
 
     public func send(source: TerminalView, data: ArraySlice<UInt8>) {
@@ -572,7 +609,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         if position <= 0.0001 && trimmed && historySource != nil {
             // Older output is read back from disk as the user reaches the top (no visible break).
             DispatchQueue.main.async { [weak self] in _ = self?.loadOlderHistory() }
-        } else if position >= 0.9999 {
+        } else if position >= 0.9999, historyExtended {
             DispatchQueue.main.async { [weak self] in self?.shrinkHistoryIfAtBottom() }
         }
         let atLimit = position <= 0.0001 && trimmed && historySource == nil

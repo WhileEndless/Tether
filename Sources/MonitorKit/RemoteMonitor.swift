@@ -43,6 +43,13 @@ public final class RemoteMonitor {
     public private(set) var isStreaming = false
     /// Latency of short commands over the shared connection (for hosts without a tmux session).
     public private(set) var commandLatency: Double?
+
+    /// Published in 10 ms steps: a new value every few seconds that looks the same would redraw the
+    /// host panel and status bar for nothing.
+    private func noteCommandLatency(_ seconds: Double) {
+        let rounded = (seconds * 100).rounded() / 100
+        if commandLatency != rounded { commandLatency = rounded }
+    }
     /// The host's platform, once known (Windows hosts have no load average, tmux, etc.).
     public private(set) var platform: RemotePlatform?
 
@@ -131,8 +138,11 @@ public final class RemoteMonitor {
             // Wait for a login to this host in progress, shared connection or not: its host-key
             // question is answered once, and known_hosts has the key when this ssh starts.
             await ConnectionGate.shared.waitForTurn(executor.target.key)
-            let platform = await executor.resolvedPlatform()
+            let platform = await executor.resolvedPlatform(quiet: true)
             guard let self, self.stream === s else { return }
+            // The host needs a password and no tab has signed in: nothing is started (see
+            // BackgroundSignIn); the panel says so and tries again while someone watches.
+            guard await executor.backgroundWorkAllowed() else { s.onEnd?(255, executor.backgroundWaitingMessage); return }
             self.platform = platform
             s.start(executor: executor, script: RemoteScript(ProbeScripts.systemStream, windows: WindowsProbeScripts.systemStream),
                     platform: platform, arguments: [String(Int(interval))], purpose: "monitor")
@@ -164,7 +174,7 @@ public final class RemoteMonitor {
         do {
             let start = Date()
             let text = try await executor.output(RemoteScript(ProbeScripts.system, windows: WindowsProbeScripts.system), arguments: ["1"], timeout: 20, purpose: "monitor")
-            commandLatency = Date().timeIntervalSince(start)
+            noteCommandLatency(Date().timeIntervalSince(start))
             ingest(text)
         } catch {
             self.error = error.localizedDescription
@@ -264,7 +274,7 @@ public final class RemoteMonitor {
     private func lookAtRemoteSessions() async {
         let start = Date()
         if let text = try? await executor.output(RemoteScript(ProbeScripts.remoteSessions, windows: WindowsProbeScripts.remoteSessions), timeout: 20, purpose: "monitor") {
-            commandLatency = Date().timeIntervalSince(start)
+            noteCommandLatency(Date().timeIntervalSince(start))
             sessionsRefreshedAt = Date()
             // Unchanged lists are not assigned: observers (the sidebar) are not redrawn for nothing.
             let found = ProbeParser.remoteSessions(text)

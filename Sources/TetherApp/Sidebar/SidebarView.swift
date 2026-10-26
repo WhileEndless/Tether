@@ -4,8 +4,51 @@ import SSHConfigKit
 import SessionKit
 import MonitorKit
 
+/// How sidebar rows are drawn (Settings ▸ Appearance ▸ Sidebar).
+struct SidebarLook {
+    var style: SidebarStyle = .detailed
+    var showDetails = true
+    var showButtons = true
+    var showCounts = true
+    var scale: CGFloat = 1
+
+    init() {}
+
+    init(_ s: AppSettings, scale: CGFloat) {
+        style = s.sidebarStyle
+        showDetails = s.sidebarShowDetails
+        showButtons = s.sidebarShowRowButtons
+        showCounts = s.sidebarShowCounts
+        self.scale = scale
+    }
+
+    var details: Bool { style.canShowDetails && showDetails }
+    var buttons: Bool { style.canShowRowButtons && showButtons }
+    var counts: Bool { style.canShowCounts && showCounts }
+    /// Labels such as "background" and "Suspended", and the agent line under a session.
+    var extras: Bool { style == .detailed || style == .flat }
+    /// Rows under a host are indented by hand, except in the folder tree (which indents itself).
+    var childIndent: CGFloat { style == .folders ? 0 : 22 * scale }
+    /// "Local" and "Hosts" headers: Detailed and Compact keep their sections; Minimal shows only
+    /// group names, and Flat is one list (headers that say "Hosts" over hosts add only noise there).
+    var plainSectionHeaders: Bool { style == .detailed || style == .compact }
+    var iconWidth: CGFloat { 18 * scale }
+}
+
+private struct SidebarLookKey: EnvironmentKey {
+    static let defaultValue = SidebarLook()
+}
+
+extension EnvironmentValues {
+    var sidebarLook: SidebarLook {
+        get { self[SidebarLookKey.self] }
+        set { self[SidebarLookKey.self] = newValue }
+    }
+}
+
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
     @Environment(WindowState.self) private var state
     @Environment(\.openWindow) private var openWindow
     @State private var search = ""
@@ -70,7 +113,8 @@ struct SidebarView: View {
         case .files(let f):
             row = .files(f.id)
         }
-        if SidebarFolding.shared.collapsed.contains(key) { SidebarFolding.shared.collapsed.remove(key) }
+        let folding = SidebarFolding.shared
+        for k in [key] + SidebarFolding.folderKeys where folding.collapsed.contains(k) { folding.collapsed.remove(k) }
         if case .alias(let alias) = item.target, let group = model.metadata(for: alias).groupID,
            model.groups.first(where: { $0.id == group })?.isExpanded == false {
             model.updateGroup(group) { $0.isExpanded = true }
@@ -84,19 +128,30 @@ struct SidebarView: View {
     private var sidebarList: some View {
         @Bindable var state = state
         List(selection: $state.sidebarSelection) {
-            LocalSection()
-            favoritesSection
-            ForEach(model.groups) { group in
-                GroupSection(group: group, search: search, onRename: {
-                    newGroupName = group.name
-                    renamingGroup = group
-                })
+            switch model.settings.sidebarStyle {
+            case .folders:
+                SidebarFolderTree(search: search, adhocKeys: adhocKeys, onRename: rename)
+            case .flat:
+                LocalSection()
+                flatSection
+                quickConnectionsSection
+                ArchiveSection()
+            case .detailed, .compact, .minimal:
+                LocalSection()
+                favoritesSection
+                ForEach(model.groups) { group in
+                    GroupSection(group: group, search: search, onRename: { rename(group) })
+                }
+                ungroupedSection
+                quickConnectionsSection
+                ArchiveSection()
             }
-            ungroupedSection
-            quickConnectionsSection
-            ArchiveSection()
         }
         .listStyle(.sidebar)
+        .environment(\.sidebarLook, SidebarLook(model.settings, scale: scale))
+        // Another style is another list: rebuilt, not diffed row by row (sections and folders do
+        // not map onto each other, and reused rows could keep the old style's text).
+        .id(model.settings.sidebarStyle)
         // Menus and double-click are handled by the list itself, so a single click selects at once
         // (a per-row double-click gesture makes every single click wait).
         .contextMenu(forSelectionType: SidebarItem.self) { items in
@@ -144,29 +199,68 @@ struct SidebarView: View {
         }
     }
 
+    private func rename(_ group: HostGroup) {
+        newGroupName = group.name
+        renamingGroup = group
+    }
+
+    /// Flat: every host in one list without headers — favorites first, then by name (a group shows
+    /// as the row's colour dot, a favorite as a star).
+    private var flatSection: some View {
+        Section {
+            let favorite = { (h: SSHHostEntry) in
+                model.settings.sidebarShowFavorites && (h.alias.map { model.metadata(for: $0).favorite } ?? false)
+            }
+            let hosts = filtered(model.hosts).sorted {
+                let (a, b) = (favorite($0), favorite($1))
+                if a != b { return a }
+                return ($0.alias ?? "").localizedStandardCompare($1.alias ?? "") == .orderedAscending
+            }
+            ForEach(hosts, id: \.id) { HostRows(host: $0, search: search) }
+            if model.hosts.isEmpty { addFirstHost }
+        }
+    }
+
+    private var addFirstHost: some View {
+        Button {
+            state.hostEditor = HostEditorRequest()
+        } label: {
+            Label("Add your first host", systemImage: "plus.circle")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
+    }
+
     @ViewBuilder
     private var favoritesSection: some View {
         let favorites = model.ordered(model.hosts.filter { $0.alias.map { model.metadata(for: $0).favorite } ?? false })
-        if !favorites.isEmpty && search.isEmpty {
+        if !favorites.isEmpty && search.isEmpty && model.settings.sidebarShowFavorites {
             Section("Favorites") {
                 ForEach(favorites, id: \.id) { HostRows(host: $0, search: search) }
             }
         }
     }
 
+    @ViewBuilder
     private var ungroupedSection: some View {
+        let look = SidebarLook(model.settings, scale: scale)
+        if look.plainSectionHeaders || !model.groups.isEmpty {
+            ungroupedHosts
+        } else {
+            Section { ungroupedRows }
+        }
+    }
+
+    @ViewBuilder
+    private var ungroupedRows: some View {
+        ForEach(filtered(model.hosts(in: nil)), id: \.id) { HostRows(host: $0, search: search) }
+            .onMove { from, to in model.moveHosts(in: nil, from: from, to: to) }
+        if model.hosts.isEmpty { addFirstHost }
+    }
+
+    private var ungroupedHosts: some View {
         Section {
-            ForEach(filtered(model.hosts(in: nil)), id: \.id) { HostRows(host: $0, search: search) }
-                .onMove { from, to in model.moveHosts(in: nil, from: from, to: to) }
-            if model.hosts.isEmpty {
-                Button {
-                    state.hostEditor = HostEditorRequest()
-                } label: {
-                    Label("Add your first host", systemImage: "plus.circle")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tint)
-            }
+            ungroupedRows
         } header: {
             Text(model.groups.isEmpty ? "Hosts" : "Other Hosts")
                 .dropDestination(for: String.self) { items, _ in
@@ -183,14 +277,14 @@ struct SidebarView: View {
             Section("Quick Connections") {
                 ForEach(keys, id: \.self) { key in
                     Label(key, systemImage: "bolt.horizontal")
-                                    .tag(SidebarItem.host(key))
+                        .tag(SidebarItem.host(key))
                     HostChildren(key: key, target: model.target(forKey: key))
                 }
             }
         }
     }
 
-    private var adhocKeys: [String] {
+    var adhocKeys: [String] {
         var seen = Set<String>()
         return model.sessions.sessions.compactMap { s -> String? in
             guard case .adhoc = s.descriptor.target else { return nil }
@@ -207,6 +301,7 @@ struct SidebarView: View {
 /// A user group with its hosts. Hosts can be reordered by dragging and dropped onto the header.
 private struct GroupSection: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.sidebarLook) private var look
     let group: HostGroup
     let search: String
     let onRename: () -> Void
@@ -220,23 +315,15 @@ private struct GroupSection: View {
             HStack(spacing: 6) {
                 if let c = group.color.color { Circle().fill(c).frame(width: 7, height: 7) }
                 Text(group.name)
+                if look.counts {
+                    Text("\(model.hosts(in: group.id).count)").monospacedDigit().foregroundStyle(.tertiary)
+                }
             }
             .dropDestination(for: String.self) { items, _ in
                 items.forEach { model.moveHost($0, toGroup: group.id) }
                 return !items.isEmpty
             }
-            .contextMenu {
-                Button("Rename…", action: onRename)
-                Menu("Color") {
-                    ForEach(TagColor.allCases) { c in
-                        Button(c.title) { model.updateGroup(group.id) { $0.color = c } }
-                    }
-                }
-                Button("Move Up") { model.moveGroup(group.id, by: -1) }
-                Button("Move Down") { model.moveGroup(group.id, by: 1) }
-                Divider()
-                Button("Delete Group", role: .destructive) { model.deleteGroup(group.id) }
-            }
+            .contextMenu { GroupMenu(group: group, onRename: onRename) }
         }
     }
 
@@ -245,8 +332,28 @@ private struct GroupSection: View {
     }
 }
 
-/// A host row followed by its open sessions.
-private struct HostRows: View {
+/// A group's menu: on its section header, or its folder in the folder tree.
+struct GroupMenu: View {
+    @Environment(AppModel.self) private var model
+    let group: HostGroup
+    let onRename: () -> Void
+
+    var body: some View {
+        Button("Rename…", action: onRename)
+        Menu("Color") {
+            ForEach(TagColor.allCases) { c in
+                Button(c.title) { model.updateGroup(group.id) { $0.color = c } }
+            }
+        }
+        Button("Move Up") { model.moveGroup(group.id, by: -1) }
+        Button("Move Down") { model.moveGroup(group.id, by: 1) }
+        Divider()
+        Button("Delete Group", role: .destructive) { model.deleteGroup(group.id) }
+    }
+}
+
+/// A host row followed by its open sessions (in the folder tree: a host that opens to them).
+struct HostRows: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
     let host: SSHHostEntry
@@ -262,12 +369,21 @@ private struct HostRows: View {
         return all.filter { sessionMatches($0, q) }
     }
 
+    @Environment(\.sidebarLook) private var look
+
     var body: some View {
         if let alias = host.alias {
-            HostRow(host: host)
-                .tag(SidebarItem.host(alias))
-                .draggable(alias)
-            HostChildren(key: alias, target: .alias(alias), sessions: visibleSessions(alias), searching: !search.isEmpty)
+            let children = HostChildren(key: alias, target: .alias(alias), sessions: visibleSessions(alias), searching: !search.isEmpty)
+            if look.style == .folders {
+                HostNode(key: alias, target: .alias(alias), searching: !search.isEmpty) {
+                    HostRow(host: host).tag(SidebarItem.host(alias)).draggable(alias)
+                } children: { children }
+            } else {
+                HostRow(host: host)
+                    .tag(SidebarItem.host(alias))
+                    .draggable(alias)
+                children
+            }
         }
     }
 }
@@ -368,18 +484,20 @@ struct HostChildren: View {
 /// "3 leftover sessions on the server" with a button that ends them.
 private struct LeftoverSessionsRow: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.sidebarLook) private var look
     let count: Int
     let target: ConnectionTarget
     @State private var cleaning = false
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "tray.full").font(.caption).foregroundStyle(.secondary).frame(width: 16)
+            Image(systemName: "tray.full").uiFont(size: 10).foregroundStyle(.secondary)
+                .frame(width: 16 * look.scale, height: 16 * look.scale)
             Text("\(count) leftover session\(count == 1 ? "" : "s") on the server")
-                .font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                .uiFont(.callout).foregroundStyle(.secondary).lineLimit(1)
             Spacer(minLength: 4)
             if cleaning {
-                Image(systemName: "hourglass").font(.caption).foregroundStyle(.secondary)
+                Image(systemName: "hourglass").uiFont(.caption).foregroundStyle(.secondary)
             } else {
                 Button("Clean Up") {
                     cleaning = true
@@ -390,25 +508,26 @@ private struct LeftoverSessionsRow: View {
                     }
                 }
                 .buttonStyle(.borderless)
-                .font(.caption)
+                .uiFont(.caption)
                 .help("End the Tether sessions on this server that are not open in any tab (your own tmux sessions are not touched)")
             }
         }
-        .padding(.leading, 26)
+        .padding(.leading, look.childIndent + 4)
     }
 }
 
 /// "Show 42 more" / "Show fewer" under a host.
 private struct FoldRow: View {
+    @Environment(\.sidebarLook) private var look
     let title: String
     let action: () -> Void
 
     var body: some View {
         Button(action: { withAnimation(.snappy) { action() } }) {
             Text(title)
-                .font(.caption)
+                .uiFont(.caption)
                 .foregroundStyle(.tint)
-                .padding(.leading, 26)
+                .padding(.leading, look.childIndent + 4)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
         }
@@ -426,6 +545,13 @@ final class SidebarFolding {
     }
     var expanded: Set<String> = []
 
+    /// Folders of the folder tree that are not groups (their state is kept with the hosts').
+    static let favoritesFolder = "folder:favorites"
+    static let otherHostsFolder = "folder:other"
+    static let quickFolder = "folder:quick"
+    static let archiveFolder = "folder:archive"
+    static let folderKeys = [otherHostsFolder, quickFolder]
+
     func toggle(_ key: String) {
         if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
     }
@@ -434,6 +560,7 @@ final class SidebarFolding {
 /// One server-side session: click it (or Attach) to open it in a tab.
 private struct ServerSessionRow: View {
     @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
     let entry: RemoteSessionEntry
     let target: ConnectionTarget
     let monitor: RemoteMonitor
@@ -442,34 +569,34 @@ private struct ServerSessionRow: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "server.rack")
-                .font(.caption)
+                .uiFont(size: 10)
                 .foregroundStyle(entry.attached ? .green : .secondary)
-                .frame(width: 16)
+                .frame(width: 16 * look.scale, height: 16 * look.scale)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(entry.isTether ? "Detached session" : entry.name)
                         .lineLimit(1)
                     Text(entry.kind.rawValue)
-                        .font(.caption2)
+                        .uiFont(.caption2)
                         .padding(.horizontal, 4)
                         .background(Capsule().fill(.quaternary))
                         .foregroundStyle(.secondary)
                 }
-                if let pane = entry.activePane {
+                if let pane = entry.activePane, look.extras {
                     PaneSummary(pane: pane)
                 }
             }
             Spacer(minLength: 4)
             if attaching {
                 ProgressView().controlSize(.mini)
-            } else {
+            } else if look.buttons {
                 RowAction(symbol: "arrow.right.circle", help: "Attach in a new tab", action: attach)
                 RowAction(symbol: "xmark.circle", help: "Kill this session on the server") {
                     Task { await monitor.killRemoteSession(entry) }
                 }
             }
         }
-        .padding(.leading, 22)
+        .padding(.leading, look.childIndent)
         .contentShape(Rectangle())
         .onTapGesture(perform: attach)
         .help(helpText)
@@ -510,12 +637,12 @@ struct PaneSummary: View {
         HStack(spacing: 3) {
             if let agent = pane.agent {
                 Image(systemName: agent.isWorking ? "sparkles" : "sparkle")
-                    .font(.caption2)
+                    .uiFont(.caption2)
                     .foregroundStyle(agent.isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     .help(agent.isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
             }
             Text(stateOnly ? (pane.agent?.isWorking == true ? "working" : "waiting") : showPath ? pane.summary : pane.displayCommand)
-                .font(.caption)
+                .uiFont(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -565,12 +692,13 @@ struct RowAction: View {
     var tint: Color = .accentColor
     let action: () -> Void
     @State private var hovering = false
+    @Environment(\.uiScale) private var scale
 
     var body: some View {
         Button(action: action) {
             Image(systemName: hovering ? symbol + ".fill" : symbol)
-                .font(.system(size: 12))
-                .frame(width: 18, height: 18)
+                .uiFont(size: 12)
+                .frame(width: 18 * scale, height: 18 * scale)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -585,18 +713,45 @@ struct RowAction: View {
 
 /// Local shells on this Mac.
 private struct LocalSection: View {
-    @Environment(AppModel.self) private var model
-    @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
 
     var body: some View {
-        Section {
-            HStack(spacing: 8) {
-                Image(systemName: "laptopcomputer").foregroundStyle(.tint).frame(width: 18)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("This Mac")
-                    Text(localMachineName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        if look.plainSectionHeaders {
+            Section {
+                rows
+            } header: {
+                Text("Local")
+            }
+        } else {
+            Section { rows }
+        }
+    }
+
+    @ViewBuilder
+    private var rows: some View {
+        LocalRow().tag(SidebarItem.host("local"))
+        HostChildren(key: "local", target: .local)
+    }
+}
+
+/// "This Mac", with a button for a new local terminal.
+struct LocalRow: View {
+    @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
+
+    var body: some View {
+        HStack(spacing: 8 * look.scale) {
+            if look.style != .minimal {
+                Image(systemName: "laptopcomputer").foregroundStyle(.tint).frame(width: look.iconWidth)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text("This Mac").uiFont(.body)
+                if look.details {
+                    Text(localMachineName).uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Spacer()
+            }
+            Spacer()
+            if look.style != .minimal {
                 Button {
                     state.connect(.local)
                 } label: {
@@ -605,16 +760,14 @@ private struct LocalSection: View {
                 .buttonStyle(.borderless)
                 .help("New local terminal (⌥⌘T)")
             }
-            .tag(SidebarItem.host("local"))
-            HostChildren(key: "local", target: .local)
-        } header: {
-            Text("Local")
         }
+        .help(look.details ? "" : localMachineName)
     }
 }
 
 private struct ArchiveSection: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.sidebarLook) private var look
     @Environment(WindowState.self) private var state
     @Environment(\.openWindow) private var openWindow
 
@@ -623,13 +776,15 @@ private struct ArchiveSection: View {
             Section {
                 ForEach(model.sessions.archive.prefix(30)) { item in
                     ArchiveRow(item: item)
-                                    .tag(SidebarItem.archived(item.id))
+                        .tag(SidebarItem.archived(item.id))
                 }
             } header: {
                 HStack {
                     Text("Archive")
                     Spacer()
-                    Text("\(model.sessions.archive.count)").monospacedDigit().foregroundStyle(.tertiary)
+                    if look.counts {
+                        Text("\(model.sessions.archive.count)").monospacedDigit().foregroundStyle(.tertiary)
+                    }
                 }
             }
         }
@@ -656,7 +811,7 @@ private struct SidebarBottomBar: View {
                 Button("Reload SSH Config") { model.reloadConfig() }
             } label: {
                 // Not the tab bar's "+" (a new tab): this one adds to the host list, and says so.
-                Label("Add", systemImage: "server.rack").labelStyle(.titleAndIcon).font(.callout)
+                Label("Add", systemImage: "server.rack").labelStyle(.titleAndIcon).uiFont(.callout)
             }
             .menuStyle(.button)
             .menuIndicator(.visible)
@@ -676,7 +831,7 @@ private struct SidebarBottomBar: View {
                 }
             }
             BarButton(symbol: model.settings.showSidebarArchive ? "archivebox.fill" : "archivebox",
-                      badge: archived, active: model.settings.showSidebarArchive,
+                      active: model.settings.showSidebarArchive,
                       help: model.settings.showSidebarArchive ? "Hide the archive (\(archived) ended sessions)"
                                                               : "Show the archive (\(archived) ended sessions)") {
                 model.settings.showSidebarArchive.toggle()
@@ -689,7 +844,7 @@ private struct SidebarBottomBar: View {
                     Circle().fill(online > 0 ? Color.green : .secondary).frame(width: 6, height: 6)
                     Text("\(online)/\(sessions.count)").monospacedDigit()
                 }
-                .font(.caption)
+                .uiFont(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize()
                 .help("\(online) of \(sessions.count) sessions online")
@@ -700,7 +855,7 @@ private struct SidebarBottomBar: View {
                     NSWorkspace.shared.open(update.page)
                 } label: {
                     Text("Update")
-                        .font(.caption2.weight(.semibold))
+                        .uiFont(.caption2, weight: .semibold)
                         .padding(.horizontal, 6).padding(.vertical, 1)
                         .background(Capsule().fill(Color.accentColor.opacity(0.2)))
                         .foregroundStyle(.tint)
@@ -713,7 +868,7 @@ private struct SidebarBottomBar: View {
                 openWindow(id: "about")
             } label: {
                 Text("v\(AppInfo.bundleVersion)")
-                    .font(.caption2.monospacedDigit())
+                    .uiFont(.caption2).monospacedDigit()
                     .foregroundStyle(.tertiary)
                     .fixedSize()
                     .padding(.leading, 6)
@@ -726,28 +881,20 @@ private struct SidebarBottomBar: View {
     }
 }
 
-/// A compact icon button with an optional count badge.
+/// A compact icon button (counts go in the tooltip, not on the icon).
 private struct BarButton: View {
     let symbol: String
-    var badge = 0
     var active = false
     let help: String
     let action: () -> Void
+    @Environment(\.uiScale) private var scale
 
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
+                .uiFont(.body)
                 .foregroundStyle(active ? Color.accentColor : .secondary)
-                .frame(width: 28, height: 24)
-                .overlay(alignment: .topTrailing) {
-                    if badge > 0 {
-                        Text(badge > 99 ? "99+" : "\(badge)")
-                            .font(.system(size: 9, weight: .semibold).monospacedDigit())
-                            .padding(.horizontal, 3)
-                            .background(Capsule().fill(Color.secondary.opacity(0.25)))
-                            .offset(x: 2, y: -1)
-                    }
-                }
+                .frame(width: 28 * scale, height: 24 * scale)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -758,55 +905,120 @@ private struct BarButton: View {
 struct HostRow: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
     let host: SSHHostEntry
 
     var body: some View {
         let alias = host.alias ?? ""
         let meta = model.metadata(for: alias)
-        let sessions = model.sessions.sessions(for: alias)
-        HStack(spacing: 8) {
-            Image(systemName: host.proxyJump != nil ? "point.3.connected.trianglepath.dotted" : "server.rack")
-                .foregroundStyle(meta.color.color ?? .secondary)
-                .frame(width: 18)
+        let live = model.sessions.sessions(for: alias).filter { !$0.phase.isDead }
+        let online = live.filter { $0.phase.isOnline }.count
+        HStack(spacing: 8 * look.scale) {
+            icon(meta: meta, live: live.count, online: online)
             VStack(alignment: .leading, spacing: 1) {
-                Text(alias).lineLimit(1)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(alias).uiFont(.body).lineLimit(1)
+                if look.details, !subtitle.isEmpty {
+                    Text(subtitle).uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            if look.style == .flat && meta.favorite && model.settings.sidebarShowFavorites {
+                Image(systemName: "star.fill").uiFont(size: 9).foregroundStyle(.yellow)
+                    .help("Favorite")
             }
             Spacer(minLength: 4)
-            let live = sessions.filter { !$0.phase.isDead }
-            if !live.isEmpty {
-                let online = live.filter { $0.phase.isOnline }.count
-                let folded = SidebarFolding.shared.collapsed.contains(alias)
-                Button {
-                    withAnimation(.snappy) { SidebarFolding.shared.toggle(alias) }
-                } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .rotationEffect(.degrees(folded ? 0 : 90))
-                        Text("\(online)/\(live.count)")
-                    }
-                    .font(.caption2.monospacedDigit())
-                    .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(Capsule().fill((online > 0 ? Color.green : Color.orange).opacity(0.18)))
-                }
-                .buttonStyle(.plain)
-                .help(folded ? "Show this host's sessions" : "Hide this host's sessions (\(online) of \(live.count) online)")
-            }
+            if !live.isEmpty { foldControl(alias: alias, live: live.count, online: online) }
             // Always present (a row that changes its content on hover makes the list re-measure it).
-            RowAction(symbol: "terminal", help: "New terminal") { state.connect(.alias(alias)) }
-            RowAction(symbol: "folder", help: "Open files in a tab") { state.openFiles(.alias(alias)) }
+            if look.buttons {
+                RowAction(symbol: "terminal", help: "New terminal") { state.connect(.alias(alias)) }
+                RowAction(symbol: "folder", help: "Open files in a tab") { state.openFiles(.alias(alias)) }
+            }
         }
-        .padding(.vertical, 2)
-
+        .padding(.vertical, look.style == .detailed || look.style == .flat ? 2 : 0)
+        .help(look.details || subtitle.isEmpty ? "" : subtitle)
     }
 
-    private var subtitle: String {
+    @ViewBuilder
+    private func icon(meta: HostMetadata, live: Int, online: Int) -> some View {
+        let symbol = host.proxyJump != nil ? "point.3.connected.trianglepath.dotted" : "server.rack"
+        switch look.style {
+        case .minimal:
+            EmptyView()
+        case .compact:
+            // A light: green with a session online, orange while sessions wait, faint otherwise.
+            Circle()
+                .fill(online > 0 ? Color.green : live > 0 ? Color.orange : Color.secondary.opacity(0.35))
+                .frame(width: 7 * look.scale, height: 7 * look.scale)
+                .frame(width: look.iconWidth)
+        case .flat:
+            HStack(spacing: 4 * look.scale) {
+                Circle().fill(groupColor ?? .clear).frame(width: 6 * look.scale, height: 6 * look.scale)
+                Image(systemName: symbol).foregroundStyle(meta.color.color ?? .secondary)
+            }
+            .frame(width: look.iconWidth + 10 * look.scale)
+        case .detailed, .folders:
+            Image(systemName: symbol)
+                .foregroundStyle(meta.color.color ?? .secondary)
+                .frame(width: look.iconWidth)
+        }
+    }
+
+    /// The colour of the host's group (Flat shows it, having no group headers).
+    private var groupColor: Color? {
+        guard let alias = host.alias, let id = model.metadata(for: alias).groupID else { return nil }
+        return model.groups.first { $0.id == id }?.color.color
+    }
+
+    /// Folds the host's sessions away: a capsule with the count (Detailed), a quiet count, or only a
+    /// chevron. The folder tree folds with its own disclosure triangle, so it only shows the count.
+    @ViewBuilder
+    private func foldControl(alias: String, live: Int, online: Int) -> some View {
+        let folded = SidebarFolding.shared.collapsed.contains(alias)
+        let help = folded ? "Show this host's sessions" : "Hide this host's sessions (\(online) of \(live) online)"
+        if look.style == .folders {
+            if look.counts {
+                Text("\(online)/\(live)").uiFont(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    .help("\(online) of \(live) sessions online")
+            }
+        } else {
+            Button {
+                withAnimation(.snappy) { SidebarFolding.shared.toggle(alias) }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.right")
+                        .uiFont(size: 8, weight: .bold)
+                        .rotationEffect(.degrees(folded ? 0 : 90))
+                    if look.counts { Text("\(online)/\(live)") }
+                }
+                .uiFont(.caption2)
+                .monospacedDigit()
+                .padding(.horizontal, look.style == .detailed && look.counts ? 6 : 2).padding(.vertical, 1)
+                .background {
+                    if look.style == .detailed && look.counts {
+                        Capsule().fill((online > 0 ? Color.green : Color.orange).opacity(0.18))
+                    }
+                }
+                .foregroundStyle(look.style == .detailed ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(help)
+        }
+    }
+
+    /// user@address:port via jump — without repeating the name above it: an address that is the
+    /// alias itself is left out (then only the user, port and jump are worth a line, if any).
+    var subtitle: String {
+        let alias = host.alias ?? ""
+        let address = host.hostName.flatMap { $0.caseInsensitiveCompare(alias) == .orderedSame ? nil : $0 }
         var s = ""
-        if let u = host.user { s += u + "@" }
-        s += host.hostName ?? host.alias ?? ""
-        if let p = host.port, p != 22 { s += ":\(p)" }
-        if let j = host.proxyJump { s += " via \(j)" }
+        switch (host.user, address) {
+        case let (u?, a?): s = "\(u)@\(a)"
+        case let (u?, nil): s = u
+        case let (nil, a?): s = a
+        case (nil, nil): break
+        }
+        if let p = host.port, p != 22 { s += s.isEmpty ? "port \(p)" : ":\(p)" }
+        if let j = host.proxyJump { s += s.isEmpty ? "via \(j)" : " via \(j)" }
         return s
     }
 }
@@ -816,55 +1028,71 @@ struct HostRow: View {
 struct SessionRow: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
     let session: TerminalSession
+
+    /// Minimal shows a session's mark only when it needs you (waiting agent, bell, not connected).
+    private var needsAttention: Bool {
+        session.attention != nil || (session.agent?.activity.isWaiting ?? false) || !session.phase.isOnline
+    }
 
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
         let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID)
-        VStack(alignment: .leading, spacing: 1) {
-        HStack(spacing: 6) {
-            if session.phase.isSuspended || (inBackground && session.attention == nil && !(session.agent?.activity.isWaiting ?? false)) {
+        // The mark and the buttons sit in the middle of the whole row — also when a coding agent adds
+        // a second line under the title — and every mark gets the same square, so they line up.
+        HStack(spacing: 6 * look.scale) {
+            if look.style == .minimal && !needsAttention {
+                EmptyView()
+            } else if session.phase.isSuspended || (inBackground && session.attention == nil && !(session.agent?.activity.isWaiting ?? false)) {
                 Image(systemName: session.phase.isSuspended ? "pause.circle.fill" : "moon.zzz.fill")
-                    .font(.caption)
+                    .uiFont(size: 10)
                     .foregroundStyle(session.phase.tint)
-                    .frame(width: 16)
+                    .frame(width: 16 * look.scale, height: 16 * look.scale)
             } else {
                 // The same as the tab: an agent waiting, attention, an agent, a working command.
-                TabStatusIcon(session: session, size: 10, restingSymbol: "terminal")
+                TabStatusIcon(session: session, size: 10 * look.scale, restingSymbol: "terminal", animates: false)
             }
-            if session.phase.isSuspended {
-                Text("Suspended").font(.caption2).foregroundStyle(.blue)
-            }
-            Text(session.displayTitle)
-                .lineLimit(1)
-                .foregroundStyle(session.phase.isDead || elsewhere != nil ? .secondary : .primary)
-            if let elsewhere { OtherWindowBadge(name: elsewhere) }
-            if inBackground && !session.phase.isSuspended {
-                Text("background").font(.caption2).foregroundStyle(.secondary)
-            }
-            if let c = session.descriptor.color.color {
-                Circle().fill(c).frame(width: 6, height: 6)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6 * look.scale) {
+                    if session.phase.isSuspended && look.extras {
+                        Text("Suspended").uiFont(.caption2).foregroundStyle(.blue)
+                    }
+                    Text(session.displayTitle)
+                        .uiFont(.body)
+                        .lineLimit(1)
+                        .foregroundStyle(session.phase.isDead || elsewhere != nil || (inBackground && !look.extras) ? .secondary : .primary)
+                    if let elsewhere { OtherWindowBadge(name: elsewhere) }
+                    if inBackground && !session.phase.isSuspended && look.extras {
+                        Text("background").uiFont(.caption2).foregroundStyle(.secondary)
+                    }
+                    if let c = session.descriptor.color.color, look.style != .minimal {
+                        Circle().fill(c).frame(width: 6 * look.scale, height: 6 * look.scale)
+                    }
+                }
+                // A coding agent in the tab: its session name, under the title.
+                if look.extras, let pane = agentPane {
+                    PaneSummary(pane: pane, showPath: false, stateOnly: session.agentTitle != nil)
+                }
             }
             Spacer(minLength: 4)
             // Always present; they only light up on hover, so the row never changes its layout.
-            if session.phase.isSuspended {
+            if !look.buttons {
+                EmptyView()
+            } else if session.phase.isSuspended {
                 RowAction(symbol: "play.circle", help: "Reconnect", tint: .blue) { state.show(session) }
             } else if session.canSuspend {
                 RowAction(symbol: "pause.circle", help: "Disconnect & move to background (keeps running on the server)",
                           tint: .blue) { state.disconnectToBackground(session) }
             }
-            RowAction(symbol: "xmark.circle", help: "Close…", tint: .orange) { state.closeTab(session) }
-            RowAction(symbol: "trash.circle", help: "Terminate — ends the shell on the server", tint: .red) {
-                state.terminate(session)
+            if look.buttons {
+                RowAction(symbol: "xmark.circle", help: "Close…", tint: .orange) { state.closeTab(session) }
+                RowAction(symbol: "trash.circle", help: "Terminate — ends the shell on the server", tint: .red) {
+                    state.terminate(session)
+                }
             }
         }
-            // A coding agent in the tab: its session name, under the title.
-            if let pane = agentPane {
-                PaneSummary(pane: pane, showPath: false, stateOnly: session.agentTitle != nil)
-                    .padding(.leading, 22)
-            }
-        }
-        .padding(.leading, 22)
+        .padding(.leading, look.childIndent)
         .tag(SidebarItem.session(session.id))
         .id(SidebarItem.session(session.id))
         .middleClickCloses(.session(session.id))
@@ -885,14 +1113,19 @@ extension SessionRow {
 }
 
 struct ArchiveRow: View {
+    @Environment(\.sidebarLook) private var look
     let item: ArchivedSession
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "archivebox").foregroundStyle(.secondary).frame(width: 18)
+        HStack(spacing: 8 * look.scale) {
+            if look.style != .minimal {
+                Image(systemName: "archivebox").foregroundStyle(.secondary).frame(width: look.iconWidth)
+            }
             VStack(alignment: .leading, spacing: 1) {
-                Text(item.title).lineLimit(1)
-                Text(item.endedAt, format: .relative(presentation: .named))
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(item.title).uiFont(.body).lineLimit(1)
+                if look.style != .minimal && look.style != .compact {
+                    Text(item.endedAt, format: .relative(presentation: .named))
+                        .uiFont(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -1013,7 +1246,7 @@ struct OtherWindowBadge: View {
     var body: some View {
         Label(name, systemImage: "macwindow")
             .labelStyle(.titleAndIcon)
-            .font(.caption2)
+            .uiFont(.caption2)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(Capsule().fill(.quaternary))
@@ -1026,6 +1259,7 @@ struct OtherWindowBadge: View {
 struct FileTabRow: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
+    @Environment(\.sidebarLook) private var look
     let tab: FileTab
 
     var body: some View {
@@ -1033,19 +1267,20 @@ struct FileTabRow: View {
         let elsewhere = model.workspaces.otherWindowName(of: tab.id, here: state.workspaceID)
         HStack(spacing: 6) {
             Image(systemName: open ? "folder.fill" : "folder")
-                .font(.caption)
+                .uiFont(size: 10)
                 .foregroundStyle(Color.accentColor)
-                .frame(width: 16)
+                .frame(width: 16 * look.scale, height: 16 * look.scale)
             Text(model.fileTabs.title(of: tab))
+                .uiFont(.body)
                 .lineLimit(1)
-                .foregroundStyle(elsewhere != nil ? .secondary : .primary)
+                .foregroundStyle(elsewhere != nil || (!open && !look.extras) ? .secondary : .primary)
             if let elsewhere { OtherWindowBadge(name: elsewhere) }
-            if !open {
-                Text("background").font(.caption2).foregroundStyle(.secondary)
+            if !open && look.extras {
+                Text("background").uiFont(.caption2).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }
-        .padding(.leading, 22)
+        .padding(.leading, look.childIndent)
         .tag(SidebarItem.files(tab.id))
         .id(SidebarItem.files(tab.id))
         .middleClickCloses(.files(tab.id))

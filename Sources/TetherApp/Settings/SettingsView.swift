@@ -10,6 +10,7 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
+            AppearanceSettings().tabItem { Label("Appearance", systemImage: "paintpalette") }
             TerminalSettings().tabItem { Label("Terminal", systemImage: "terminal") }
             KeyboardSettings().tabItem { Label("Keyboard", systemImage: "keyboard") }
             SessionSettings().tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
@@ -20,7 +21,7 @@ struct SettingsView: View {
             PasswordSettings().tabItem { Label("Passwords", systemImage: "key") }
             SSHSettings().tabItem { Label("SSH", systemImage: "lock.shield") }
         }
-        .frame(width: 620, height: 520)
+        .frame(width: 660, height: 600)
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
     }
 }
@@ -52,7 +53,6 @@ private struct GeneralSettings: View {
                 }
                 .help("⌘T and New Session to Same Host: the folder the current tab's shell is in, or the home folder")
                 Toggle("Ask before closing an online session", isOn: $store.settings.confirmCloseOnlineSessions)
-                Toggle("Show archive in sidebar", isOn: $store.settings.showSidebarArchive)
                 Toggle("Name tabs after coding agent sessions", isOn: $store.settings.tabTitleFromAgent)
                     .help("A tab running Claude Code, Codex or opencode (in tmux) takes the name of its session, unless you renamed the tab yourself")
                 Toggle("Browse folders of this Mac in Finder", isOn: $store.settings.browseLocalInFinder)
@@ -83,36 +83,79 @@ private struct GeneralSettings: View {
     }
 }
 
-private struct TerminalSettings: View {
+private struct AppearanceSettings: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         @Bindable var store = model.settingsStore
+        let style = store.settings.sidebarStyle
         Form {
-            Section("Appearance") {
-                Picker("Colors", selection: $store.settings.theme) {
-                    ForEach(TerminalThemeChoice.allCases) { Text($0.title).tag($0) }
-                }
-                if store.settings.theme == .system {
-                    Picker("Terminal.app profile", selection: $store.settings.terminalProfile) {
-                        Text("Default (\(TerminalAppProfile.defaultName ?? "Basic"))").tag("")
-                        ForEach(TerminalAppProfile.availableNames(), id: \.self) { Text($0).tag($0) }
-                    }
-                    Toggle("Use the profile's font", isOn: $store.settings.fontFromProfile)
-                    Text("Colors, font and background translucency are read from this Mac's Terminal settings, so Tether looks like your Terminal. Programs on the server (ls, vim…) choose which of these colors to use.")
+            Section {
+                AppearanceModePicker(settings: $store.settings)
+                    .padding(.vertical, 4)
+                LabeledContent("Accent color") { AccentPicker(accent: $store.settings.accentColor) }
+                TextSizePicker(size: $store.settings.uiTextSize)
+            } header: {
+                Text("Window")
+            } footer: {
+                Text("Automatic follows the Mac's light or dark setting. The text and icon size applies to the sidebar, tabs and host panel (⌥⌘+ and ⌥⌘− change it from anywhere).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Sidebar") {
+                SidebarStylePicker(style: $store.settings.sidebarStyle, accent: store.settings.accentColor.color ?? .accentColor)
+                    .padding(.vertical, 4)
+                Toggle("Show user and address under host names", isOn: $store.settings.sidebarShowDetails)
+                    .disabled(!style.canShowDetails)
+                Toggle("Show buttons when the pointer is over a row", isOn: $store.settings.sidebarShowRowButtons)
+                    .disabled(!style.canShowRowButtons)
+                Toggle("Show counts on groups and hosts", isOn: $store.settings.sidebarShowCounts)
+                    .disabled(!style.canShowCounts)
+                Toggle("Show Favorites", isOn: $store.settings.sidebarShowFavorites)
+                Toggle("Show archive", isOn: $store.settings.showSidebarArchive)
+                if !style.canShowDetails || !style.canShowRowButtons {
+                    Text("\(style.title) keeps rows short, so some of these have no room. Pick Detailed or Flat to see addresses.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if !(store.settings.theme == .system && store.settings.fontFromProfile) {
+            }
+            Section {
+                TerminalColorsPicker(settings: $store.settings)
+                    .padding(.vertical, 4)
+            } header: {
+                Text("Terminal Colors")
+            } footer: {
+                Text("The terminal's colors are separate from the window's: a light window can keep a dark terminal.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Terminal Font") {
+                if !(store.settings.terminalColors == .terminalApp && store.settings.fontFromProfile) {
                     HStack {
                         TextField("Font", text: $store.settings.fontName, prompt: Text("System monospaced (SF Mono)"))
                         Button("Choose…") { FontPicker.show(current: store.settings.terminalFontName) { store.settings.fontName = $0 } }
                     }
                     Stepper("Size: \(Int(store.settings.fontSize)) pt", value: $store.settings.fontSize, in: 8...40)
+                } else {
+                    Text("The font comes from the Terminal.app profile (see Terminal Colors).")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Picker("Cursor", selection: $store.settings.cursorShape) {
                     ForEach(CursorShape.allCases) { Text($0.title).tag($0) }
                 }
                 Toggle("Blinking cursor", isOn: $store.settings.cursorBlink)
             }
+            Section {
+                Button("Set Up Appearance Again…") { openWindow(id: "setup") }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct TerminalSettings: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var store = model.settingsStore
+        Form {
             Section("Behavior") {
                 Stepper("Lines kept in memory: \(store.settings.scrollbackLines.formatted())",
                         value: $store.settings.scrollbackLines, in: 1_000...200_000, step: 5_000)
@@ -319,6 +362,44 @@ private struct TransferSettings: View {
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
+            Section {
+                Picker("Files pasted or dropped into a terminal go to", selection: $store.settings.uploadDestination) {
+                    ForEach(UploadDestination.allCases) { Text($0.title).tag($0) }
+                }
+                Toggle("Type the uploaded paths into the terminal", isOn: $store.settings.uploadTypesPaths)
+            } header: {
+                Text("Uploading from a Terminal")
+            } footer: {
+                Text("Paste (⌘V) or drop files or folders on a terminal of a server to upload them. The current folder is asked from tmux or the shell at that moment; when it cannot be told (screen, Windows, a shell that does not report it), or a program in front connects elsewhere (ssh, docker exec), Tether asks. To choose the folder anyway, use Edit ▸ Paste Files To… (⌥⌘V) or hold ⌥ while dropping. If the folder cannot take the files, Tether asks before sending anything. While a full-screen program (vim, htop) is open, the paths are copied instead of typed. Nothing is overwritten: clashing names get a number (name-1.ext). Terminals of this Mac get the files' paths, without copying.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                LabeledContent("Download to") {
+                    HStack {
+                        Text(store.settings.downloadFolder.isEmpty ? "Downloads"
+                             : store.settings.downloadFolder.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .lineLimit(1).truncationMode(.middle)
+                            .foregroundStyle(.secondary)
+                        Button("Choose…") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseFiles = false
+                            panel.canChooseDirectories = true
+                            panel.canCreateDirectories = true
+                            panel.directoryURL = model.defaultDownloadFolder
+                            if panel.runModal() == .OK, let url = panel.url { store.settings.downloadFolder = url.path }
+                        }
+                        if !store.settings.downloadFolder.isEmpty {
+                            Button("Use Downloads") { store.settings.downloadFolder = "" }
+                        }
+                    }
+                }
+                Toggle("Ask where to download every time", isOn: $store.settings.askWhereToDownload)
+            } header: {
+                Text("Downloading")
+            } footer: {
+                Text("For Download in the file manager. Dragging files to Finder puts them where you drop them; Copy, then ⌘V in Finder, pastes them there. “Download To…” in the file list's menu picks a folder once. Nothing is overwritten: clashing names get a number (name 2).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section {
                 Picker("Pack many files into one stream", selection: $store.settings.transferArchiveMode) {
                     ForEach(TransferArchiveMode.allCases) { Text($0.title).tag($0) }

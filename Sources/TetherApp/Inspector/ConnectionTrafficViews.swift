@@ -16,7 +16,7 @@ struct ConnectionRows: View {
                 ConnectionRow(connection: c, monitor: monitor, showProcess: showProcess)
             }
             if connections.count > limit {
-                Text("and \(connections.count - limit) more").font(.caption).foregroundStyle(.secondary)
+                Text("and \(connections.count - limit) more").uiFont(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -32,10 +32,10 @@ struct ConnectionRow: View {
         let c = connection
         Button { showing.toggle() } label: {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(c.proto).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
+                Text(c.proto).uiFont(.caption2, weight: .semibold).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.callout.monospaced()).lineLimit(1)
-                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(title).uiFont(.callout, design: .monospaced).lineLimit(1)
+                    Text(subtitle).uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 4)
                 if c.received != nil || c.sent != nil {
@@ -43,7 +43,7 @@ struct ConnectionRow: View {
                         Text("↓ \((c.received ?? 0).rateString)")
                         Text("↑ \((c.sent ?? 0).rateString)")
                     }
-                    .font(.caption.monospacedDigit())
+                    .uiFont(.caption).monospacedDigit()
                     .foregroundStyle(c.rate > 0 ? .primary : .secondary)
                     .help("Speed of this connection: download ↓ and upload ↑ per second")
                 }
@@ -88,7 +88,7 @@ struct ConnectionDetail: View {
     var body: some View {
         let c = connection
         VStack(alignment: .leading, spacing: 10) {
-            Text(c.isListening ? "Listening socket" : "Connection").font(.headline)
+            Text(c.isListening ? "Listening socket" : "Connection").uiFont(.headline)
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
                 row("Process", "\(c.processName.isEmpty ? "—" : c.processName) (PID \(c.pid))")
                 row("Protocol", c.proto + (c.state == "-" ? "" : " · \(c.state)"))
@@ -107,15 +107,15 @@ struct ConnectionDetail: View {
                     row("Transferred", "↓ \((c.receivedBytes ?? 0).byteString)   ↑ \((c.sentBytes ?? 0).byteString)")
                 }
             }
-            .font(.callout)
+            .uiFont(.callout)
             if !c.isTCPorUDP {
                 Text(c.state == "from command line"
                      ? "ICMP (ping and similar) uses no connection the system lists here; the target is read from the command line. Its bytes are not counted on any system."
                      : "ICMP and raw sockets (ping and similar) have no ports, and no system counts their bytes per process.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .uiFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else if c.received == nil && c.sent == nil && !c.isListening {
                 Text("The server does not count bytes for this connection, so its speed is unknown.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .uiFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Button("Copy Remote Address") { CommandFormat.copy(c.peer) }.disabled(c.isListening)

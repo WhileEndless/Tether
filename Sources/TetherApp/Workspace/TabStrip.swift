@@ -343,7 +343,7 @@ private struct TabDragPreview: View {
 
     var body: some View {
         Label(title, systemImage: "terminal")
-            .font(.callout)
+            .uiFont(.callout)
             .lineLimit(1)
             .frame(maxWidth: 220)
             .padding(.horizontal, 10)
@@ -357,6 +357,7 @@ private struct TabDragPreview: View {
 /// The tabs of this window.
 struct TabStrip: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
     @Environment(WindowState.self) private var state
     @State private var center = TabBarCenter.shared
 
@@ -433,7 +434,7 @@ struct TabStrip: View {
                         }
                     }
                 } label: {
-                    Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
+                    Image(systemName: "chevron.down").uiFont(size: 10, weight: .semibold)
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
@@ -460,7 +461,7 @@ struct TabStrip: View {
             .help(state.newTabHelp + " · hold for more")
             .padding(.trailing, 6)
         }
-        .frame(height: 36)
+        .frame(height: 36 * scale)
         .background(center.dropTarget == state.workspaceID ? Color.accentColor.opacity(0.12) : .clear)
         .background(.bar)
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { center.barFrames[state.workspaceID] = $0 }
@@ -469,6 +470,7 @@ struct TabStrip: View {
 
 private struct TabChip: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
     @Environment(WindowState.self) private var state
     let session: TerminalSession
     let number: Int
@@ -484,22 +486,22 @@ private struct TabChip: View {
             ZStack {
                 if showNumber {
                     Text("\(number)")
-                        .font(.caption2.weight(.bold).monospacedDigit())
+                        .uiFont(.caption2, weight: .bold).monospacedDigit()
                         .foregroundStyle(.white)
-                        .frame(width: 16, height: 16)
+                        .frame(width: 16 * scale, height: 16 * scale)
                         .background(Circle().fill(Color.accentColor))
                 } else {
                     // An agent waiting for you, attention, an agent, a working command, or the state.
-                    TabStatusIcon(session: session)
+                    TabStatusIcon(session: session, size: 10 * scale)
                 }
             }
-            .frame(width: 16, height: 16)
+            .frame(width: 16 * scale, height: 16 * scale)
 
             if let c = session.descriptor.color.color {
-                RoundedRectangle(cornerRadius: 1.5).fill(c).frame(width: 3, height: 14)
+                RoundedRectangle(cornerRadius: 1.5).fill(c).frame(width: 3, height: 14 * scale)
             }
             if session.descriptor.isPrivate {
-                Image(systemName: "eye.slash").font(.caption).foregroundStyle(.secondary)
+                Image(systemName: "eye.slash").uiFont(.caption).foregroundStyle(.secondary)
                     .help("Private tab: no recording, archive or command history")
             }
 
@@ -521,13 +523,13 @@ private struct TabChip: View {
             Button {
                 state.closeTab(session)
             } label: {
-                Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).frame(width: 14, height: 14)
+                Image(systemName: "xmark").uiFont(size: 8, weight: .bold).frame(width: 14, height: 14)
             }
             .buttonStyle(.plain)
             .opacity(hovering || isSelected ? 0.8 : 0)
             .help("Close tab (⌘W)")
         }
-        .font(.callout)
+        .uiFont(.callout)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background {
@@ -540,7 +542,7 @@ private struct TabChip: View {
         .help("Middle-click to close")
         // Select on mouse-down for an instant switch; a double-click renames.
         .simultaneousGesture(TapGesture(count: 2).onEnded { startRename() })
-        .simultaneousGesture(TapGesture(count: 1).onEnded { if !isSelected { state.select(session) } })
+        .simultaneousGesture(TapGesture(count: 1).onEnded { if isSelected { state.follow(session) } else { state.select(session) } })
         .contextMenu {
             Button("Rename…") { startRename() }
             Menu("Color") {
@@ -588,6 +590,7 @@ private struct TabChip: View {
 /// A file manager tab.
 private struct FileTabChip: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
     @Environment(WindowState.self) private var state
     let tab: FileTab
     let number: Int
@@ -600,28 +603,28 @@ private struct FileTabChip: View {
             ZStack {
                 if showNumber {
                     Text("\(number)")
-                        .font(.caption2.weight(.bold).monospacedDigit())
+                        .uiFont(.caption2, weight: .bold).monospacedDigit()
                         .foregroundStyle(.white)
-                        .frame(width: 16, height: 16)
+                        .frame(width: 16 * scale, height: 16 * scale)
                         .background(Circle().fill(Color.accentColor))
                 } else {
-                    Image(systemName: "folder.fill").font(.caption).foregroundStyle(.tint)
+                    Image(systemName: "folder.fill").uiFont(.caption).foregroundStyle(.tint)
                 }
             }
-            .frame(width: 16, height: 16)
+            .frame(width: 16 * scale, height: 16 * scale)
             Text("\(model.fileTabs.title(of: tab)) — \(tab.target.displayName)")
                 .lineLimit(1)
                 .frame(maxWidth: 200, alignment: .leading)
             Button {
                 state.close(.files(tab))
             } label: {
-                Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).frame(width: 14, height: 14)
+                Image(systemName: "xmark").uiFont(size: 8, weight: .bold).frame(width: 14, height: 14)
             }
             .buttonStyle(.plain)
             .opacity(hovering || isSelected ? 0.8 : 0)
             .help("Close tab (⌘W)")
         }
-        .font(.callout)
+        .uiFont(.callout)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background {
@@ -631,7 +634,7 @@ private struct FileTabChip: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { TabBarCenter.shared.tabFrames[tab.id] = $0 }
-        .onTapGesture { if !isSelected { state.select(tab.id) } }
+        .onTapGesture { if isSelected { state.follow(tab.id) } else { state.select(tab.id) } }
         .contextMenu {
             Button("Open Terminal Here") {
                 state.connect(tab.target, directory: model.fileTabs.browser(for: tab).directory)
@@ -703,7 +706,7 @@ private struct TabArrow: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 24)
+            Image(systemName: symbol).uiFont(size: 10, weight: .semibold).frame(width: 20, height: 24)
         }
         .buttonStyle(.borderless)
         .disabled(!enabled)

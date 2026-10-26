@@ -98,11 +98,14 @@ fi
 
     /// For each wanted name, a name that does not exist yet in `directory` (and is not used by an
     /// earlier name of the same batch): `report.pdf` → `report-1.pdf`, `report-2.pdf`, …
-    /// Also creates the directory if needed. Never overwrites anything.
-    public func uniqueNames(in directory: String, for names: [String]) async throws -> [String] {
+    /// Creates the directory if needed — unless `create` is false (a folder Tether chose itself,
+    /// such as the terminal's current one, which must exist: a stale one is not made anew).
+    /// Never overwrites anything.
+    public func uniqueNames(in directory: String, for names: [String], create: Bool = true) async throws -> [String] {
+        let make = create ? #"mkdir -p -- "$d" 2>/dev/null"# : #"[ -d "$d" ] || { echo "No such folder: $d" >&2; exit 1; }"#
         let script = #"""
 d="$1"; shift
-mkdir -p -- "$d" 2>/dev/null
+MAKE
 [ -d "$d" ] && [ -w "$d" ] || { echo "Cannot write to $d" >&2; exit 1; }
 taken=""
 for n in "$@"; do
@@ -118,7 +121,7 @@ $c"
   printf '%s
 ' "$c"
 done
-"""#
+"""#.replacingOccurrences(of: "MAKE", with: make)
         let platform = await executor.resolvedPlatform()
         let out = try await executor.output(RemoteScript(script, windows: WindowsFileScripts.uniqueNames),
                                             arguments: [directory] + names, timeout: 30, purpose: "files")

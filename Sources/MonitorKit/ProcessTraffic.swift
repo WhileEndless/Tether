@@ -131,8 +131,9 @@ public final class ProcessTraffic {
         let executor = self.executor
         let interval = self.interval
         Task { [weak self] in
-            let platform = await executor.resolvedPlatform()
+            let platform = await executor.resolvedPlatform(quiet: true)
             guard let self, self.stream === s else { return }
+            guard await executor.backgroundWorkAllowed() else { s.onEnd?(255, executor.backgroundWaitingMessage); return }
             s.start(executor: executor, script: RemoteScript(ProbeScripts.processTraffic, windows: WindowsProbeScripts.processTraffic),
                     platform: platform,
                     arguments: [String(Int(interval))], purpose: "monitor")

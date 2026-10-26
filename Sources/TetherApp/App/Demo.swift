@@ -55,6 +55,12 @@ enum DemoMode {
         store.settings.showStatusStrip = true
         store.settings.showSidebarArchive = false
         store.settings.defaultPersistence = .tmux
+        // TETHER_DEMO_LOOK=style,appearance[,size] (e.g. folders,light,large) for screenshots of the
+        // appearance choices.
+        let look = (env["TETHER_DEMO_LOOK"] ?? "").split(separator: ",").map(String.init)
+        if let style = look.first.flatMap(SidebarStyle.init(rawValue:)) { store.settings.sidebarStyle = style }
+        if look.count > 1, let appearance = AppAppearance(rawValue: look[1]) { store.settings.appearance = appearance }
+        if look.count > 2, let size = UITextSize(rawValue: look[2]) { store.settings.uiTextSize = size }
     }
 
     /// Fills the first window: host groups, terminals, a file manager tab and host metrics.

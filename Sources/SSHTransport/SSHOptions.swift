@@ -105,9 +105,19 @@ public struct SSHOptions: Sendable, Equatable {
     }
 
     /// Argument list for a non-interactive command that reads a script from stdin.
-    public func batchArguments(target: ConnectionTarget, remoteCommand: String, connectTimeout: Int = 15) -> [String] {
+    public func batchArguments(target: ConnectionTarget, remoteCommand: String, connectTimeout: Int = 15,
+                               quiet: Bool = false) -> [String] {
         commonOptions() + ["-T", "-o", "ConnectTimeout=\(connectTimeout)"]
+            + (quiet ? ["-o", "BatchMode=yes"] : [])
             + Self.destinationArguments(for: target) + [remoteCommand]
+    }
+
+    /// Work Tether does on its own in the background (monitoring, latency, finding the platform):
+    /// it uses a tab's shared connection, keys or the agent, but never asks for a password or a
+    /// passphrase — only a tab the user opens does (BatchMode). Several pop-ups after waking the Mac,
+    /// for jobs the user never asked for, were the alternative.
+    public static func isQuietPurpose(_ purpose: String) -> Bool {
+        ["monitor", "latency", "platform", "forward-keepalive"].contains(purpose)
     }
 
     /// Arguments for `ssh -O <command>` (check, exit) against the multiplex master.

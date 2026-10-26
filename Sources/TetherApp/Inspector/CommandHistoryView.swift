@@ -58,11 +58,11 @@ struct CommandHistoryView: View {
             .padding(.bottom, 6)
             if !model.settings.keepCommandHistory {
                 Label("Command history is turned off in Settings ▸ Monitoring.", systemImage: "info.circle")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.bottom, 6)
+                    .uiFont(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.bottom, 6)
             }
             if history.isLocked {
                 Label("Some history is encrypted: unlock Tether to see it.", systemImage: "lock")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.bottom, 6)
+                    .uiFont(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.bottom, 6)
             }
             if list.isEmpty {
                 EmptyStateView(symbol: "clock.arrow.circlepath", title: "No Commands Yet",
@@ -119,11 +119,11 @@ struct CommandRecordRow: View {
             HStack(alignment: .firstTextBaseline) {
                 statusIcon
                 Text(r.name).fontWeight(.medium).lineLimit(1)
-                if showHost { Text(r.hostName).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                if showHost { Text(r.hostName).uiFont(.caption).foregroundStyle(.secondary).lineLimit(1) }
                 Spacer()
                 duration
             }
-            Text(r.commandLine).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(expanded ? 6 : 1)
+            Text(r.commandLine).uiFont(.caption, design: .monospaced).foregroundStyle(.secondary).lineLimit(expanded ? 6 : 1)
                 .textSelection(.enabled)
             HStack(spacing: 10) {
                 Text(r.started.formatted(date: .abbreviated, time: .shortened))
@@ -133,7 +133,7 @@ struct CommandRecordRow: View {
                 if let cpu = r.cpu { Text("CPU avg \(CommandFormat.percent(cpu.mean)) · peak \(CommandFormat.percent(cpu.max))") }
                 if let mem = r.memory { Text("Mem peak \(Int64(mem.max).byteString)") }
             }
-            .font(.caption)
+            .uiFont(.caption)
             .foregroundStyle(.secondary)
             .lineLimit(1)
             if expanded { details }
@@ -150,7 +150,7 @@ struct CommandRecordRow: View {
             .font(.callout.monospacedDigit().weight(.medium))
             .foregroundStyle(.green)
         } else {
-            Text(record.duration.clockString).font(.callout.monospacedDigit())
+            Text(record.duration.clockString).uiFont(.callout).monospacedDigit()
         }
     }
 
@@ -174,7 +174,7 @@ struct CommandRecordRow: View {
                 Text("average").foregroundStyle(.secondary)
                 Text("peak").foregroundStyle(.secondary)
             }
-            .font(.caption.weight(.semibold))
+            .uiFont(.caption, weight: .semibold)
             metric("CPU", r.cpu, CommandFormat.percent)
             metric("Memory", r.memory) { Int64($0).byteString }
             metric("Threads", r.threads) { "\(Int($0.rounded()))" }
@@ -184,17 +184,17 @@ struct CommandRecordRow: View {
             metric("Disk read", r.read) { $0.rateString }
             metric("Disk write", r.written) { $0.rateString }
         }
-        .font(.caption.monospacedDigit())
+        .uiFont(.caption).monospacedDigit()
         if r.series.count > 2 {
             let cpu = r.series.map { $0.cpu ?? 0 }
             let mem = r.series.map { $0.memory ?? 0 }
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("CPU").font(.caption2).foregroundStyle(.secondary)
+                    Text("CPU").uiFont(.caption2).foregroundStyle(.secondary)
                     Sparkline(values: cpu.map { $0 / max(cpu.max() ?? 0, 100) }, tint: .blue, filled: true).frame(height: 28)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Memory").font(.caption2).foregroundStyle(.secondary)
+                    Text("Memory").uiFont(.caption2).foregroundStyle(.secondary)
                     Sparkline(values: normalized(mem), tint: .purple, filled: true).frame(height: 28)
                 }
             }
@@ -209,13 +209,13 @@ struct CommandRecordRow: View {
                 Text("Disconnected for \(r.disconnectedSeconds.uptimeString) while it ran (no readings then)")
             }
         }
-        .font(.caption)
+        .uiFont(.caption)
         .foregroundStyle(.secondary)
     }
 
     private func processes(_ list: [ProcessSummary], dropped: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("Processes (\(list.count + dropped))").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text("Processes (\(list.count + dropped))").uiFont(.caption, weight: .semibold).foregroundStyle(.secondary)
             ForEach(list.prefix(20)) { p in
                 HStack(spacing: 6) {
                     Text(p.name).lineLimit(1).help(p.commandLine)
@@ -228,18 +228,18 @@ struct CommandRecordRow: View {
                     }
                     if let mem = p.memoryPeak { Text("RAM \(Int64(mem).byteString)").help("Peak memory") }
                 }
-                .font(.caption.monospacedDigit())
+                .uiFont(.caption).monospacedDigit()
             }
             if list.count > 20 || dropped > 0 {
                 Text("and \(list.count - min(list.count, 20) + dropped) more (export as JSON for every kept one)")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .uiFont(.caption2).foregroundStyle(.secondary)
             }
         }
     }
 
     private func connections(_ list: [ConnectionSummary], more: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("Connections (\(list.count)\(more ? "+" : ""))").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text("Connections (\(list.count)\(more ? "+" : ""))").uiFont(.caption, weight: .semibold).foregroundStyle(.secondary)
             ForEach(list.prefix(20)) { c in
                 HStack(spacing: 6) {
                     Text(c.proto).foregroundStyle(.secondary)
@@ -252,10 +252,10 @@ struct CommandRecordRow: View {
                             .help("Bytes moved over this connection" + (c.peakReceived.map { ", peak ↓ \($0.rateString)" } ?? ""))
                     }
                 }
-                .font(.caption.monospacedDigit())
+                .uiFont(.caption).monospacedDigit()
             }
             if list.count > 20 || more {
-                Text("more connections were open (export as JSON for every kept one)").font(.caption2).foregroundStyle(.secondary)
+                Text("more connections were open (export as JSON for every kept one)").uiFont(.caption2).foregroundStyle(.secondary)
             }
         }
     }

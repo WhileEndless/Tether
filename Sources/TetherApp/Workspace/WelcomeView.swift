@@ -21,10 +21,10 @@ struct WelcomeView: View {
         VStack(spacing: 28) {
             VStack(spacing: 10) {
                 Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                    .font(.system(size: 54, weight: .light))
+                    .uiFont(size: 54, weight: .light)
                     .foregroundStyle(.tint)
                     .symbolEffect(.bounce, value: appeared)
-                Text("Tether").font(.largeTitle.weight(.semibold))
+                Text("Tether").uiFont(.largeTitle, weight: .semibold)
                 Text("Sessions that survive the network.")
                     .foregroundStyle(.secondary)
             }
@@ -73,7 +73,7 @@ struct WelcomeView: View {
 
             if !recentHosts.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Hosts").font(.headline).foregroundStyle(.secondary)
+                    Text("Hosts").uiFont(.headline).foregroundStyle(.secondary)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], spacing: 10) {
                         ForEach(Array(recentHosts.enumerated()), id: \.element.id) { index, host in
                             HostCard(host: host)
@@ -101,7 +101,7 @@ struct WelcomeView: View {
             Text("·")
             Link("Report an Issue", destination: AppInfo.issues)
         }
-        .font(.caption)
+        .uiFont(.caption)
         .foregroundStyle(.secondary)
     }
 
@@ -123,11 +123,11 @@ struct HostCard: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "terminal")
-                    .font(.title3)
+                    .uiFont(.title3)
                     .foregroundStyle(model.metadata(for: host.alias ?? "").color.color ?? .accentColor)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(host.alias ?? "").fontWeight(.medium).lineLimit(1)
-                    Text(host.hostName ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(host.hostName ?? "").uiFont(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 0)
             }

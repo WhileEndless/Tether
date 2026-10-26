@@ -39,17 +39,22 @@ public struct RemoteExecutor: Sendable {
         // Wait for a login to this host in progress, shared connection or not: its host-key
         // question is answered once, and known_hosts has the key when this ssh starts.
         await ConnectionGate.shared.waitForTurn(target.key)
-        let platform = await resolvedPlatform()
+        let quiet = SSHOptions.isQuietPurpose(purpose)
+        if quiet, !(await backgroundWorkAllowed()) {
+            return ProcessResult(status: 255, stdout: Data(), stderr: Data(backgroundWaitingMessage.utf8), timedOut: false)
+        }
+        let platform = await resolvedPlatform(quiet: quiet)
         let call: (command: String, input: Data)
         do {
             call = try invocation(script, arguments: arguments, platform: platform, extra: extra)
         } catch {
             return ProcessResult(status: 127, stdout: Data(), stderr: Data(error.localizedDescription.utf8), timedOut: false)
         }
-        let args = options.batchArguments(target: target, remoteCommand: call.command)
-        let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: purpose)
+        let args = options.batchArguments(target: target, remoteCommand: call.command, quiet: quiet)
+        let env = AskPassBridge.shared.environment(for: target.key, purpose: purpose)
         defer { AskPassBridge.shared.revoke(environment: env) }
         var result = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: call.input, timeout: timeout)
+        if quiet { BackgroundSignIn.shared.noteQuietResult(target.key, status: result.status, stderr: result.errorOutput) }
         if platform.isWindows {
             // PowerShell writes CRLF; the parsers expect LF.
             result.stdout = PowerShell.normalize(result.stdout)

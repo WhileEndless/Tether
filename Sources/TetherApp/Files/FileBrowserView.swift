@@ -389,7 +389,10 @@ struct FileBrowserView: View {
                 NSPasteboard.general.setString(items.map(\.path).joined(separator: "\n"), forType: .string)
             }
             Divider()
-            Button("Download to Downloads") { download(items) }
+            Button(model.settings.askWhereToDownload ? "Download…" : "Download to \(model.downloadFolderName)") { download(items) }
+            if !model.settings.askWhereToDownload {
+                Button("Download To…") { download(items, ask: true) }
+            }
             Button("Move To…") { bulk = BulkAction(kind: .move, items: items, value: b.directory) }
             Button("Copy To…") { bulk = BulkAction(kind: .copy, items: items, value: b.directory) }
             Button("Permissions…") {
@@ -485,49 +488,17 @@ struct FileBrowserView: View {
         return provider
     }
 
-    private func download(_ items: [RemoteFile]) {
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        show("Downloading \(items.count) item(s) to Downloads…")
-        downloadItems(items, to: downloads) { urls, failed in
+    private func download(_ items: [RemoteFile], ask: Bool = false) {
+        guard let folder = model.downloadFolder(ask: ask) else { return }
+        show("Downloading \(items.count) item(s) to \(folder.lastPathComponent)…")
+        downloadItems(items, to: folder) { urls, failed in
             if !urls.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(urls) }
             if failed > 0 { show("\(failed) item(s) could not be downloaded — see Transfers", isError: true) }
         }
     }
 
-    /// Downloads items into a local folder without replacing anything there (Finder-style
-    /// "name 2" names). Many files travel as one packed stream (see Settings ▸ Transfers).
     private func downloadItems(_ items: [RemoteFile], to local: URL, completion: @escaping ([URL], Int) -> Void) {
-        guard !items.isEmpty else { return }
-        let names = LocalFiles.uniqueNames(in: local, for: items.map(\.name))
-        let parents = Set(items.map { ($0.path as NSString).deletingLastPathComponent })
-        let fs = RemoteFileSystem(executor: model.executor(for: target))
-        let transfers = model.transfers
-        let target = self.target
-        Task {
-            // Only folders need counting; plain files are counted as they are.
-            var size = TransferSize(files: items.count, bytes: items.reduce(0) { $0 + $1.size })
-            if items.contains(where: \.isDirectory), transfers.policy.archiveMode != .never {
-                size = (try? await fs.measure(items.map(\.path))) ?? size
-            }
-            let finish: ([TransferItem]) -> Void = { made in
-                let ok = made.filter { $0.state == .completed }
-                let urls = ok.flatMap { $0.entries.map { URL(fileURLWithPath: $0.to) } }
-                completion(urls, made.count - ok.count)
-            }
-            if parents.count == 1, let parent = parents.first {
-                transfers.downloadGroup(items.map(\.name), from: parent, to: local, as: names, target: target,
-                                        fileCount: size.files, totalBytes: size.bytes, completion: finish)
-            } else {
-                var made: [TransferItem] = []
-                var remaining = items.count
-                for (f, name) in zip(items, names) {
-                    made.append(transfers.download(f.path, to: local.appendingPathComponent(name), target: target) { _ in
-                        remaining -= 1
-                        if remaining == 0 { finish(made) }
-                    })
-                }
-            }
-        }
+        model.downloadRemote(items, from: target, to: local, completion: completion)
     }
 
     private func quickLook(_ f: RemoteFile) {
@@ -591,12 +562,15 @@ struct FileBrowserView: View {
     /// Downloads the items to a local clipboard folder, then puts them on the Mac's clipboard so
     /// they can be pasted in Finder.
     private func copyToMac(_ items: [RemoteFile]) {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("TetherClipboard/\(UUID().uuidString)", isDirectory: true)
+        let dir = AppPaths.clipboardDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         show("Preparing \(items.count) item(s) for the clipboard…")
         downloadItems(items, to: dir) { urls, failed in
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects(urls as [NSURL])
+            // Nothing arrived: what the user had on the clipboard stays.
+            if !urls.isEmpty {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.writeObjects(urls as [NSURL])
+            }
             show(failed == 0 ? "\(urls.count) item(s) copied — paste them in Finder (⌘V)"
                              : "\(urls.count) copied, \(failed) failed", isError: failed > 0)
         }
@@ -733,7 +707,7 @@ struct FileDetailView: View {
                     }
                     .font(.callout)
                     HStack {
-                        Button("Download") { download(f) }.prominentGlassButtonStyle()
+                        Button("Download") { download([f]) }.prominentGlassButtonStyle()
                         if !f.isDirectory { Button("Quick Look") { quickLook(f) }.glassButtonStyle() }
                     }
                 }
@@ -746,7 +720,7 @@ struct FileDetailView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "doc.on.doc").font(.largeTitle).foregroundStyle(.secondary)
                     Text("\(files.count) items · \(files.reduce(0) { $0 + $1.size }.byteString)")
-                    Button("Download All") { files.forEach(download) }.prominentGlassButtonStyle()
+                    Button("Download All") { download(files) }.prominentGlassButtonStyle()
                 }
                 .frame(maxWidth: .infinity).padding(20)
             } else {
@@ -772,10 +746,11 @@ struct FileDetailView: View {
         }
     }
 
-    private func download(_ f: RemoteFile) {
-        let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        model.transfers.download(f.path, to: dir.appendingPathComponent(f.name), target: target) { item in
-            if item.state == .completed { NSWorkspace.shared.activateFileViewerSelecting([item.localURL]) }
+    /// Never replaces anything in the folder (the same safe path as the file list's Download).
+    private func download(_ files: [RemoteFile]) {
+        guard let folder = model.downloadFolder() else { return }
+        model.downloadRemote(files, from: target, to: folder) { urls, _ in
+            if !urls.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(urls) }
         }
     }
 

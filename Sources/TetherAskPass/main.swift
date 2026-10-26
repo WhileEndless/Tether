@@ -4,6 +4,8 @@
 // We forward the prompt to the running Tether app over a private Unix socket and print its reply.
 import Foundation
 
+// Tether gone or the socket closed: fail with an exit status, not a signal.
+signal(SIGPIPE, SIG_IGN)
 let env = ProcessInfo.processInfo.environment
 guard let socketPath = env["TETHER_ASKPASS_SOCKET"], let token = env["TETHER_ASKPASS_TOKEN"] else {
     FileHandle.standardError.write(Data("tether-askpass: not started by Tether\n".utf8))

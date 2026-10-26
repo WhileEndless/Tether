@@ -187,6 +187,21 @@ struct TetherCommands: Commands {
             Toggle("Show Host Status Bar", isOn: Binding(get: { model.settings.showStatusStrip },
                                                          set: { model.settings.showStatusStrip = $0 }))
                 .shortcut(.statusBar)
+            Picker("Sidebar Style", selection: Binding(get: { model.settings.sidebarStyle },
+                                                       set: { model.settings.sidebarStyle = $0 })) {
+                ForEach(SidebarStyle.allCases) { Text($0.title).tag($0) }
+            }
+            Menu("Text and Icon Size") {
+                Button("Bigger") { if let s = model.settings.uiTextSize.bigger { model.settings.uiTextSize = s } }
+                    .shortcut(.biggerInterface)
+                    .disabled(model.settings.uiTextSize.bigger == nil)
+                Button("Smaller") { if let s = model.settings.uiTextSize.smaller { model.settings.uiTextSize = s } }
+                    .shortcut(.smallerInterface)
+                    .disabled(model.settings.uiTextSize.smaller == nil)
+                Button("Default Size") { model.settings.uiTextSize = .standard }
+                    .shortcut(.defaultInterface)
+            }
+            Button("Set Up Appearance…") { openWindow(id: "setup") }
             // As in Terminal.app: in this terminal, whether programs (vim, htop, tmux) get the mouse.
             Toggle("Allow Mouse Reporting", isOn: Binding(
                 get: { active.flatMap { TerminalRegistry.shared.existingView(for: $0.id) }?.mouseReportingAllowed ?? model.settings.allowMouseReporting },
@@ -207,6 +222,14 @@ struct TetherCommands: Commands {
         }
 
         CommandGroup(after: .textEditing) {
+            Button("Paste Files To…") {
+                guard let window, let session = active,
+                      let files = PasteboardFiles.filesToPaste(from: .general), !files.isEmpty else { NSSound.beep(); return }
+                model.handleFiles(files, for: session, in: window, askAnyway: true)
+            }
+            .shortcut(.pasteFilesTo)
+            .disabled(active == nil || active?.descriptor.target.isLocal == true)
+            Divider()
             Button("Search All Sessions…") { openWindow(id: "search") }
                 .shortcut(.searchAll)
             Button("Search in This Session…") {

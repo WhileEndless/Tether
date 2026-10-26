@@ -168,7 +168,8 @@ final class MasterConnector {
         RunLoop.main.add(poll, forMode: .common)
         timer = poll
         let status: Int32 = await withCheckedContinuation { cont in
-            p.terminationHandler = { cont.resume(returning: $0.terminationStatus) }
+            // Ended by a signal (Tether stopped a login nobody answered): a failure, whatever the number.
+            p.terminationHandler = { cont.resume(returning: $0.terminationReason == .uncaughtSignal ? -2 : $0.terminationStatus) }
             do {
                 try p.run()
                 AskPassBridge.shared.bindToken(environment, pid: p.processIdentifier)
@@ -182,6 +183,7 @@ final class MasterConnector {
         try? FileManager.default.removeItem(at: logURL)
         // ssh itself fails with 255; any other code is `exit`'s own answer — the login worked (a
         // device CLI may not know `exit`, or may report it as an error).
+        if status == -2 { return "The sign-in was stopped" }
         return status >= 0 && status != 255 ? nil : "ssh exited with code \(status)"
     }
 

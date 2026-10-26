@@ -140,6 +140,20 @@ final class WindowState {
         showInspectorRequest = true
     }
 
+    /// The user went back to a terminal (clicked into it, or on its tab while it was already in
+    /// front): a host row clicked in the sidebar meanwhile no longer decides what the sidebar and
+    /// the host panel show — the terminal in front does.
+    func follow(_ session: TerminalSession) {
+        guard selectedItem?.id == session.id, sidebarSelection != .session(session.id) else { return }
+        sidebarSelection = .session(session.id)
+    }
+
+    /// The same for a file manager tab.
+    func follow(_ fileTab: UUID) {
+        guard selectedItem?.id == fileTab, sidebarSelection != .files(fileTab) else { return }
+        sidebarSelection = .files(fileTab)
+    }
+
     /// The host shown in the inspector: the sidebar selection, else the selected tab's host.
     var inspectedTarget: ConnectionTarget? {
         if case .host(let key) = sidebarSelection { return model.target(forKey: key) }

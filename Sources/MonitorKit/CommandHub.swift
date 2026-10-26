@@ -154,7 +154,8 @@ public final class CommandHub {
         if watcher != nil && anchors == watchedAnchors && covered.map(\.id) == watched { return }
         stopWatcher()
         guard !anchors.isEmpty else { return }
-        let platform = await executor.resolvedPlatform()
+        guard await executor.backgroundWorkAllowed() else { return }
+        let platform = await executor.resolvedPlatform(quiet: true)
         let s = RemoteStream(separator: "\n")
         watched = covered.map(\.id)
         watchedAnchors = anchors

@@ -1,24 +1,10 @@
 import Foundation
 import Observation
 
-public enum TerminalThemeChoice: String, Codable, CaseIterable, Identifiable, Sendable {
-    /// Mirrors Terminal.app's "Basic" profile and follows the system appearance.
-    case system
-    case light
-    case dark
-    case solarizedDark
-    case solarizedLight
-
-    public var id: String { rawValue }
-    public var title: String {
-        switch self {
-        case .system: "Terminal.app profile"
-        case .light: "Light"
-        case .dark: "Dark"
-        case .solarizedDark: "Solarized Dark"
-        case .solarizedLight: "Solarized Light"
-        }
-    }
+/// The single terminal theme setting of versions before 0.8, read only to carry it over to
+/// `TerminalColorMode` and the light/dark themes.
+enum TerminalThemeChoice: String, Codable {
+    case system, light, dark, solarizedDark, solarizedLight
 }
 
 public enum CursorShape: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -180,6 +166,25 @@ public enum NewTabDirectory: String, Codable, CaseIterable, Identifiable, Sendab
     }
 }
 
+/// Where files pasted or dropped into a terminal go on the server.
+public enum UploadDestination: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// The folder the terminal's shell is in (asked when it cannot be told).
+    case currentFolder
+    /// /tmp (the temp folder on Windows).
+    case tmp
+    /// Ask every time, suggesting the current folder.
+    case ask
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .currentFolder: "The terminal's current folder"
+        case .tmp: "/tmp"
+        case .ask: "Ask every time"
+        }
+    }
+}
+
 /// How the open sessions under a host are ordered in the sidebar.
 public enum SessionSortOrder: String, Codable, CaseIterable, Identifiable, Sendable {
     /// Online first, then connecting, suspended; each in the manual order.
@@ -233,11 +238,28 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Closing the last window keeps Tether (and every session) running in the menu bar.
     public var keepRunningInMenuBar = true
 
+    // Appearance
+    public var appearance: AppAppearance = .system
+    /// Accent for selections and buttons; `.none` follows the system accent colour.
+    public var accentColor: TagColor = .none
+    public var uiTextSize: UITextSize = .standard
+    public var sidebarStyle: SidebarStyle = .detailed
+    /// user@host:port under host names (styles with room for it).
+    public var sidebarShowDetails = true
+    /// Terminal / Files / Close buttons when the pointer is over a row.
+    public var sidebarShowRowButtons = true
+    public var sidebarShowFavorites = true
+    /// Online and session counts on group, folder and host rows.
+    public var sidebarShowCounts = true
+    /// The terminal's colours, chosen apart from the app's appearance.
+    public var terminalColors: TerminalColorMode = .followApp
+    public var terminalLightTheme: TerminalPalette = .tetherLight
+    public var terminalDarkTheme: TerminalPalette = .tetherDark
+
     // Terminal
     public var fontName: String = ""          // empty = system monospaced
     public var fontSize: Double = 12
-    public var theme: TerminalThemeChoice = .system
-    /// Terminal.app profile to mirror when `theme == .system`; empty = Terminal's default profile.
+    /// Terminal.app profile to mirror when `terminalColors == .terminalApp`; empty = Terminal's default profile.
     public var terminalProfile: String = ""
     /// Use the Terminal.app profile's font and size.
     public var fontFromProfile = true
@@ -360,6 +382,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var transferArchiveThreshold = 20
     /// Compress packed transfers on the wire (ssh -C). Helps on slow links, costs CPU on fast ones.
     public var transferCompress = true
+    /// Where files pasted or dropped into a terminal are uploaded (hold ⌥ to be asked anyway).
+    public var uploadDestination: UploadDestination = .currentFolder
+    /// After such an upload, type the uploaded paths into the terminal.
+    public var uploadTypesPaths = true
+    /// Downloads from the file manager go here; empty = the Downloads folder.
+    public var downloadFolder = ""
+    /// Ask for a folder every time something is downloaded.
+    public var askWhereToDownload = false
 
     // Updates
     /// At launch, ask GitHub once whether a newer release exists (one request to api.github.com).
@@ -422,6 +452,18 @@ public struct AppSettings: Codable, Equatable, Sendable {
         return URL(fileURLWithPath: (sshConfigPath as NSString).expandingTildeInPath)
     }
 
+    private enum LegacyKeys: String, CodingKey { case theme }
+
+    mutating func adoptLegacyTheme(_ theme: TerminalThemeChoice) {
+        switch theme {
+        case .system: terminalColors = .terminalApp
+        case .light: terminalColors = .alwaysLight; terminalLightTheme = .basicLight
+        case .dark: terminalColors = .alwaysDark; terminalDarkTheme = .basicDark
+        case .solarizedLight: terminalColors = .alwaysLight; terminalLightTheme = .solarizedLight
+        case .solarizedDark: terminalColors = .alwaysDark; terminalDarkTheme = .solarizedDark
+        }
+    }
+
     // Decode tolerantly so that new settings never wipe old ones.
     public init(from decoder: Decoder) throws {
         self.init()
@@ -440,7 +482,23 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.keepRunningInMenuBar, &keepRunningInMenuBar)
         d(.fontName, &fontName)
         d(.fontSize, &fontSize)
-        d(.theme, &theme)
+        d(.appearance, &appearance)
+        d(.accentColor, &accentColor)
+        d(.uiTextSize, &uiTextSize)
+        d(.sidebarStyle, &sidebarStyle)
+        d(.sidebarShowDetails, &sidebarShowDetails)
+        d(.sidebarShowRowButtons, &sidebarShowRowButtons)
+        d(.sidebarShowFavorites, &sidebarShowFavorites)
+        d(.sidebarShowCounts, &sidebarShowCounts)
+        d(.terminalLightTheme, &terminalLightTheme)
+        d(.terminalDarkTheme, &terminalDarkTheme)
+        if let mode = try? c.decode(TerminalColorMode.self, forKey: .terminalColors) {
+            terminalColors = mode
+        } else {
+            // Saved before 0.8: keep the colours the terminal had (the old default was the profile).
+            let legacy = try? decoder.container(keyedBy: LegacyKeys.self).decode(TerminalThemeChoice.self, forKey: .theme)
+            adoptLegacyTheme(legacy ?? .system)
+        }
         d(.terminalProfile, &terminalProfile)
         d(.fontFromProfile, &fontFromProfile)
         d(.cursorShape, &cursorShape)
@@ -505,6 +563,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.transferArchiveMode, &transferArchiveMode)
         d(.transferArchiveThreshold, &transferArchiveThreshold)
         d(.transferCompress, &transferCompress)
+        d(.uploadDestination, &uploadDestination)
+        d(.uploadTypesPaths, &uploadTypesPaths)
+        d(.downloadFolder, &downloadFolder)
+        d(.askWhereToDownload, &askWhereToDownload)
         d(.checkForUpdates, &checkForUpdates)
         d(.appLockMode, &appLockMode)
         d(.lockOnSleep, &lockOnSleep)
@@ -549,13 +611,23 @@ public final class SettingsStore {
     private let defaults: UserDefaults = AppPaths.debugOverride("TETHER_DEFAULTS_SUITE")
         .flatMap(UserDefaults.init(suiteName:)) ?? .standard
 
+    /// Settings were saved before this launch (false on the very first launch: the place to ask
+    /// how Tether should look).
+    public let hadSavedSettings: Bool
+
     public init() {
+        hadSavedSettings = defaults.data(forKey: Self.defaultsKey) != nil
         if let data = defaults.data(forKey: Self.defaultsKey),
            var decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
             decoded.migrate()
             settings = decoded
         } else {
             settings = AppSettings()
+        }
+        // "Type the uploaded paths" used to be a preference of the upload sheet alone: carried over once.
+        if let typed = defaults.object(forKey: "upload.pastePaths") as? Bool {
+            settings.uploadTypesPaths = typed
+            defaults.removeObject(forKey: "upload.pastePaths")
         }
         // Never run an ssh/scp that is missing, not executable or in a temporary folder.
         let defaults = AppSettings()
@@ -582,6 +654,19 @@ public final class SettingsStore {
 
     /// Security settings that differed from the defaults when no keychain copy existed (to review).
     public private(set) var unpinnedNonDefaults: [String] = []
+
+    /// Writes the settings even when nothing changed (the first-launch setup was seen, also when
+    /// the user kept every default).
+    public func save() {
+        if let data = try? JSONEncoder().encode(settings) { defaults.set(data, forKey: Self.defaultsKey) }
+    }
+
+    /// Ask how Tether should look: nothing was saved before this launch (never for test and demo
+    /// runs, which use their own defaults suite, unless TETHER_SHOW_SETUP asks for it).
+    public var wantsFirstLaunchSetup: Bool {
+        if AppPaths.debugOverride("TETHER_SHOW_SETUP") != nil { return true }
+        return !hadSavedSettings && AppPaths.debugOverride("TETHER_DEFAULTS_SUITE") == nil
+    }
 
     /// Everything back to defaults except the security settings (App Lock, encryption, where
     /// passwords go …): those change only in their own places, with confirmation.

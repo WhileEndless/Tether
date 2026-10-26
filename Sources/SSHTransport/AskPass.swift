@@ -7,6 +7,8 @@ public struct AskPassRequest: Sendable {
     public var targetKey: String
     public var purpose: String
     public var prompt: String
+    /// The terminal tab whose login asks, if any (only the tab in front shows its prompt).
+    public var sessionID: UUID? = nil
     /// How many prompts this token has produced so far (1-based). Used to detect wrong saved passwords.
     public var sequence: Int
 
@@ -16,6 +18,15 @@ public struct AskPassRequest: Sendable {
     }
 
     public var isPasswordPrompt: Bool { prompt.lowercased().contains("password") }
+
+    /// ssh's own password question (`user@host's password:`, or keyboard-interactive's plain
+    /// `(user@host) Password:`) — not a one-time code or "New password:" a server asks for, which
+    /// must never be remembered or replayed.
+    public var isPlainPasswordPrompt: Bool {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return p.wholeMatch(of: #/[^@\s'()]+@[^'\s()]+'s password:/#) != nil
+            || p.wholeMatch(of: #/\([^@\s()]+@[^)\s]+\) Password:/#) != nil
+    }
 
     /// ssh puts `(user@host) ` before every keyboard-interactive prompt: what follows was written by
     /// the server, so it is never treated as ssh's own key-passphrase or host-key question.
@@ -101,6 +112,9 @@ public final class AskPassBridge: @unchecked Sendable {
         var targetKey: String
         var purpose: String
         var count: Int
+        var sessionID: UUID? = nil
+        /// The helper hung up while its prompt waited: nobody can use an answer any more.
+        var dead = false
         /// Answered without asking (a passphrase Tether hands to ssh-keygen / ssh-add itself).
         var fixedAnswer: String? = nil
         /// Answered without asking, by the prompt (`ssh-keygen -p` asks for the old passphrase,
@@ -115,6 +129,7 @@ public final class AskPassBridge: @unchecked Sendable {
     private var contexts: [String: Context] = [:]
     private var listenFD: Int32 = -1
     private var handler: AskPassHandler?
+    private var cancelHandler: (@Sendable (String) -> Void)?
 
     public var helperPath: String? {
         let dir = Bundle.main.executableURL?.deletingLastPathComponent()
@@ -125,9 +140,10 @@ public final class AskPassBridge: @unchecked Sendable {
 
     public var isAvailable: Bool { listenFD >= 0 && helperPath != nil }
 
-    /// Starts listening. Call once at app launch.
-    public func start(handler: @escaping AskPassHandler) {
-        lock.lock(); self.handler = handler; lock.unlock()
+    /// Starts listening. Call once at app launch. `cancel` gets a token whose prompt can no longer be
+    /// answered (its ssh ended, gave up or was stopped): a prompt still on screen for it goes away.
+    public func start(handler: @escaping AskPassHandler, cancel: (@Sendable (String) -> Void)? = nil) {
+        lock.lock(); self.handler = handler; self.cancelHandler = cancel; lock.unlock()
         guard listenFD < 0 else { return }
         let path = AppPaths.askPassSocket.path
         unlink(path)
@@ -150,10 +166,10 @@ public final class AskPassBridge: @unchecked Sendable {
 
     /// Registers a new token for one ssh process and returns the environment to give it.
     /// - Parameter mode: "force" for non-interactive processes, "prefer" to answer even with a TTY.
-    public func environment(targetKey: String, purpose: String, mode: String = "force") -> [String: String] {
+    public func environment(targetKey: String, purpose: String, mode: String = "force", sessionID: UUID? = nil) -> [String: String] {
         guard isAvailable, let helperPath else { return [:] }
         let token = UUID().uuidString
-        lock.lock(); contexts[token] = Context(targetKey: targetKey, purpose: purpose, count: 0); lock.unlock()
+        lock.lock(); contexts[token] = Context(targetKey: targetKey, purpose: purpose, count: 0, sessionID: sessionID); lock.unlock()
         return [
             "SSH_ASKPASS": helperPath,
             "SSH_ASKPASS_REQUIRE": mode,
@@ -161,6 +177,27 @@ public final class AskPassBridge: @unchecked Sendable {
             "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
             "TETHER_ASKPASS_TOKEN": token,
         ]
+    }
+
+    /// For quiet background work: every prompt is refused at once. BatchMode on the command line
+    /// does not reach the ssh that ProxyJump starts for the jump host; this does.
+    public func refusingEnvironment(targetKey: String, purpose: String) -> [String: String] {
+        guard isAvailable, let helperPath else { return [:] }
+        let token = UUID().uuidString
+        lock.lock(); contexts[token] = Context(targetKey: targetKey, purpose: purpose, count: 0, answerFor: { _ in nil }); lock.unlock()
+        return [
+            "SSH_ASKPASS": helperPath,
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
+            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
+            "TETHER_ASKPASS_TOKEN": token,
+        ]
+    }
+
+    /// The askpass environment for an ssh with this purpose (quiet work refuses every prompt).
+    public func environment(for target: String, purpose: String) -> [String: String] {
+        SSHOptions.isQuietPurpose(purpose) ? refusingEnvironment(targetKey: target, purpose: purpose)
+                                           : environment(targetKey: target, purpose: purpose)
     }
 
     /// An environment whose prompts are all answered with `answer` (for ssh-keygen and ssh-add, so a
@@ -193,6 +230,51 @@ public final class AskPassBridge: @unchecked Sendable {
         ]
     }
 
+    /// Whether an answer for this token can still reach its ssh (not revoked, helper still there).
+    public func isLive(_ token: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let ctx = contexts[token] else { return false }
+        return !ctx.dead
+    }
+
+    /// Ends the ssh processes a token was given to (a login whose question waited so long that the
+    /// server has closed it; ssh does not notice while it waits for the answer).
+    /// Children first: an ssh killed during sign-in leaves its ProxyJump ssh running, which would
+    /// go on to send empty passwords to the jump host.
+    public func terminateProcesses(of token: String) {
+        lock.lock(); let ctx = contexts[token]; lock.unlock()
+        guard let ctx, !ctx.dead else { return }
+        let roots = ctx.pids.filter { $0 > 0 }
+        guard !roots.isEmpty else { return }
+        for pid in Self.descendants(of: roots).reversed() { kill(pid, SIGTERM) }
+        for pid in roots { kill(pid, SIGTERM) }
+    }
+
+    /// Every process below the given ones, parents before children.
+    static func descendants(of roots: Set<pid_t>) -> [pid_t] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let count = size / MemoryLayout<kinfo_proc>.stride + 16
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        size = count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        var children: [pid_t: [pid_t]] = [:]
+        for p in procs.prefix(size / MemoryLayout<kinfo_proc>.stride) {
+            children[p.kp_eproc.e_ppid, default: []].append(p.kp_proc.p_pid)
+        }
+        var out: [pid_t] = []
+        var queue = Array(roots)
+        while let next = queue.first {
+            queue.removeFirst()
+            for child in children[next] ?? [] where !out.contains(child) && !roots.contains(child) {
+                out.append(child)
+                queue.append(child)
+            }
+        }
+        return out
+    }
+
     /// Ties a token to the process it was given to, right after that process started. A token read
     /// from the environment of a running ssh by some other program is then useless to it.
     public func bindToken(_ env: [String: String], pid: pid_t) {
@@ -203,7 +285,8 @@ public final class AskPassBridge: @unchecked Sendable {
     /// Forgets a token once its process has finished.
     public func revoke(environment env: [String: String]) {
         guard let token = env["TETHER_ASKPASS_TOKEN"] else { return }
-        lock.lock(); contexts[token] = nil; lock.unlock()
+        lock.lock(); contexts[token] = nil; let cancel = cancelHandler; lock.unlock()
+        cancel?(token)
     }
 
     private func acceptLoop(_ fd: Int32) {
@@ -216,6 +299,13 @@ public final class AskPassBridge: @unchecked Sendable {
             var uid: uid_t = 0, gid: gid_t = 0
             guard getpeereid(client, &uid, &gid) == 0, uid == getuid(), let peer = Self.peerPID(client),
                   Self.isDescendant(peer, of: getpid()) else { close(client); continue }
+            // Answering a helper that is already gone (its ssh ended while the prompt was up) must
+            // fail quietly: by default the write raises SIGPIPE, which ends the whole app.
+            var on: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            // Not handed down to processes Tether starts: a child holding it would keep the helper's
+            // end looking alive, and a prompt whose ssh has ended would not go away.
+            _ = fcntl(client, F_SETFD, FD_CLOEXEC)
             Thread.detachNewThread { [weak self] in self?.serve(client, peer: peer) }
         }
     }
@@ -283,16 +373,36 @@ public final class AskPassBridge: @unchecked Sendable {
         if let fixed = ctx.fixedAnswer { reply(fd, fixed); return }
         if let answer = ctx.answerFor { reply(fd, answer(prompt)); return }
 
-        let request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
+        var request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
                                      prompt: prompt, sequence: ctx.count)
+        request.sessionID = ctx.sessionID
         let semaphore = DispatchSemaphore(value: 0)
         let box = AnswerBox()
         Task {
             box.value = await handler?(request)
             semaphore.signal()
         }
-        semaphore.wait()
-        reply(fd, box.value)
+        // While the user decides, watch the helper: when it goes away (ssh gave up, the server's
+        // login time ran out, the tab was closed), the prompt is withdrawn instead of waiting for
+        // an answer nobody can use.
+        var withdrawn = false
+        while semaphore.wait(timeout: .now() + 0.5) == .timedOut {
+            if !withdrawn, Self.peerHungUp(fd) {
+                withdrawn = true
+                lock.lock(); contexts[token]?.dead = true; let cancel = cancelHandler; lock.unlock()
+                cancel?(token)
+            }
+        }
+        if !withdrawn { reply(fd, box.value) }
+    }
+
+    /// The helper closed its end (it never writes after its request, so readable means closed).
+    static func peerHungUp(_ fd: Int32) -> Bool {
+        var p = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP), revents: 0)
+        guard poll(&p, 1, 0) > 0 else { return false }
+        if p.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return true }
+        var byte: UInt8 = 0
+        return recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0
     }
 
     private final class AnswerBox: @unchecked Sendable { var value: String? }

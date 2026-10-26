@@ -164,24 +164,44 @@ final class ArchiveJob: TransferJob {
         onFinish()
     }
 
+    /// An item could not be moved into place: what arrived stays in the staging folder (named in
+    /// the error) instead of being thrown away.
+    private var keepStaging = false
+
     /// Moves unpacked downloads to their final names. Never replaces an existing file.
     private func moveDownloadsIntoPlace() -> String? {
         guard let staging = stagingURL else { return nil }
         let fm = FileManager.default
         var problems: [String] = []
-        for (remote, local) in item.renames {
-            let from = staging.appendingPathComponent(remote)
-            let to = item.localURL.appendingPathComponent(local)
-            if fm.fileExists(atPath: to.path) {
-                problems.append("\(local) already exists")
-                continue
+        for (i, pair) in item.renames.enumerated() {
+            let from = staging.appendingPathComponent(pair.from)
+            // Taken meanwhile (the free name was chosen before the transfer started): the next free
+            // name, never a replacement — and never throwing away what was downloaded.
+            var moved: URL?
+            var lastError: Error?
+            for _ in 0..<5 where moved == nil {
+                let to = item.localURL.appendingPathComponent(LocalFiles.uniqueNames(in: item.localURL, for: [pair.to])[0])
+                do { try fm.moveItem(at: from, to: to); moved = to } catch { lastError = error }
             }
-            do { try fm.moveItem(at: from, to: to) } catch { problems.append(error.localizedDescription) }
+            if let moved {
+                // What "Show in Finder" and the Transfers list point at.
+                if i < item.entries.count, item.entries[i].to != moved.path {
+                    item.entries[i].to = moved.path
+                    item.entries[i].renamed = true
+                }
+            } else {
+                problems.append(lastError?.localizedDescription ?? "\(pair.to) could not be moved into place")
+                keepStaging = true
+            }
         }
-        return problems.isEmpty ? nil : problems.prefix(3).joined(separator: "\n")
+        guard !problems.isEmpty else { return nil }
+        var message = problems.prefix(3).joined(separator: "\n")
+        if keepStaging, let staging = stagingURL { message += "\nWhat arrived is kept in \(staging.path)" }
+        return message
     }
 
     private func cleanUpStaging() {
+        guard !keepStaging else { return }
         if let stagingURL { try? FileManager.default.removeItem(at: stagingURL) }
     }
 
@@ -204,7 +224,9 @@ final class ArchiveJob: TransferJob {
     /// `tar -c` of local files, each relative to its own folder. GNU format: long names and large
     /// files work everywhere, and no macOS-only metadata (resource forks, xattrs) is included.
     static func localTarCreate(_ files: [URL]) -> Process {
-        var args = ["-c", "-f", "-", "--format", "gnutar", "--no-mac-metadata", "--no-xattrs", "--no-acls", "--no-fflags"]
+        // -H: an item that is itself a symbolic link (a linked folder) sends what it points to; a
+        // link to a path on this Mac would mean nothing on the server.
+        var args = ["-c", "-f", "-", "-H", "--format", "gnutar", "--no-mac-metadata", "--no-xattrs", "--no-acls", "--no-fflags"]
         for f in files {
             args += ["-C", f.deletingLastPathComponent().path, "./" + f.lastPathComponent]
         }

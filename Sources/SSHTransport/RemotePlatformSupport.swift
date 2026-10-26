@@ -73,19 +73,23 @@ public final class PlatformCache: @unchecked Sendable {
         if isNew, let onDeviceDetected { DispatchQueue.main.async { onDeviceDetected(key) } }
     }
 
-    func resolve(_ key: String, detect: @escaping @Sendable () async -> RemotePlatform?) async -> RemotePlatform {
+    /// - Parameter quiet: background work never shares a detection with a terminal or a user action:
+    ///   a quiet one gives up where the other would ask, and a terminal that got its "don't know"
+    ///   would treat a Windows host or a network device as a POSIX shell.
+    func resolve(_ key: String, quiet: Bool = false, detect: @escaping @Sendable () async -> RemotePlatform?) async -> RemotePlatform {
+        let slot = quiet ? key + "\u{0}quiet" : key
         let (known, task): (RemotePlatform?, Task<RemotePlatform?, Never>?) = lock.withLock {
             if let known = platforms[key] { return (known, nil) }
-            if let running = pending[key] { return (nil, running) }
+            if let running = pending[slot] { return (nil, running) }
             let task = Task<RemotePlatform?, Never> { await detect() }
-            pending[key] = task
+            pending[slot] = task
             return (nil, task)
         }
         if let known { return known }
         guard let task else { return .posix }
         let value = await task.value
         let isNew: Bool = lock.withLock {
-            pending[key] = nil
+            pending[slot] = nil
             let isNew = value != nil && platforms[key] == nil
             // An unanswered probe (e.g. no connection) is not remembered, so it is tried again later.
             if let value { platforms[key] = value }
@@ -148,35 +152,39 @@ public enum PowerShell {
 
 extension RemoteExecutor {
     /// The host's platform: cached, or detected with one short command over the shared connection.
-    public func resolvedPlatform() async -> RemotePlatform {
+    /// - Parameter quiet: background work: never asks for a password to find out (see
+    ///   `SSHOptions.isQuietPurpose`); an unanswered question is asked again later.
+    public func resolvedPlatform(quiet: Bool = false) async -> RemotePlatform {
         if target.isLocal { return .posix }
         let me = self
-        return await PlatformCache.shared.resolve(target.key) { await me.detectPlatform() }
+        return await PlatformCache.shared.resolve(target.key, quiet: quiet) { await me.detectPlatform(quiet: quiet) }
     }
 
     /// Asks the host's default shell a question only it can answer (see `RemotePlatform.probeCommand`).
     /// No shell's answer: a second, plainer question (`ShellAccess.shellProbeCommand`) tells a shell
     /// that disliked the first (csh: "Undefined variable") from a device or limited shell, which is
     /// then remembered as one — Tether sends it nothing but the terminal's login from then on.
-    public func detectPlatform() async -> RemotePlatform? {
+    public func detectPlatform(quiet: Bool = false) async -> RemotePlatform? {
         if target.isLocal { return .posix }
         // Wait for a login to this host in progress, shared connection or not: its host-key
         // question is answered once, and known_hosts has the key when this ssh starts.
         await ConnectionGate.shared.waitForTurn(target.key)
-        guard let first = await ask(RemotePlatform.probeCommand) else { return nil }
+        if quiet, !(await backgroundWorkAllowed()) { return nil }
+        guard let first = await ask(RemotePlatform.probeCommand, quiet: quiet) else { return nil }
         if let platform = RemotePlatform.parse(probeOutput: first) { return platform }
-        guard let second = await ask(ShellAccess.shellProbeCommand) else { return nil }
+        guard let second = await ask(ShellAccess.shellProbeCommand, quiet: quiet) else { return nil }
         if ShellAccess.answersShell(second) { return .posix }
         PlatformCache.shared.markDevice(target.key)
         return .posix
     }
 
     /// One short command; nil when the host could not be reached (asked again later).
-    private func ask(_ command: String) async -> String? {
-        let args = options.batchArguments(target: target, remoteCommand: command)
-        let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect")
+    private func ask(_ command: String, quiet: Bool) async -> String? {
+        let args = options.batchArguments(target: target, remoteCommand: command, quiet: quiet)
+        let env = AskPassBridge.shared.environment(for: target.key, purpose: quiet ? "platform" : "connect")
         defer { AskPassBridge.shared.revoke(environment: env) }
         let r = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: Data(), timeout: 20)
+        if quiet { BackgroundSignIn.shared.noteQuietResult(target.key, status: r.status, stderr: r.errorOutput) }
         guard !r.timedOut, r.status != 255 else { return nil }
         return r.output + "\n" + r.errorOutput
     }

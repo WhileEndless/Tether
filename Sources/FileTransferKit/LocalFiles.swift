@@ -38,6 +38,7 @@ public enum LocalFiles {
 
     /// Finder-style free names in a local folder: `report.pdf` → `report 2.pdf`, `report 3.pdf`, …
     /// Names already chosen earlier in the same batch count as taken.
+    /// Case is ignored, as the Mac's disk does (README and readme cannot both exist).
     public static func uniqueNames(in directory: URL, for names: [String]) -> [String] {
         var taken = Set<String>()
         return names.map { name in
@@ -47,12 +48,12 @@ public enum LocalFiles {
             let suffix = base == name ? "" : "." + ext
             var candidate = name
             var i = 2
-            while taken.contains(candidate)
+            while taken.contains(candidate.lowercased())
                     || FileManager.default.fileExists(atPath: directory.appendingPathComponent(candidate).path) {
                 candidate = "\(base) \(i)\(suffix)"
                 i += 1
             }
-            taken.insert(candidate)
+            taken.insert(candidate.lowercased())
             return candidate
         }
     }

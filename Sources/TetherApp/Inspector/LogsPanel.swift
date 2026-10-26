@@ -48,7 +48,7 @@ struct LogsPanel: View {
                     LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
                             Text(String(line))
-                                .font(.system(size: 11, design: .monospaced))
+                                .uiFont(size: 11, design: .monospaced)
                                 .foregroundStyle(color(for: line))
                                 .textSelection(.enabled)
                                 .id(i)

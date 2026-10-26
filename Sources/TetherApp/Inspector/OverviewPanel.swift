@@ -3,6 +3,7 @@ import TetherCore
 import MonitorKit
 import SessionKit
 import SSHConfigKit
+import SSHTransport
 
 struct OverviewPanel: View {
     @Environment(AppModel.self) private var model
@@ -19,6 +20,8 @@ struct OverviewPanel: View {
                     if !s.interfaces.isEmpty { NetworkCard(interfaces: s.interfaces) }
                     DisksCard(disks: s.disks)
                     SystemCard(snapshot: s)
+                } else if let error = monitor.error, error.hasPrefix(BackgroundSignIn.marker) {
+                    SignInCard(target: target, message: error)
                 } else if let error = monitor.error {
                     ErrorCard(message: error) { Task { await monitor.refresh(firstSample: true) } }
                 } else {
@@ -64,7 +67,7 @@ struct ConnectionCard: View {
                     if let conn, !conn.sshPorts.isEmpty { row("sshd ports", conn.sshPorts.joined(separator: ", ")) }
                     if let key = entry?.identityFiles.first { row("Key", (key as NSString).lastPathComponent) }
                 }
-                .font(.callout)
+                .uiFont(.callout)
             }
         }
     }
@@ -97,13 +100,13 @@ struct LatencyBadge: View {
         let quality = stats?.quality ?? (fallback == nil ? .unknown : .good)
         HStack(spacing: 6) {
             Circle().fill(color(quality)).frame(width: 8, height: 8)
-            Text("Latency").font(.caption).foregroundStyle(.secondary)
+            Text("Latency").uiFont(.caption).foregroundStyle(.secondary)
             Text(LatencyStats.format(stats?.median ?? fallback))
                 .font(.callout.monospacedDigit().weight(.semibold))
             if let j = stats?.jitter {
-                Text("Jitter ±\(LatencyStats.format(j))").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text("Jitter ±\(LatencyStats.format(j))").uiFont(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
-            Text(quality.rawValue).font(.caption).foregroundStyle(color(quality))
+            Text(quality.rawValue).uiFont(.caption).foregroundStyle(color(quality))
         }
         .help("Latency: round-trip time to the server (median of recent samples). Jitter: how much it varies between samples — high jitter makes typing feel uneven.")
     }
@@ -213,7 +216,7 @@ struct NetworkCard: View {
                         }
                         .padding(.top, 6)
                     } label: {
-                        Text("Virtual & loopback (\(virtual.count))").font(.caption).foregroundStyle(.secondary)
+                        Text("Virtual & loopback (\(virtual.count))").uiFont(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -229,24 +232,24 @@ private struct InterfaceRow: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Circle().fill(i.state == "down" ? Color.secondary : .green).frame(width: 6, height: 6)
-                Text(i.name).font(.callout.weight(.medium))
+                Text(i.name).uiFont(.callout, weight: .medium)
                 if let speed = i.speedMbps {
-                    Text(speed >= 1000 ? "\(speed / 1000) Gb/s" : "\(speed) Mb/s").font(.caption2).foregroundStyle(.secondary)
+                    Text(speed >= 1000 ? "\(speed / 1000) Gb/s" : "\(speed) Mb/s").uiFont(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Label(i.rxRate?.rateString ?? "—", systemImage: "arrow.down").foregroundStyle(.blue)
                 Label(i.txRate?.rateString ?? "—", systemImage: "arrow.up").foregroundStyle(.orange)
             }
-            .font(.caption.monospacedDigit())
+            .uiFont(.caption).monospacedDigit()
             if !i.addresses.isEmpty || !i.mac.isEmpty {
                 Text((i.addresses + (i.mac.isEmpty ? [] : [i.mac])).joined(separator: "  ·  "))
-                    .font(.caption2.monospaced())
+                    .uiFont(.caption2, design: .monospaced)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .textSelection(.enabled)
             }
             Text("Total ↓ \(Int64(i.rxBytes).byteString)  ↑ \(Int64(i.txBytes).byteString)")
-                .font(.caption2).foregroundStyle(.tertiary)
+                .uiFont(.caption2).foregroundStyle(.tertiary)
         }
     }
 }
@@ -262,7 +265,7 @@ struct MetricTile: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
+                Text(title).uiFont(.caption, weight: .medium).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 if valueText != "" {
                 Text(valueText ?? "\(Int((value * 100).rounded()))%")
@@ -277,7 +280,7 @@ struct MetricTile: View {
             } else {
                 ProgressView(value: min(max(value, 0), 1)).tint(tint).frame(height: 30)
             }
-            Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            Text(detail).uiFont(.caption2).foregroundStyle(.secondary).lineLimit(1)
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.5)))
@@ -291,7 +294,7 @@ struct GPUCard: View {
     var body: some View {
         Card(title: "\(gpu.vendor.rawValue) GPU \(gpu.index)") {
             VStack(alignment: .leading, spacing: 8) {
-                Text(gpu.name).font(.callout.weight(.medium)).lineLimit(1)
+                Text(gpu.name).uiFont(.callout, weight: .medium).lineLimit(1)
                 HStack(spacing: 14) {
                     gauge("Util", gpu.utilization.map { "\(Int(($0 * 100).rounded()))%" }, gpu.utilization)
                     gauge("Memory", memoryText, gpu.memoryFraction)
@@ -316,7 +319,7 @@ struct GPUCard: View {
 
     private func gauge(_ title: String, _ text: String?, _ fraction: Double?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(title).uiFont(.caption2).foregroundStyle(.secondary)
             Text(text ?? "—").font(.caption.monospacedDigit().weight(.semibold)).lineLimit(1).minimumScaleFactor(0.7)
             ProgressView(value: min(max(fraction ?? 0, 0), 1))
                 .tint((fraction ?? 0) > 0.85 ? .red : .green)
@@ -337,7 +340,7 @@ struct DisksCard: View {
                             Text(d.mount).lineLimit(1).truncationMode(.middle)
                             Spacer()
                             Text("\((d.usedKB * 1024).byteString) / \((d.sizeKB * 1024).byteString)")
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                .uiFont(.caption).monospacedDigit().foregroundStyle(.secondary)
                         }
                         ProgressView(value: d.fraction).tint(d.fraction > 0.9 ? .red : d.fraction > 0.75 ? .orange : .accentColor)
                     }
@@ -390,7 +393,7 @@ struct SystemCard: View {
             Text(k).foregroundStyle(.secondary)
             Text(v).textSelection(.enabled).lineLimit(1)
         }
-        .font(.callout)
+        .uiFont(.callout)
     }
 }
 
@@ -403,7 +406,7 @@ struct Card<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                Text(title).uiFont(.subheadline, weight: .semibold).foregroundStyle(.secondary)
                 if let onExport {
                     Spacer()
                     Button(action: onExport) { Image(systemName: "square.and.arrow.up") }
@@ -419,6 +422,32 @@ struct Card<Content: View>: View {
     }
 }
 
+/// The host needs a password (or a host-key check) and no tab is signed in: nothing is wrong, the
+/// user only has to open a terminal, where Tether asks.
+struct SignInCard: View {
+    @Environment(WindowState.self) private var state
+    let target: ConnectionTarget
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "lock.circle").uiFont(.largeTitle).foregroundStyle(.secondary)
+            Text(BackgroundSignIn.marker).uiFont(.callout, weight: .medium)
+            Text(message.dropFirst(BackgroundSignIn.marker.count).drop { $0 == ":" || $0 == " " }.capitalizedFirst)
+                .multilineTextAlignment(.center).uiFont(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open Terminal") { state.connect(target) }
+                .prominentGlassButtonStyle()
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private extension Substring {
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+}
+
 struct ErrorCard: View {
     let message: String
     let retry: () -> Void
@@ -431,20 +460,20 @@ struct ErrorCard: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle").font(.title).foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.triangle").uiFont(.title).foregroundStyle(.orange)
             if let (problem, hint) = diagnosis {
                 // ssh's own output (banners and all) stays one click away.
-                Text(problem).multilineTextAlignment(.center).font(.callout.weight(.medium))
-                Text(hint).multilineTextAlignment(.center).font(.caption).foregroundStyle(.secondary)
+                Text(problem).multilineTextAlignment(.center).uiFont(.callout, weight: .medium)
+                Text(hint).multilineTextAlignment(.center).uiFont(.caption).foregroundStyle(.secondary)
                 Button(showOutput ? "Hide ssh Output" : "Show ssh Output") { showOutput.toggle() }
-                    .buttonStyle(.borderless).font(.caption)
+                    .buttonStyle(.borderless).uiFont(.caption)
                 if showOutput {
-                    Text(message).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                    Text(message).uiFont(size: 10, design: .monospaced).foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
-                Text(message).multilineTextAlignment(.center).font(.callout).textSelection(.enabled)
+                Text(message).multilineTextAlignment(.center).uiFont(.callout).textSelection(.enabled)
             }
             Button("Retry", action: retry).glassButtonStyle()
         }

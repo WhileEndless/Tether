@@ -15,6 +15,7 @@ import KeySetupKit
 struct PendingPrompt: Identifiable {
     let id = UUID()
     let request: AskPassRequest
+    let created = Date()
     let continuation: CheckedContinuation<String?, Never>
     /// The saved password was just sent and not accepted (it probably changed on the server).
     var savedWasRejected = false
@@ -50,7 +51,97 @@ final class AppModel {
     private(set) var configError: String?
 
     var prompts: [PendingPrompt] = [] {
-        didSet { AskPassPanel.shared.update(prompts.first) }
+        didSet { refreshPromptPanel() }
+    }
+    @ObservationIgnored private var promptExpiryTimer: Timer?
+
+    /// The prompt to show now: one that belongs to no tab (a file transfer, a host-key question, a
+    /// key passphrase for something the user started), or to a tab in front in a window — or to the
+    /// host such a tab connects to (answering it signs that tab in too). Prompts of tabs in the
+    /// background wait, marked on their tabs, until the user shows them.
+    var promptInFront: PendingPrompt? {
+        let front = workspaces.frontSessions
+        let frontIDs = Set(front.map(\.id)), frontHosts = Set(front.map(\.descriptor.target.key))
+        return prompts.first { isInFront($0, frontIDs: frontIDs, frontHosts: frontHosts) }
+    }
+
+    /// A prompt that may be shown now (see `promptInFront`). One of a tab that was closed is not:
+    /// its ssh is about to end.
+    private func isInFront(_ p: PendingPrompt, frontIDs: Set<UUID>, frontHosts: Set<String>) -> Bool {
+        guard let id = p.request.sessionID, !p.request.isConfirmation else { return true }
+        guard sessions.session(id) != nil else { return false }
+        return frontIDs.contains(id) || frontHosts.contains(p.request.targetKey)
+    }
+
+    /// Whether a password typed for this prompt may be remembered for the host's other logins:
+    /// only ssh's own password question or a local key's passphrase, never a one-time code.
+    private func isRememberable(_ request: AskPassRequest) -> Bool {
+        request.isPlainPasswordPrompt || request.isPassphrasePrompt
+    }
+
+    /// A tab whose login waits for the user (a held-back prompt, or one that gave up waiting).
+    func waitsForSignIn(_ session: TerminalSession) -> Bool {
+        session.waitsForUser || prompts.contains { $0.request.sessionID == session.id }
+    }
+
+    /// Shows the prompt for what is in front (after prompts, the shown tab or the lock changed).
+    func refreshPromptPanel() {
+        AskPassPanel.shared.update(promptInFront)
+        schedulePromptExpiry()
+        // A tab in front that waits for a sign-in (its window came back, was un-minimized, the app
+        // was unhidden) starts it now — it is in front, so its question can be shown.
+        for session in workspaces.frontSessions where session.waitsForUser { session.shownToUser() }
+    }
+
+    /// A tab's login whose question waits in the background past the server's patience (sshd's
+    /// LoginGraceTime is 2 minutes; ssh does not notice while it waits): the login is ended and the
+    /// tab waits to be shown, so the password the user types later goes to a fresh login.
+    func expireHeldPrompts() {
+        let frontSessions = workspaces.frontSessions
+        let front = Set(frontSessions.map(\.id)), frontHosts = Set(frontSessions.map(\.descriptor.target.key))
+        recentPasswords = recentPasswords.filter { Date().timeIntervalSince($0.value.date) < Self.recentPasswordLifetime }
+        for p in prompts where !isInFront(p, frontIDs: front, frontHosts: frontHosts) && Date().timeIntervalSince(p.created) > 90 {
+            guard let id = p.request.sessionID, let session = sessions.session(id) else { continue }
+            session.waitForUser()
+            // The other tabs to this host in the background wait too, instead of each taking its
+            // turn at a login nobody answers (20 tabs would mean 20 attempts at the server).
+            for other in sessions.sessions(for: session.descriptor.target.key) where !front.contains(other.id) {
+                other.waitForUser()
+            }
+            AskPassBridge.shared.terminateProcesses(of: p.request.token)
+        }
+    }
+
+    private func schedulePromptExpiry() {
+        guard promptExpiryTimer == nil, prompts.contains(where: { $0.request.sessionID != nil }) else { return }
+        promptExpiryTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let model = AppModel.shared
+                model.expireHeldPrompts()
+                if !model.prompts.contains(where: { $0.request.sessionID != nil }) {
+                    model.promptExpiryTimer?.invalidate()
+                    model.promptExpiryTimer = nil
+                }
+            }
+        }
+    }
+
+    /// A tab came to the front: its held-back prompt appears, or a login that waited for it starts.
+    func sessionShown(_ session: TerminalSession) {
+        session.shownToUser()
+        refreshPromptPanel()
+    }
+
+    /// ssh behind a prompt is gone (gave up, timed out, was stopped): the prompt goes away. A tab in
+    /// the background then waits to be shown before it tries again (see `TerminalSession.waitsForUser`).
+    func withdrawPrompts(token: String) {
+        guard let i = prompts.firstIndex(where: { $0.request.token == token }), prompts[i].followers.isEmpty else { return }
+        let prompt = prompts.remove(at: i)
+        if let id = prompt.request.sessionID, let session = sessions.session(id),
+           !workspaces.frontSessions.contains(where: { $0.id == id }) {
+            session.waitForUser()
+        }
+        prompt.continuation.resume(returning: nil)
     }
     /// Set while the app quits so closing windows does not end sessions.
     var isTerminating = false
@@ -99,6 +190,13 @@ final class AppModel {
             AppModel.shared.applyAgentSettings(to: session)
             session.onOnline = { s in
                 let model = AppModel.shared
+                // Tabs to the same host that waited for a sign-in can use this tab's connection now.
+                // (Also one whose sign-in was refused or cancelled: this one just signed in, so the
+                // shared connection is there and no password is sent again.)
+                for other in model.sessions.sessions(for: s.descriptor.target.key)
+                where other.id != s.id && (other.waitsForUser || other.retryPausedReason != nil) {
+                    other.reconnectNow()
+                }
                 model.forwards.sessionConnected(to: s.descriptor.target,
                                                 saved: model.metadata(for: s.descriptor.target.key).forwards ?? [])
             }
@@ -117,8 +215,18 @@ final class AppModel {
             AppModel.shared.commandSessionRemoved(id)
         }
 
+        // A window coming back (unhidden, un-minimized, the app brought forward) can put a waiting
+        // tab in front: show its question, or start its sign-in.
+        for name in [NSApplication.didUnhideNotification, NSApplication.didBecomeActiveNotification,
+                     NSWindow.didDeminiaturizeNotification, NSWindow.didBecomeKeyNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { AppModel.shared.refreshPromptPanel() }
+            }
+        }
         AskPassBridge.shared.start { request in
             await AppModel.shared.answer(request)
+        } cancel: { token in
+            Task { @MainActor in AppModel.shared.withdrawPrompts(token: token) }
         }
         RecordingStore.configure(quotaMB: store.settings.recordingQuotaMB,
                                  retentionDays: store.settings.recordingRetentionDays,
@@ -153,6 +261,7 @@ final class AppModel {
     }
 
     func launch() {
+        applyAppearance()
         watchWindowVisibility()
         // With App Lock, sessions (and their history) come back only after unlocking.
         AppLock.shared.start { [weak self] in
@@ -598,7 +707,15 @@ final class AppModel {
         if request.isPasswordPrompt || request.isPassphrasePrompt {
             let (key, transient, tried) = await MainActor.run {
                 let key = self.savedPasswordKey(for: request)
-                return (key, key.flatMap { self.transientPasswords[$0] }, key.map { self.triedPasswords.contains(request.token + $0) } ?? true)
+                // Background work never gets a password (it refuses every prompt anyway).
+                let usable = !SSHOptions.isQuietPurpose(request.purpose)
+                let rememberable = request.isPlainPasswordPrompt || request.isPassphrasePrompt
+                let tried = key.map { self.triedPasswords.contains(request.token + $0) } ?? true
+                // The same ssh asking again: the password it got (typed or from memory) was wrong.
+                // Other tabs must not try it — each wrong try is a failed login on the server.
+                if tried, let key { self.recentPasswords[key] = nil }
+                let memory = usable ? key.flatMap { self.transientPasswords[$0] ?? (rememberable ? self.recentPassword(for: $0) : nil) } : nil
+                return (key, memory, tried)
             }
             // Offer a saved password once per hop; a second prompt for the same hop means it was wrong.
             // Touch ID (if enabled) comes before the password is even read from the keychain.
@@ -621,6 +738,8 @@ final class AppModel {
                 // Several ssh processes logging in to a new host at once (a tab, monitoring, files)
                 // each ask about the same key: the question is shown once and answers them all, and
                 // one asked again right after it was answered gets the same answer.
+                // Its ssh ended while this was on the way (Touch ID, the lock screen): nothing to ask.
+                guard AskPassBridge.shared.isLive(request.token) else { cont.resume(returning: nil); return }
                 if let key = prompt.confirmationKey {
                     if let recent = self.recentConfirmations[key], Date().timeIntervalSince(recent.date) < 120 {
                         cont.resume(returning: recent.answer)
@@ -645,6 +764,23 @@ final class AppModel {
     }
 
     @ObservationIgnored private var triedPasswords: Set<String> = []
+
+    /// A password the user just typed (and did not save), kept in memory for two minutes so the
+    /// other logins to the same host — a second shared connection for many tabs, the tabs whose
+    /// turn comes next — do not ask again. Never written anywhere; used only for a prompt that ssh
+    /// itself names for the same user and host (`savedPasswordKey`), once per ssh process, and
+    /// dropped when Tether locks.
+    @ObservationIgnored var recentPasswords: [String: (password: String, date: Date)] = [:]
+    static let recentPasswordLifetime: TimeInterval = 120
+
+    func recentPassword(for key: String) -> String? {
+        guard let entry = recentPasswords[key] else { return nil }
+        guard Date().timeIntervalSince(entry.date) < Self.recentPasswordLifetime else {
+            recentPasswords[key] = nil
+            return nil
+        }
+        return entry.password
+    }
     /// When a saved password was last typed into each session (automatically or with a click): the
     /// same prompt coming back right after means it was not accepted.
     @ObservationIgnored var lastFilled: [UUID: Date] = [:]
@@ -654,14 +790,61 @@ final class AppModel {
     @ObservationIgnored var autoFilled: [UUID: (key: String, date: Date)] = [:]
 
     func resolvePrompt(_ prompt: PendingPrompt, answer: String?, save: Bool) {
-        let current = prompts.first { $0.id == prompt.id } ?? prompt
-        prompts.removeAll { $0.id == prompt.id }
+        // Answered once only: Return in the field and the default button can both arrive, and a
+        // prompt withdrawn a moment ago (its ssh ended) has already been resumed. Resuming twice
+        // would end the app.
+        guard let i = prompts.firstIndex(where: { $0.id == prompt.id }) else { return }
+        let current = prompts.remove(at: i)
+        // Cancelled: the ssh behind it is ended first. Told "no answer", ssh would send an empty
+        // password (a failed login on the server) and ask again, up to three times.
+        if answer == nil, !prompt.request.isConfirmation {
+            AskPassBridge.shared.terminateProcesses(of: prompt.request.token)
+        }
+        // Cancelled by the user: the tab stops trying (and asking) until they press Reconnect, and
+        // the other tabs to this host in the background wait to be shown instead of asking next.
+        if answer == nil, let id = prompt.request.sessionID, let session = sessions.session(id) {
+            session.pauseRetries("Sign-in cancelled. Press Reconnect when you want to sign in.")
+            let front = Set(workspaces.frontSessions.map(\.id))
+            for other in sessions.sessions(for: session.descriptor.target.key) where other.id != id && !front.contains(other.id) {
+                other.waitForUser()
+            }
+        }
+        // Answered after the server's login time ran out (sshd closes an unfinished login after about
+        // two minutes; ssh does not notice while it waits): sending it would fail and ask again. The
+        // tab signs in afresh instead, and the password just typed answers that login from memory.
+        if let answer, !answer.isEmpty, isRememberable(prompt.request), prompt.request.sessionID != nil,
+           Date().timeIntervalSince(current.created) > 110, let key = savedPasswordKey(for: prompt.request) {
+            if save { PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request)) }
+            recentPasswords[key] = (answer, Date())
+            triedPasswords.insert(prompt.request.token + key)
+            AskPassBridge.shared.terminateProcesses(of: prompt.request.token)
+            current.continuation.resume(returning: nil)
+            for follower in current.followers { follower.resume(returning: nil) }
+            return
+        }
         if save, let answer, prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
             PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request))
+            // The same ssh asking again means it was wrong: then the user is asked, not the keychain.
+            if let key = savedPasswordKey(for: prompt.request) { triedPasswords.insert(prompt.request.token + key) }
+        } else if let answer, !answer.isEmpty, isRememberable(prompt.request),
+                  let key = savedPasswordKey(for: prompt.request) {
+            recentPasswords[key] = (answer, Date())
+            // Answered from memory for this ssh only once: a wrong one is asked again.
+            triedPasswords.insert(prompt.request.token + key)
         }
         if let key = prompt.confirmationKey { recentConfirmations[key] = (answer, Date()) }
-        prompt.continuation.resume(returning: answer)
+        current.continuation.resume(returning: answer)
         for follower in current.followers { follower.resume(returning: answer) }
+        // Other logins already waiting for the same user and host (tabs held in the background,
+        // hosts behind the same jump host) take this password too, once each, instead of asking.
+        if let answer, !answer.isEmpty, isRememberable(prompt.request), let key = savedPasswordKey(for: prompt.request) {
+            for other in prompts where isRememberable(other.request) && savedPasswordKey(for: other.request) == key
+                && !triedPasswords.contains(other.request.token + key) {
+                triedPasswords.insert(other.request.token + key)
+                prompts.removeAll { $0.id == other.id }
+                other.continuation.resume(returning: answer)
+            }
+        }
     }
 
     // MARK: One copy
@@ -680,6 +863,7 @@ final class AppModel {
     // MARK: Settings side effects
 
     func settingsChanged() {
+        applyAppearance()
         TerminalRegistry.shared.applySettings(settings)
         RecordingStore.configure(quotaMB: settings.recordingQuotaMB, retentionDays: settings.recordingRetentionDays,
                                  compressAfterDays: settings.compressRecordingsAfterDays,

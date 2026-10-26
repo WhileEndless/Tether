@@ -61,7 +61,7 @@ public final class TransferItem: Identifiable {
     public let method: Method
     public let target: ConnectionTarget
     /// Single transfers: the local file. Packed downloads: the local folder they go into.
-    public let localURL: URL
+    public internal(set) var localURL: URL
     /// Single transfers: the remote directory (upload) or file (download). Packed: the remote directory.
     public let remotePath: String
     /// For uploads: the file name on the server (nil = keep the local name).
@@ -219,6 +219,12 @@ public final class TransferManager {
 
     // MARK: Groups
 
+    /// Two names that would be the same file in one folder (ignoring case on the Mac's disk).
+    static func hasClashingNames(_ names: [String], caseInsensitive: Bool) -> Bool {
+        let keys = names.map { caseInsensitive ? $0.lowercased() : $0 }
+        return Set(keys).count != keys.count
+    }
+
     /// Uploads files into `remoteDirectory` under the given (already conflict-free) names.
     /// Many files are packed into one stream unless `pack` says otherwise; `completion` runs once
     /// for the whole group.
@@ -227,8 +233,11 @@ public final class TransferManager {
                             fileCount: Int, totalBytes: Int64?, pack: Bool? = nil,
                             completion: (([TransferItem]) -> Void)? = nil) -> [TransferItem] {
         // Packed streams need a POSIX shell and tar on the host; Windows hosts copy file by file.
+        // Items unpack side by side in one staging folder: two with the same name (from different
+        // folders) would land on each other there, so they go file by file instead.
         let shouldPack = (pack ?? policy.packs(fileCount: fileCount)) && files.count >= 1 && fileCount > 1
             && PlatformCache.shared.cached(target.key)?.isWindows != true && !PlatformCache.shared.isDevice(target.key)
+            && !Self.hasClashingNames(files.map(\.lastPathComponent), caseInsensitive: false)
         if shouldPack {
             let item = TransferItem(direction: .upload, method: .archive, target: target,
                                     localURL: files[0].deletingLastPathComponent(), remotePath: remoteDirectory)
@@ -261,8 +270,11 @@ public final class TransferManager {
     public func downloadGroup(_ remoteNames: [String], from remoteDirectory: String, to localDirectory: URL,
                               as localNames: [String], target: ConnectionTarget, fileCount: Int, totalBytes: Int64?,
                               pack: Bool? = nil, completion: (([TransferItem]) -> Void)? = nil) -> [TransferItem] {
+        // The Mac's disk ignores case: README and readme from a Linux folder would unpack onto each
+        // other in the staging folder, so they go file by file (each to its own free name).
         let shouldPack = (pack ?? policy.packs(fileCount: fileCount)) && fileCount > 1 && !target.isLocal
             && PlatformCache.shared.cached(target.key)?.isWindows != true && !PlatformCache.shared.isDevice(target.key)
+            && !Self.hasClashingNames(remoteNames, caseInsensitive: true)
         if shouldPack {
             let item = TransferItem(direction: .download, method: .archive, target: target,
                                     localURL: localDirectory, remotePath: remoteDirectory)
@@ -361,6 +373,15 @@ public final class TransferManager {
             jobs[item.id] = job
             job.start()
             return
+        }
+        // The free name was chosen when the download was asked for; it waited in the queue since, and
+        // something may have taken the name meanwhile (another download, the user). scp would
+        // overwrite it, or copy a folder into the one now there: the next free name instead.
+        if item.direction == .download, FileManager.default.fileExists(atPath: item.localURL.path) {
+            let folder = item.localURL.deletingLastPathComponent()
+            let free = folder.appendingPathComponent(LocalFiles.uniqueNames(in: folder, for: [item.localURL.lastPathComponent])[0])
+            item.localURL = free
+            item.entries = [TransferEntry(from: item.remotePath, to: free.path, renamed: true)]
         }
         var executable = options.scpBinary
         var args: [String]

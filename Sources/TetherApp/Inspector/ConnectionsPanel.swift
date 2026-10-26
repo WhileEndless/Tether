@@ -26,10 +26,10 @@ struct ConnectionsPanel: View {
                             Image(systemName: "person.crop.circle").foregroundStyle(.tint)
                             VStack(alignment: .leading) {
                                 Text(l.user).fontWeight(.medium)
-                                Text("\(l.terminal) · \(l.since)").font(.caption).foregroundStyle(.secondary)
+                                Text("\(l.terminal) · \(l.since)").uiFont(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Text(l.from).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            Text(l.from).uiFont(.caption, design: .monospaced).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -50,9 +50,9 @@ struct ConnectionsPanel: View {
                                 .foregroundStyle(c.isSSH ? .green : .secondary)
                                 .frame(width: 16)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(c.peer).font(.callout.monospaced())
+                                Text(c.peer).uiFont(.callout, design: .monospaced)
                                 Text("→ \(c.local)\(c.process.isEmpty ? "" : " · \(c.process)")")
-                                    .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                    .uiFont(.caption, design: .monospaced).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -113,7 +113,7 @@ struct ProcessTrafficCard: View {
         Card(title: title) {
             VStack(alignment: .leading, spacing: 6) {
                 if let message = traffic.message {
-                    Label(message, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
+                    Label(message, systemImage: "info.circle").uiFont(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 suggestion
@@ -144,7 +144,7 @@ struct ProcessTrafficCard: View {
                         }
                     }
                     if list.count > 40 {
-                        Text("and \(list.count - 40) more — filter to find one").font(.caption).foregroundStyle(.secondary)
+                        Text("and \(list.count - 40) more — filter to find one").uiFont(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -197,10 +197,10 @@ struct ProcessTrafficCard: View {
         if isLinux, let wanted {
             let command = ProcessTraffic.installSuggestion(osID: monitor.snapshot?.osInfo["id"])
             VStack(alignment: .leading, spacing: 4) {
-                Text(wanted).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(wanted).uiFont(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if let command {
                     HStack(spacing: 6) {
-                        Text(command).font(.caption.monospaced()).textSelection(.enabled).lineLimit(2)
+                        Text(command).uiFont(.caption, design: .monospaced).textSelection(.enabled).lineLimit(2)
                         Button { CommandFormat.copy(command) } label: { Image(systemName: "doc.on.doc") }
                             .buttonStyle(.borderless)
                             .help("Copy — run it on the server yourself if you want it (Tether installs nothing)")
@@ -216,10 +216,10 @@ struct ProcessTrafficCard: View {
         let quiet = e.rate == 0
         return HStack(spacing: 6) {
             Text(e.name.isEmpty ? "?" : e.name).lineLimit(1)
-            Text(verbatim: String(e.pid)).font(.caption.monospacedDigit()).foregroundStyle(.secondary).help("Process ID")
+            Text(verbatim: String(e.pid)).uiFont(.caption).monospacedDigit().foregroundStyle(.secondary).help("Process ID")
             Spacer(minLength: 4)
             if let c = e.connections {
-                Text("\(c) connection\(c == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
+                Text("\(c) connection\(c == 1 ? "" : "s")").uiFont(.caption).foregroundStyle(.secondary)
             } else {
                 if e.history.count > 2 {
                     Sparkline(values: normalized(e.history), tint: .indigo, filled: false)
@@ -234,11 +234,11 @@ struct ProcessTrafficCard: View {
                             .help("Moved since this card opened: ↓ \(Int64(e.totalReceived).byteString) ↑ \(Int64(e.totalSent).byteString)")
                     }
                 }
-                .font(.caption.monospacedDigit())
+                .uiFont(.caption).monospacedDigit()
                 .fixedSize()
             }
         }
-        .font(.callout)
+        .uiFont(.callout)
         .opacity(quiet && e.connections == nil ? 0.5 : 1)
     }
 
@@ -271,7 +271,7 @@ struct ListeningCard: View {
                 if !group.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         Label(title(exposure), systemImage: icon(exposure))
-                            .font(.caption.weight(.semibold))
+                            .uiFont(.caption, weight: .semibold)
                             .foregroundStyle(color(exposure))
                         ForEach(group) { s in row(s) }
                     }
@@ -279,7 +279,7 @@ struct ListeningCard: View {
                 }
             }
             Text("Process names of other users' services are only visible with root rights.")
-                .font(.caption2).foregroundStyle(.tertiary)
+                .uiFont(.caption2).foregroundStyle(.tertiary)
         }
         .contextMenu {
             let list = sockets
@@ -293,23 +293,23 @@ struct ListeningCard: View {
     private func row(_ s: ListeningSocket) -> some View {
         HStack(spacing: 8) {
             Text(verbatim: String(s.port)).font(.callout.monospacedDigit().weight(.medium)).frame(width: 52, alignment: .leading)
-            Text(s.proto.uppercased()).font(.caption2).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
+            Text(s.proto.uppercased()).uiFont(.caption2).foregroundStyle(.secondary).frame(width: 30, alignment: .leading)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     if let c = s.container {
-                        Label(c, systemImage: "shippingbox.fill").font(.caption).foregroundStyle(.teal)
+                        Label(c, systemImage: "shippingbox.fill").uiFont(.caption).foregroundStyle(.teal)
                     }
                     Text(s.process.isEmpty ? "unknown process" : s.process + (s.pid.map { " (\($0))" } ?? ""))
-                        .font(.caption).foregroundStyle(s.process.isEmpty ? .tertiary : .primary)
+                        .uiFont(.caption).foregroundStyle(s.process.isEmpty ? .tertiary : .primary)
                 }
-                Text(s.address).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                Text(s.address).uiFont(.caption2, design: .monospaced).foregroundStyle(.secondary)
             }
             .lineLimit(1)
             Spacer()
             if s.proto == "tcp" {
                 Button("Forward") { forward(s) }
                     .buttonStyle(.borderless)
-                    .font(.caption)
+                    .uiFont(.caption)
                     .help("Make it reachable on this Mac through the SSH connection")
             }
         }
@@ -412,26 +412,26 @@ private struct RemoteSessionRow: View {
             Image(systemName: entry.kind == .tmux ? "rectangle.split.3x1" : "rectangle.on.rectangle")
             VStack(alignment: .leading) {
                 HStack(spacing: 6) {
-                Text(entry.name).font(.callout.monospaced())
+                Text(entry.name).uiFont(.callout, design: .monospaced)
                 if entry.isTether {
-                    Text("Tether").font(.caption2).padding(.horizontal, 4).background(Capsule().fill(.quaternary))
+                    Text("Tether").uiFont(.caption2).padding(.horizontal, 4).background(Capsule().fill(.quaternary))
                 }
             }
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).uiFont(.caption).foregroundStyle(.secondary)
                 let windows = entry.panes.filter(\.paneActive)
                 ForEach(windows.prefix(6), id: \.windowIndex) { pane in
                     HStack(spacing: 4) {
                         Image(systemName: pane.windowActive ? "chevron.right.circle.fill" : "chevron.right")
-                            .font(.caption2)
+                            .uiFont(.caption2)
                             .foregroundStyle(pane.windowActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
                             .frame(width: 12)
-                        Text("\(pane.windowIndex): \(pane.windowName)").font(.caption.monospaced())
+                        Text("\(pane.windowIndex): \(pane.windowName)").uiFont(.caption, design: .monospaced)
                         PaneSummary(pane: pane)
                     }
                     .help(pane.summary)
                 }
                 if windows.count > 6 {
-                    Text("+\(windows.count - 6) more").font(.caption2).foregroundStyle(.tertiary)
+                    Text("+\(windows.count - 6) more").uiFont(.caption2).foregroundStyle(.tertiary)
                 }
             }
             Spacer()
@@ -441,7 +441,7 @@ private struct RemoteSessionRow: View {
             .buttonStyle(.borderless)
             .help("Kill this session on the server")
             if isOpen {
-                Text("Open").font(.caption).foregroundStyle(.green)
+                Text("Open").uiFont(.caption).foregroundStyle(.green)
             } else {
                 Button("Attach") {
                     state.connect(target, remoteSessionName: entry.name,

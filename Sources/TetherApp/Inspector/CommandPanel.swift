@@ -160,7 +160,7 @@ struct RunningCommandView: View {
             }
         }
         GPUUseCard(monitor: monitor, pids: Set(frame.processes.map(\.pid)))
-        if let error { Text(error).font(.caption).foregroundStyle(.red) }
+        if let error { Text(error).uiFont(.caption).foregroundStyle(.red) }
     }
 
     private func actions(_ leader: CommandProcess) -> some View {
@@ -208,9 +208,9 @@ struct RunningCommandView: View {
 
     private func note(_ title: String, symbol: String, _ message: String) -> some View {
         VStack(spacing: 8) {
-            Image(systemName: symbol).font(.title).foregroundStyle(.secondary)
-            Text(title).font(.headline)
-            Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Image(systemName: symbol).uiFont(.title).foregroundStyle(.secondary)
+            Text(title).uiFont(.headline)
+            Text(message).uiFont(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 160)
         .padding(.horizontal)
@@ -226,7 +226,7 @@ struct CommandHeader: View {
         Card(title: "Running") {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(leader.name).font(.title3.weight(.semibold)).lineLimit(1)
+                    Text(leader.name).uiFont(.title3, weight: .semibold).lineLimit(1)
                     Spacer()
                     if let started = leader.started {
                         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -237,7 +237,7 @@ struct CommandHeader: View {
                     }
                 }
                 Text(leader.commandLine.isEmpty ? leader.name : leader.commandLine)
-                    .font(.callout.monospaced())
+                    .uiFont(.callout, design: .monospaced)
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
                     .textSelection(.enabled)
@@ -249,7 +249,7 @@ struct CommandHeader: View {
                     }
                     if let shellPid { Text("shell " + String(shellPid)).foregroundStyle(.tertiary).help("Process ID of the terminal's shell") }
                 }
-                .font(.caption)
+                .uiFont(.caption)
                 .foregroundStyle(.secondary)
                 .labelStyle(.titleAndIcon)
                 .lineLimit(1)
@@ -282,14 +282,14 @@ struct ProcessTreeCard: View {
                         Text(p.rssBytes?.byteString ?? "").monospacedDigit().foregroundStyle(.secondary)
                             .frame(width: 70, alignment: .trailing)
                     }
-                    .font(.callout)
+                    .uiFont(.callout)
                     .contextMenu {
                         Button("Copy Command") { CommandFormat.copy(p.commandLine) }
                         Button("Copy PID") { CommandFormat.copy(String(p.pid)) }
                     }
                 }
                 if processes.count > 60 {
-                    Text("and \(processes.count - 60) more").font(.caption).foregroundStyle(.secondary)
+                    Text("and \(processes.count - 60) more").uiFont(.caption).foregroundStyle(.secondary)
                 }
             }
         }
@@ -320,7 +320,7 @@ struct GPUUseCard: View {
                             Spacer()
                             Text(g.memoryUsed?.byteString ?? "—").monospacedDigit()
                         }
-                        .font(.callout)
+                        .uiFont(.callout)
                     }
                 }
             }
@@ -343,7 +343,7 @@ struct NetworkSourceNote: View {
         Label(isWindows ? "Windows does not report network traffic per process without administrator tools."
                         : "No network use measured yet. Linux counts TCP per socket (ss, kernel 4.1 or later); UDP is not counted.",
               systemImage: "info.circle")
-            .font(.caption).foregroundStyle(.secondary)
+            .uiFont(.caption).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
 }

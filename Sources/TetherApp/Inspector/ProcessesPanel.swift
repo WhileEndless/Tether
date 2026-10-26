@@ -69,9 +69,9 @@ struct ProcessesPanel: View {
                 }
             }
             HStack {
-                Text("\(monitor.processes.count) processes").font(.caption).foregroundStyle(.secondary)
+                Text("\(monitor.processes.count) processes").uiFont(.caption).foregroundStyle(.secondary)
                 Spacer()
-                if let error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(1) }
+                if let error { Text(error).uiFont(.caption).foregroundStyle(.red).lineLimit(1) }
             }
             .padding(.horizontal, 10).padding(.vertical, 5)
         }

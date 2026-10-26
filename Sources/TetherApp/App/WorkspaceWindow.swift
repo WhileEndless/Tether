@@ -20,6 +20,8 @@ struct WorkspaceWindow: View {
         showInspector && detailWidth >= inspectorWidth + 380
     }
     @State private var renameText = ""
+    /// The first-launch setup opens with the first window only.
+    @MainActor private static var setupShown = false
 
     init(workspaceID: UUID) {
         self.workspaceID = workspaceID
@@ -59,8 +61,9 @@ struct WorkspaceWindow: View {
             .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { detailWidth = $0 }
         }
         .toolbar { WorkspaceToolbar(showInspector: $showInspector) }
-        .navigationTitle(windowTitle)
-        .navigationSubtitle(windowSubtitle)
+        // In a small view of its own: a program animating its title (Claude Code's spinner) then
+        // redraws only the title, not the whole window several times a second.
+        .background(WindowTitles(state: state, workspaceID: workspaceID))
         .focusedSceneValue(\.windowState, state)
         .focusedSceneValue(\.activeSessionID, state.session?.id)
         .background(WindowAccessor { window in
@@ -96,6 +99,10 @@ struct WorkspaceWindow: View {
             WindowLayout.openRemaining { id in openWindow(id: "workspace", value: id) }
             model.adoptOrphanSessions(into: state)
             MenuBarState.windowOpened()
+            if model.settingsStore.wantsFirstLaunchSetup, !Self.setupShown {
+                Self.setupShown = true
+                DispatchQueue.main.async { openWindow(id: "setup") }
+            }
             #if DEBUG
             SelfTest.runIfRequested(state: state)
             DemoMode.runIfRequested(state: state)
@@ -105,8 +112,9 @@ struct WorkspaceWindow: View {
             // Closing a window keeps its sessions running in the background.
             if !model.isTerminating { model.workspaces.windowClosed(workspaceID) }
         }
-        .onChange(of: state.session?.id) { _, id in
+        .onChange(of: state.session?.id, initial: true) { _, id in
             if model.sessions.selectedID != id { model.sessions.selectedID = id }
+            if let session = state.session { model.sessionShown(session) } else { model.refreshPromptPanel() }
         }
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
         .onChange(of: state.toggleInspector) {
@@ -124,6 +132,19 @@ struct WorkspaceWindow: View {
         }
         // Outermost, so the toolbar, sheets and alerts see this window's state too.
         .environment(state)
+    }
+}
+
+/// The window's title (the shown tab) and subtitle (its host, and "Window 2" with several windows).
+private struct WindowTitles: View {
+    @Environment(AppModel.self) private var model
+    let state: WindowState
+    let workspaceID: UUID
+
+    var body: some View {
+        Color.clear
+            .navigationTitle(windowTitle)
+            .navigationSubtitle(windowSubtitle)
     }
 
     /// The host, and "Window 2" while several windows are open (the sidebar names them so).

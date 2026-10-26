@@ -8,6 +8,8 @@ public final class RemoteStream: @unchecked Sendable {
     private let process = Process()
     private let lock = NSLock()
     private var buffer = Data()
+    /// Something arrived from the remote side (so the login itself worked).
+    private(set) var receivedAny = false
     private var stopped = false
     private var env: [String: String] = [:]
 
@@ -48,9 +50,11 @@ public final class RemoteStream: @unchecked Sendable {
             stdinData = call.input
             normalizeLineEndings = platform.isWindows
             process.executableURL = URL(fileURLWithPath: executor.options.sshBinary)
-            process.arguments = executor.options.batchArguments(target: executor.target, remoteCommand: call.command)
+            process.arguments = executor.options.batchArguments(target: executor.target, remoteCommand: call.command,
+                                                                quiet: SSHOptions.isQuietPurpose(purpose))
         }
-        env = AskPassBridge.shared.environment(targetKey: executor.target.key, purpose: purpose)
+        env = AskPassBridge.shared.environment(for: executor.target.key, purpose: purpose)
+        let quiet = SSHOptions.isQuietPurpose(purpose), local = executor.target.isLocal, key = executor.target.key
         process.environment = ChildEnvironment.base.merging(env) { $1 }
         let out = Pipe(), err = Pipe(), input = Pipe()
         process.standardOutput = out
@@ -71,6 +75,9 @@ public final class RemoteStream: @unchecked Sendable {
             err.fileHandleForReading.readabilityHandler = nil
             let status = p.terminationStatus
             let text = errData.text
+            // Only a stream that never delivered anything can have failed to sign in (one that ran
+            // for hours and then lost its network did not).
+            if quiet, !local, self?.receivedAny != true { BackgroundSignIn.shared.noteQuietResult(key, status: status, stderr: text) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 AskPassBridge.shared.revoke(environment: self.env)
@@ -92,6 +99,7 @@ public final class RemoteStream: @unchecked Sendable {
 
     private func consume(_ chunk: Data) {
         lock.lock()
+        receivedAny = true
         buffer.append(chunk)
         // Normalized as a whole, so a CR at the end of one chunk still pairs with the LF of the next.
         if normalizeLineEndings { buffer = PowerShell.normalize(buffer) }

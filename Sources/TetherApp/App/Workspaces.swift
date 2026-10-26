@@ -194,6 +194,11 @@ final class WorkspaceStore {
 
     func state(ofWorkspace id: UUID) -> WindowState? { states[id]?.state }
 
+    /// The terminal shown in each open window (the tabs a password may be asked for).
+    var frontSessions: [TerminalSession] {
+        states.compactMap { id, weak in windows[id]?.window?.isVisible == true ? weak.state?.session : nil }
+    }
+
     /// The frontmost open window's state (key window first).
     var frontState: WindowState? {
         if let key = NSApp.keyWindow, let st = state(of: key) { return st }

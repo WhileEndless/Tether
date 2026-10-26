@@ -9,6 +9,10 @@ struct TetherApp: App {
 
     init() {
         CrashLog.installIfRequested()
+        // A pipe or socket whose other end is gone (an ssh, scp or the askpass helper that already
+        // ended) must give a write error, not end the app: by default SIGPIPE terminates silently,
+        // without even a crash report.
+        signal(SIGPIPE, SIG_IGN)
         Self.raiseOpenFileLimit()
         // Tether has its own tabs per window; native window tabbing stays off.
         UserDefaults.standard.removeObject(forKey: "AppleWindowTabbingMode")
@@ -34,6 +38,7 @@ struct TetherApp: App {
         // window's tab bar, or use Window ▸ Merge All Windows.
         WindowGroup("Tether", id: "workspace", for: UUID.self) { $workspaceID in
             WorkspaceRoot(workspaceID: $workspaceID)
+                .tetherAppearance()
                 .appLockCover()
                 .environment(model)
                 .frame(minWidth: 640, minHeight: 360)
@@ -44,6 +49,7 @@ struct TetherApp: App {
         WindowGroup("Transcript", id: "transcript", for: TranscriptRequest.self) { $request in
             if let request {
                 TranscriptWindow(request: request)
+                    .tetherAppearance()
                     .appLockCover()
                     .environment(model)
                     .standaloneWindow()
@@ -54,6 +60,7 @@ struct TetherApp: App {
         WindowGroup("Files", id: "files", for: FilesRequest.self) { $request in
             if let request {
                 FilesWindow(request: request)
+                    .tetherAppearance()
                     .appLockCover()
                     .environment(model)
                     .standaloneWindow()
@@ -64,6 +71,7 @@ struct TetherApp: App {
 
         Window("Search", id: "search") {
             SearchView()
+                .tetherAppearance()
                 .appLockCover()
                 .environment(model)
                 .frame(minWidth: 760, minHeight: 480)
@@ -85,8 +93,19 @@ struct TetherApp: App {
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
 
+        Window("Set Up Tether", id: "setup") {
+            AppearanceSetupView()
+                .tetherAppearance(scalesInterface: false)
+                .appLockCover()
+                .environment(model)
+        }
+        .windowResizability(.contentSize)
+        .windowStyle(.hiddenTitleBar)
+        .defaultPosition(.center)
+
         Settings {
             SettingsView()
+                .tetherAppearance(scalesInterface: false)
                 .appLockCover()
                 .environment(model)
         }

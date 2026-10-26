@@ -43,13 +43,18 @@ public final class SessionManager {
         connectivity.onChange = { [weak self] online in
             guard let self else { return }
             if online {
-                // After a real outage, shared connections opened on the previous network are dead (and an
-                // address there may belong to a different machine here): close them before reconnecting.
-                // A plain wake from sleep keeps them, so plain shells that survived are not cut off.
+                // After an outage, shared connections whose link died are closed before reconnecting
+                // (a dead one would hang the reconnect; an address on the old network may even belong
+                // to another machine here). Ones that still answer are kept: closing them made every
+                // tab log in again — and ask for its password — after each sleep, although the
+                // connection had survived. A plain wake from sleep keeps them all.
+                // Waking from sleep is reported before Wi-Fi is back: judging connections then would
+                // find them all dead. Keep the outage noted until the network is really there.
+                guard self.connectivity.isOnline else { return }
                 let outage = self.networkWasLost
                 self.networkWasLost = false
                 Task {
-                    if outage { await self.closeAllMasters() }
+                    if outage { await self.closeDeadMasters() }
                     self.retryWaiting()
                 }
             } else {
@@ -200,8 +205,60 @@ public final class SessionManager {
         }
     }
 
+    /// Closes the shared connections that no longer reach their server and keeps the others.
+    public func closeDeadMasters() async {
+        let options = SSHOptions(settings: settings.settings)
+        guard options.useControlMaster else { return }
+        let dir = AppPaths.controlSocketDirectory
+        let sockets = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0 != AppPaths.askPassSocket.lastPathComponent }
+            .map { dir.appendingPathComponent($0).path }
+            .filter(Self.isSocket)
+        await withTaskGroup(of: Void.self) { group in
+            for path in sockets {
+                group.addTask {
+                    // A link that is slow to come back (VPN, Wi-Fi joining) gets a second chance; one
+                    // that is clearly gone is closed at once.
+                    var verdict = await Self.probeMaster(path, ssh: options.sshBinary, timeout: 8)
+                    if verdict == nil {
+                        try? await Task.sleep(for: .seconds(15))
+                        verdict = await Self.probeMaster(path, ssh: options.sshBinary, timeout: 10)
+                    }
+                    guard verdict == false else { return }
+                    _ = await ProcessRunner.run(options.sshBinary, arguments: [
+                        "-F", "/dev/null", "-o", "ControlPath=\(path)", "-O", "exit", "tether-master",
+                    ], timeout: 5)
+                }
+            }
+        }
+    }
+
+    /// Whether a shared connection still reaches its server: true (alive), false (clearly dead),
+    /// nil (no answer in time). It is asked to run `exit 0` over its existing link — understood by
+    /// sh, cmd and PowerShell; any exit status but ssh's own 255 means the server answered. No new
+    /// login can happen: no config file, BatchMode, and a ProxyCommand that fails at once if the
+    /// socket does not answer (instead of connecting to a host named "tether-master").
+    nonisolated static func probeMaster(_ path: String, ssh: String, timeout: TimeInterval) async -> Bool? {
+        let r = await ProcessRunner.run(ssh, arguments: [
+            "-F", "/dev/null", "-o", "ControlPath=\(path)", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
+            "-o", "ProxyCommand=/usr/bin/false", "-o", "RequestTTY=no", "-T", "tether-master", "exit 0",
+        ], timeout: timeout)
+        if r.timedOut { return nil }
+        if r.status != 255 { return true }
+        // A full connection (sshd MaxSessions) refuses one more session but is alive.
+        return TerminalSession.isSessionRefused(r.errorOutput) ? true : false
+    }
+
+    nonisolated static func isSocket(_ path: String) -> Bool {
+        var st = stat()
+        return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK
+    }
+
     public func retryWaiting() {
-        for s in sessions { s.reconnectNow() }
+        // Tabs waiting for the user to sign in start when they are shown (`shownToUser`).
+        // A tab whose sign-in was cancelled or refused waits for Reconnect: the network coming back
+        // does not change the password.
+        for s in sessions where !s.waitsForUser && s.retryPausedReason == nil { s.reconnectNow() }
     }
 
     // MARK: Archive

@@ -79,7 +79,19 @@ final class TmuxDriver {
     }
 
     func receive(_ bytes: some Sequence<UInt8>) {
-        for event in parser.feed(bytes) { handle(event) }
+        // tmux sends output a line at a time: the active pane's consecutive lines go to the terminal
+        // as one piece (one pass through the filters, the recording and the emulator instead of
+        // hundreds). Any other event first gets what came before it, so the order never changes.
+        var run: [UInt8] = []
+        for event in parser.feed(bytes) {
+            if case .output(let pane, let data) = event, let paneID, pane == paneID, !restoring {
+                run.append(contentsOf: data)
+                continue
+            }
+            if !run.isEmpty { display(run); run.removeAll(keepingCapacity: true) }
+            handle(event)
+        }
+        if !run.isEmpty { display(run) }
     }
 
     private func send(_ command: String, expect: Pending = .ignore) {

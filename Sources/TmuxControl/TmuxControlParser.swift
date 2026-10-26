@@ -52,21 +52,31 @@ public struct TmuxControlParser: Sendable {
                 return events
             }
 
-            // Control mode: ST at the start of a line ends it.
-            if buffer.starts(with: Self.st) {
-                buffer.removeSubrange(..<2)
-                inControlMode = false
-                block = nil
-                events.append(.leftControlMode)
-                continue
+            // Control mode: line by line, read with an index — removing each line from the front of
+            // the buffer moved the rest every time (quadratic in a burst of output or a reattach's
+            // history); the buffer is trimmed once at the end.
+            var pos = 0
+            var left = false
+            while pos < buffer.count {
+                // ST at the start of a line ends control mode.
+                if buffer[pos...].starts(with: Self.st) {
+                    pos += 2
+                    inControlMode = false
+                    block = nil
+                    events.append(.leftControlMode)
+                    left = true
+                    break
+                }
+                guard let nl = buffer[pos...].firstIndex(of: 0x0a) else { break }
+                var start = pos, end = nl
+                if end > start, buffer[end - 1] == 0x0d { end -= 1 }
+                // Some terminals echo stray CRs before the line; drop leading CRs.
+                while start < end, buffer[start] == 0x0d { start += 1 }
+                if let e = handle(line: Array(buffer[start..<end])) { events.append(e) }
+                pos = nl + 1
             }
-            guard let nl = buffer.firstIndex(of: 0x0a) else { return events }
-            var line = Array(buffer[..<nl])
-            buffer.removeSubrange(...nl)
-            if line.last == 0x0d { line.removeLast() }
-            // Some terminals echo stray CRs before the line; drop leading CRs.
-            while line.first == 0x0d { line.removeFirst() }
-            if let e = handle(line: line) { events.append(e) }
+            if pos > 0 { buffer.removeSubrange(..<pos) }
+            if !left { return events }
         }
     }
 

@@ -141,6 +141,8 @@ public final class TerminalSession: Identifiable {
         public var updated: Date
     }
     public private(set) var agent: AgentState?
+    /// The time of the newest report, also when it changed nothing shown (not observed).
+    @ObservationIgnored private var agentUpdatedQuietly = Date.distantPast
     /// Whether agents' status is followed (Settings ▸ Monitoring and the host's choice; set by the app).
     @ObservationIgnored public var agentStatusEnabled = true
     /// Whether an agent waiting for the user, or finishing, marks the tab and notifies (Settings).
@@ -150,10 +152,16 @@ public final class TerminalSession: Identifiable {
     /// An agent's status, from any source. Older than what is known: ignored. Going into
     /// "waiting" marks the tab and notifies once.
     public func agentReported(kind: AgentKind, activity: AgentActivity, at date: Date) {
-        if let agent, agent.updated > date { return }
+        if agent != nil, agentUpdatedQuietly > date { return }
         let before = agent?.activity
-        let next = AgentState(kind: kind, activity: activity, updated: date)
-        if agent != next { agent = next }
+        // Only what is shown (the agent and its state) is published: a newer report saying the same
+        // (every few seconds while an agent works) must not redraw every tab and sidebar row.
+        if let agent, agent.kind == kind, agent.activity == activity {
+            agentUpdatedQuietly = date
+        } else {
+            agent = AgentState(kind: kind, activity: activity, updated: date)
+            agentUpdatedQuietly = date
+        }
         switch activity {
         case .waiting(let why) where !(before?.isWaiting ?? false) && notifyAgentWaiting:
             raiseAttention(.message(TerminalNotification(title: kind.title, body: "\(kind.title) \(why)")))
@@ -346,6 +354,12 @@ public final class TerminalSession: Identifiable {
         return currentDirectory
     }
 
+    /// The name of the program in front in a tmux pane (zsh, vim, ssh …); nil when unknown.
+    public func tmuxForegroundCommand() async -> String? {
+        guard persistence == .tmux, phase.isOnline else { return nil }
+        return await tmuxQuery("#{pane_current_command}")?.trimmingCharacters(in: .whitespaces)
+    }
+
     private func tmuxQuery(_ format: String) async -> String? {
         guard let tmux else { return nil }
         return await tmux.query(format, timeout: .seconds(2))
@@ -480,8 +494,61 @@ public final class TerminalSession: Identifiable {
     }
 
     /// Retry immediately (used by the "Reconnect now" button and on network changes).
+    /// A login of this tab needed the user while the tab was not in front, and its question went
+    /// unanswered until ssh gave up. It waits to be shown instead of retrying on a timer: unanswered
+    /// logins every few minutes help nobody and fill the server's log (fail2ban and similar may ban).
+    public private(set) var waitsForUser = false
+
+    /// Why automatic retries stopped until the user presses Reconnect: the server refused the sign-in
+    /// (a wrong or changed password, a key it no longer takes) or the user cancelled the prompt.
+    /// Retrying on a timer would only ask again and again — or send the same wrong password.
+    public private(set) var retryPausedReason: String?
+
+    public func pauseRetries(_ reason: String) {
+        guard !phase.isOnline, !phase.isDead else { return }
+        retryPausedReason = reason
+        lastError = reason
+        if case .waiting(let attempt, _) = phase {
+            retryTask?.cancel()
+            retryTask = nil
+            phase = .waiting(attempt: attempt, nextRetry: nil)
+        }
+    }
+
+    /// ssh's words for a sign-in the server refused (not a network problem that may pass).
+    public nonisolated static func isRefusedSignIn(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return m.contains("permission denied (") || m.contains("too many authentication failures")
+            || m.contains("host key verification failed") || m.contains("no more authentication methods")
+    }
+
+    /// See `waitsForUser`: a retry already scheduled is called off, and failed attempts schedule
+    /// no more until the tab is shown.
+    public func waitForUser() {
+        guard !phase.isOnline, !phase.isDead else { return }
+        waitsForUser = true
+        if case .waiting(let attempt, let next?) = phase, next > Date() {
+            retryTask?.cancel()
+            retryTask = nil
+            phase = .waiting(attempt: attempt, nextRetry: nil)
+            lastError = "Needs your password — click the tab to sign in"
+        }
+    }
+
+    /// The tab is shown: a login that waited for the user starts now (and may ask).
+    public func shownToUser() {
+        guard waitsForUser else { return }
+        waitsForUser = false
+        reconnectNow()
+    }
+
     public func reconnectNow() {
         guard case .waiting = phase else { return }
+        // An attempt is already running (its login or its terminal): a second one would leave two
+        // ssh processes feeding this terminal.
+        guard process == nil, connector == nil else { waitsForUser = false; retryPausedReason = nil; return }
+        waitsForUser = false
+        retryPausedReason = nil
         retryTask?.cancel()
         retryTask = nil
         Task {
@@ -595,8 +662,14 @@ public final class TerminalSession: Identifiable {
             let executor = RemoteExecutor(target: target, options: self.sshOptions(config))
             if await executor.isMasterAlive() {
                 self.progress?.detail = "Using the existing connection"
+            } else if self.waitsForUser {
+                // Another tab to this host already waited in vain for a password: no new login
+                // (and no new question) until this tab is shown.
+                self.releaseGate()
+                self.scheduleReconnect()
+                return
             } else {
-                let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect", mode: "force")
+                let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect", mode: "force", sessionID: self.id)
                 let connector = MasterConnector()
                 self.connector = connector
                 let error = await connector.connect(target: target, options: sshOptions(config), environment: env) { [weak self] line in
@@ -607,7 +680,8 @@ public final class TerminalSession: Identifiable {
                 guard !Task.isCancelled, !self.intentionalStop else { self.releaseGate(); return }
                 if let error {
                     self.releaseGate()
-                    self.connectionFailed(error)
+                    // Stopped because its question waited for the user: wait for them, quietly.
+                    if self.waitsForUser { self.scheduleReconnect() } else { self.connectionFailed(error) }
                     return
                 }
             }
@@ -628,6 +702,8 @@ public final class TerminalSession: Identifiable {
     public func retryAfterFailure() {
         guard phase.isDead, endedByConnectionFailure else { return }
         endedByConnectionFailure = false
+        waitsForUser = false
+        retryPausedReason = nil
         endedAt = nil
         recorder = nil      // the old one was closed; a new recording starts
         attempt = 0
@@ -646,6 +722,9 @@ public final class TerminalSession: Identifiable {
             endedByConnectionFailure = true
             finish(reason: message, archive: false)
             return
+        }
+        if progress.map({ p in p.log.contains { Self.isRefusedSignIn($0) } }) == true {
+            retryPausedReason = "The server did not accept the sign-in. Check the password or key, then press Reconnect."
         }
         scheduleReconnect()
     }
@@ -683,7 +762,7 @@ public final class TerminalSession: Identifiable {
         // "prefer" makes password prompts appear as a native sheet (with keychain support),
         // which also works while input is blocked during a reconnect. Never for local shells: every
         // program started there could use the token to ask Tether for saved secrets.
-        askPassEnv = local ? [:] : AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
+        askPassEnv = local ? [:] : AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer", sessionID: id)
 
         // Without `$TMUX`: started from inside tmux (a terminal, a test run), local sessions would
         // otherwise be created on that outer server, and ending them could end it.
@@ -749,7 +828,7 @@ public final class TerminalSession: Identifiable {
         }
         let args = sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: command)
         AskPassBridge.shared.revoke(environment: askPassEnv)
-        askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
+        askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer", sessionID: id)
         var env = ChildEnvironment.base
         env["TERM"] = "xterm-256color"
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
@@ -865,6 +944,11 @@ public final class TerminalSession: Identifiable {
 
     private func becameOnline() {
         releaseGate()
+        waitsForUser = false
+        retryPausedReason = nil
+        // Its shared connection can serve the host panel and background work now (without sharing,
+        // background work would only fail to sign in again).
+        if sshOptions(configurationProvider()).useControlMaster { BackgroundSignIn.shared.clear(descriptor.target.key) }
         if !wasOnline { onPersistenceKnown?(self) }
         progress = nil
         if wasOnline { recorder?.mark("Reconnected \(Date().formatted(date: .omitted, time: .standard))") }
@@ -923,6 +1007,9 @@ public final class TerminalSession: Identifiable {
             }
         }
         lastError = stderrTail.isEmpty ? nil : stderrTail
+        if Self.isRefusedSignIn(stderrTail) {
+            retryPausedReason = "The server did not accept the sign-in. Check the password or key, then press Reconnect."
+        }
         scheduleReconnect()
     }
 
@@ -934,13 +1021,25 @@ public final class TerminalSession: Identifiable {
             phase = .waiting(attempt: attempt, nextRetry: nil)
             return
         }
+        if waitsForUser {
+            phase = .waiting(attempt: attempt, nextRetry: nil)
+            progress = nil
+            lastError = "Needs your password — click the tab to sign in"
+            return
+        }
+        if let reason = retryPausedReason {
+            phase = .waiting(attempt: attempt, nextRetry: nil)
+            progress = nil
+            lastError = reason
+            return
+        }
         let delay = min(config.reconnectBaseDelay * pow(2, Double(min(attempt - 1, 8))), config.reconnectMaxDelay)
         phase = .waiting(attempt: attempt, nextRetry: Date().addingTimeInterval(delay))
         retryTask?.cancel()
         retryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
-            guard let self else { return }
+            guard let self, !self.waitsForUser else { return }
             self.retryTask = nil
             self.launch(attachOnly: self.wasOnline || self.restoredFromDisk)
         }
@@ -981,7 +1080,10 @@ public final class TerminalSession: Identifiable {
                 } else {
                     await self.measureLatencyOutOfBand()
                 }
-                try? await Task.sleep(for: .seconds(self.tmux == nil ? 10 : 2))
+                // A tab not on screen asks half as often (its marks may lag a little); still well
+                // within the stall timeout, so a dead connection is noticed as before.
+                let interval: Double = self.tmux == nil ? 10 : (self.isOnScreen ? 2 : min(4, max(2, timeout * 0.66)))
+                try? await Task.sleep(for: .seconds(interval))
             }
         }
     }
@@ -1043,7 +1145,10 @@ public final class TerminalSession: Identifiable {
         // tmux: the banner above the terminal says it; the screen stays exactly as tmux left it, so
         // what the server prints meanwhile can be added seamlessly on reconnect (HistoryCatchUp).
         guard persistence != .tmux else { return }
-        let notice = "\r\n\u{1b}[2m[Tether] Connection lost. History is kept; input is paused until the session is back.\u{1b}[0m\r\n"
+        // A plain shell cannot be reattached: say so, so nobody waits for a command that has ended.
+        let notice = persistence == .plain
+            ? "\r\n\u{1b}[2m[Tether] Connection lost. This server keeps no shell running for Tether (no tmux or screen), so the shell and what ran in it have ended; reconnecting starts a new one. The output above is kept.\u{1b}[0m\r\n"
+            : "\r\n\u{1b}[2m[Tether] Connection lost. History is kept; input is paused until the session is back.\u{1b}[0m\r\n"
         display(Array(notice.utf8))
     }
 
@@ -1090,7 +1195,7 @@ public final class TerminalSession: Identifiable {
         }
     }
 
-    static func isSessionRefused(_ message: String) -> Bool {
+    public nonisolated static func isSessionRefused(_ message: String) -> Bool {
         let m = message.lowercased()
         return m.contains("session open refused") || m.contains("administratively prohibited")
             || m.contains("session request failed")

@@ -2,6 +2,7 @@ import SwiftUI
 import TetherCore
 import SessionKit
 import MonitorKit
+import SSHTransport
 
 /// A thin live bar above the terminal: CPU, memory, disk, load, network, GPU and latency.
 /// It adapts to the width (full → compact → essentials) instead of truncating labels.
@@ -34,9 +35,11 @@ struct HostStatusStrip: View {
                     .clipped()
             } else {
                 HStack {
-                    Label(monitor.error == nil ? "Loading host status…" : "Host status unavailable",
-                          systemImage: "gauge.with.dots.needle.0percent")
+                    let signIn = monitor.error?.hasPrefix(BackgroundSignIn.marker) == true
+                    Label(monitor.error == nil ? "Loading host status…" : signIn ? "Sign in to see host status" : "Host status unavailable",
+                          systemImage: signIn ? "lock" : "gauge.with.dots.needle.0percent")
                         .foregroundStyle(.secondary)
+                        .help(monitor.error ?? "")
                     Spacer()
                 }
             }
