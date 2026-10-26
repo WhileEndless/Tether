@@ -78,6 +78,7 @@ let package = Package(
         .testTarget(name: "TmuxControlTests", dependencies: ["TmuxControl"]),
         .testTarget(name: "MonitorKitTests", dependencies: ["MonitorKit", "TestSupport"]),
         .testTarget(name: "RecordingKitTests", dependencies: ["RecordingKit", "TetherCore", "SearchKit"]),
+        .testTarget(name: "KeySetupKitTests", dependencies: ["KeySetupKit", "TetherCore", "TestSupport"]),
         .testTarget(name: "SSHTransportTests", dependencies: ["SSHTransport", "TetherCore", "TestSupport"]),
         .testTarget(name: "FileTransferKitTests", dependencies: ["FileTransferKit", "SSHTransport", "TetherCore"]),
         .testTarget(name: "SearchKitTests", dependencies: ["SearchKit", "RecordingKit", "TerminalText"]),

@@ -536,6 +536,7 @@ private struct SSHSettings: View {
                 Text("Terminals, file transfers and monitoring reuse one authenticated connection, so you log in (and pass jump hosts) only once.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            SSHKeysSection()
         }
         .formStyle(.grouped)
     }

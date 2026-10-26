@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.5.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.5.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.5.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.5.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -81,7 +81,9 @@ Search across every terminal, the archive and recordings.
 - *Identify by name* (HostKeyAlias), so an address reused on another network is not confused with your host.
 - Direct connections (user, host, port, jump host, password or key) without saving anything.
 - One authenticated connection per host (ControlMaster), shared by terminals, transfers, monitoring and port forwards.
-- Passwords stay in the keychain and reach `ssh` via a private askpass bridge. A wizard can generate and install an Ed25519 key; it is offered only when key login doesn't already work.
+- Passwords stay in the keychain and reach `ssh` via a private askpass bridge.
+- **SSH keys:** *Set Up SSH Key…* on a host creates a key (Ed25519, or RSA 4096 for older servers), with or without a passphrase (typed twice), adds it to the server's `authorized_keys`, checks that the key alone logs in, and sets it in your SSH config. An existing key can be used instead. Existing files are never replaced. It is offered only where key login doesn't already work.
+- **Keys with a passphrase:** when ssh asks for it, Tether answers with the passphrase it keeps in your keychain (after Touch ID, if you turned that on), or asks you and can remember it. Optionally new keys also go to the macOS ssh-agent for Terminal and git. Settings ▸ SSH ▸ Keys lists your keys and adds, changes or removes a passphrase.
 - **Port forwarding:**
   - local, remote and SOCKS forwards saved per host, with auto-start
   - conflict checks with free-port suggestions

@@ -35,7 +35,7 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
 | Archive of ended sessions | `archive.json` | 500 entries |
 | Open sessions, windows, file tabs | `open-sessions.json`, `workspaces.json`, `window-layout.json`, `file-tabs.json` | Only what is open |
 | Settings | the app's preferences | — |
-| Passwords and the recording key | the macOS keychain | Removed with the host or password |
+| Passwords, key passphrases and the recording key | the macOS keychain (service "Tether SSH Password"; a key's passphrase is the item `passphrase:<key file>`) | Removed with the host, the password or the passphrase |
 
 Temporary files outside this folder:
 - Connection sockets and askpass: `/tmp/tether-<uid>/`, private to you. ssh removes its own sockets.

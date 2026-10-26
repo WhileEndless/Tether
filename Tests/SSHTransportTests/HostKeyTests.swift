@@ -150,4 +150,23 @@ import Foundation
         #expect(request("The authenticity of host 'h (192.0.2.1)' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])? ").isConfirmation)
         #expect(!request("(alice@evil.example.com) Are you sure you want to continue connecting (yes/no)?").isConfirmation)
     }
+
+    /// ssh cuts the key's path at 100 bytes in its prompt: the cut path finds the one file it starts.
+    @Test func longKeyPathsAreCompleted() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-key-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let deep = dir.appendingPathComponent(String(repeating: "folder-", count: 12), isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        let key = deep.appendingPathComponent("id_ed25519_long").path
+        try Data("k".utf8).write(to: URL(fileURLWithPath: key))
+        try Data("k.pub".utf8).write(to: URL(fileURLWithPath: key + ".pub"))
+        let cut = String(decoding: Array(key.utf8).prefix(100), as: UTF8.self)
+        #expect(key.utf8.count > 100)
+        #expect(request("Enter passphrase for key '\(cut)': ").keyPath == key)
+        #expect(request("Enter passphrase for key '\(cut)': ").isPassphrasePrompt)
+        // Two files it could be: left as written (and so not taken for a key file).
+        try Data("k".utf8).write(to: URL(fileURLWithPath: deep.appendingPathComponent("id_ed25519_other").path))
+        #expect(request("Enter passphrase for key '\(cut)': ").keyPath == cut)
+        #expect(!request("Enter passphrase for key '\(cut)': ").isPassphrasePrompt)
+    }
 }

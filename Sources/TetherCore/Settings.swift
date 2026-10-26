@@ -252,6 +252,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Tabs not renamed by hand are named after the coding agent session in them (Claude Code,
     /// Codex, opencode).
     public var tabTitleFromAgent = true
+    /// New keys with a passphrase: Tether keeps the passphrase in its keychain (askpass answers ssh
+    /// with it, after Touch ID when that is on).
+    public var rememberKeyPassphrases = true
+    /// New keys are also added to the macOS ssh-agent (passphrase in the macOS keychain, the host's
+    /// config gets `AddKeysToAgent` and `UseKeychain`), for Terminal, git and other programs.
+    public var addNewKeysToAgent = false
     public var bell: BellMode = .visual
     /// Notifications programs send (OSC 9/777/99 — Claude Code when it finishes or asks).
     public var notifyFromPrograms = true
@@ -421,6 +427,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.programsMayClearScrollback, &programsMayClearScrollback)
         d(.browseLocalInFinder, &browseLocalInFinder)
         d(.tabTitleFromAgent, &tabTitleFromAgent)
+        d(.rememberKeyPassphrases, &rememberKeyPassphrases)
+        d(.addNewKeysToAgent, &addNewKeysToAgent)
         d(.bell, &bell)
         d(.notifyFromPrograms, &notifyFromPrograms)
         d(.notifyOnBell, &notifyOnBell)

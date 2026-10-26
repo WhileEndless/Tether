@@ -169,7 +169,7 @@ struct HostEditorView: View {
     }
 
     private var keyAlreadyWorks: Bool {
-        request.alias.map { model.metadata(for: $0).keyLoginWorks == true } ?? false
+        request.alias.map { !model.offersKeySetup($0) } ?? false
     }
 
     private func load() {

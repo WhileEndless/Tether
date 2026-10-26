@@ -35,7 +35,32 @@ public struct AskPassRequest: Sendable {
     public var keyPath: String? {
         let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let m = p.wholeMatch(of: #/Enter passphrase for (?:key )?'(.+)': ?/#) else { return nil }
-        return String(m.1)
+        return Self.untruncated(String(m.1))
+    }
+
+    /// ssh writes at most 100 bytes of the key's path in its prompt: a longer path is completed to
+    /// the one file on this Mac that it starts (otherwise it stays as written).
+    static func untruncated(_ path: String) -> String {
+        let fm = FileManager.default
+        let expanded = (path as NSString).expandingTildeInPath
+        guard path.utf8.count == 100, !fm.fileExists(atPath: expanded) else { return path }
+        // The deepest folder that exists whole; the cut is somewhere below it.
+        var base = (expanded as NSString).deletingLastPathComponent
+        while !base.isEmpty, base != "/", !fm.fileExists(atPath: base) { base = (base as NSString).deletingLastPathComponent }
+        guard base.count > 1, let walk = fm.enumerator(atPath: base) else { return path }
+        var found: [String] = []
+        var seen = 0
+        while let rel = walk.nextObject() as? String, seen < 5_000, found.count < 2 {
+            seen += 1
+            if walk.level > 6 { walk.skipDescendants(); continue }
+            let full = (base as NSString).appendingPathComponent(rel)
+            guard full.hasPrefix(expanded) || expanded.hasPrefix(full) else { walk.skipDescendants(); continue }
+            var isDir: ObjCBool = false
+            if full.hasPrefix(expanded), !full.hasSuffix(".pub"), fm.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue {
+                found.append(full)
+            }
+        }
+        return found.count == 1 ? found[0] : path
     }
 
     /// ssh's own host-key question (`… continue connecting (yes/no/[fingerprint])?`), not server text.
@@ -78,6 +103,9 @@ public final class AskPassBridge: @unchecked Sendable {
         var count: Int
         /// Answered without asking (a passphrase Tether hands to ssh-keygen / ssh-add itself).
         var fixedAnswer: String? = nil
+        /// Answered without asking, by the prompt (`ssh-keygen -p` asks for the old passphrase,
+        /// then twice for the new one).
+        var answerFor: (@Sendable (String) -> String?)? = nil
         /// The processes this token was given to: only they (and what they start, e.g. the ssh for a
         /// jump host, then the helper) may use it.
         var pids: Set<pid_t> = []
@@ -141,6 +169,21 @@ public final class AskPassBridge: @unchecked Sendable {
         guard isAvailable, let helperPath else { return [:] }
         let token = UUID().uuidString
         lock.lock(); contexts[token] = Context(targetKey: "", purpose: purpose, count: 0, fixedAnswer: answer); lock.unlock()
+        return [
+            "SSH_ASKPASS": helperPath,
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
+            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
+            "TETHER_ASKPASS_TOKEN": token,
+        ]
+    }
+
+    /// An environment whose prompts are answered by `answer(prompt)` (several different passphrases
+    /// for one process, such as `ssh-keygen -p`). Revoke it when the process has finished.
+    public func environment(answers answer: @escaping @Sendable (String) -> String?, purpose: String) -> [String: String] {
+        guard isAvailable, let helperPath else { return [:] }
+        let token = UUID().uuidString
+        lock.lock(); contexts[token] = Context(targetKey: "", purpose: purpose, count: 0, answerFor: answer); lock.unlock()
         return [
             "SSH_ASKPASS": helperPath,
             "SSH_ASKPASS_REQUIRE": "force",
@@ -238,6 +281,7 @@ public final class AskPassBridge: @unchecked Sendable {
         let handler = self.handler
         lock.unlock()
         if let fixed = ctx.fixedAnswer { reply(fd, fixed); return }
+        if let answer = ctx.answerFor { reply(fd, answer(prompt)); return }
 
         let request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
                                      prompt: prompt, sequence: ctx.count)

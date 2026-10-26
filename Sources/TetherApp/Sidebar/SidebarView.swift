@@ -912,7 +912,7 @@ struct HostContextMenu: View {
         }
         Divider()
         Button("Edit Host…") { state.hostEditor = HostEditorRequest(alias: alias) }
-        if model.metadata(for: alias).keyLoginWorks != true {
+        if model.offersKeySetup(alias) {
             Button("Set Up SSH Key…") { state.keySetupTarget = KeySetupRequest(alias: alias) }
         }
         Toggle("Favorite", isOn: Binding(get: { model.metadata(for: alias).favorite },

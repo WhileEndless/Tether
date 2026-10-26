@@ -204,7 +204,8 @@ so it is always current. A test checks that this page names every entry in it.
   is touched.
 - **Key setup:** appends your public key to `~/.ssh/authorized_keys` (on Windows, also
   `administrators_authorized_keys` for administrators). Only when you ask, and only if the key is not
-  there yet.
+  there yet. Then one login with that key alone (`exit`, nothing else) checks that it works; a
+  key's passphrase is given to ssh through Tether's askpass, never on a command line.
 - **Port forwards:** handled by `ssh` itself. No command runs on the host.
 
 ## What stays on this Mac

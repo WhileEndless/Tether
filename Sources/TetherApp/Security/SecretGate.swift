@@ -76,6 +76,15 @@ final class SecretGate {
 enum CredentialKey {
     static func passphrase(keyPath: String) -> String { "passphrase:" + keyPath }
 
+    /// The key file named by an `Enter passphrase for key '/path':` prompt, when it exists here.
+    static func localKeyPath(in prompt: String) -> String? {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = p.firstMatch(of: #/passphrase for (?:key )?'(.+)'/#) else { return nil }
+        let path = (String(m.1) as NSString).expandingTildeInPath
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue ? path : nil
+    }
+
     /// The keychain item for a password prompt shown inside a terminal on `hostKey`.
     @MainActor
     /// `program` (the one asking, when known) keeps generic "Password:" prompts of different programs
@@ -105,7 +114,11 @@ enum CredentialKey {
                 if candidates.count == 1 { return candidates[0] }
             }
             return "login:\(prompt.user ?? "")@\(prompt.host ?? "")"
-        case .passphrase: return "passphrase:\(hostKey):\(prompt.text)"
+        case .passphrase:
+            // A key on this Mac: the same item ssh's own prompt (askpass) uses, so its passphrase is
+            // kept once. A key on a server stays with that host.
+            if hostKey == ConnectionTarget.local.key, let path = localKeyPath(in: prompt.text) { return passphrase(keyPath: path) }
+            return "passphrase:\(hostKey):\(prompt.text)"
         case .generic:
             let asker = (process?.command ?? program).flatMap { $0.isEmpty || TerminalSession.shells.contains($0) ? nil : $0 }
             let user = process.map { ":" + $0.user } ?? ""

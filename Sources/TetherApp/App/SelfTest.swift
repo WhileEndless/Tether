@@ -201,7 +201,7 @@ enum SelfTest {
                 let dir = URL(fileURLWithPath: "/tmp/tpp-\(getpid())", isDirectory: true)
                 AppPaths.ensure(dir, permissions: 0o700)
                 let keyURL = dir.appendingPathComponent("id_pp")
-                do { _ = try await KeySetup.generate(at: keyURL, comment: "tether-selftest-pp", passphrase: "pp-secret-456", addToKeychain: false) }
+                do { _ = try await KeySetup.generate(at: keyURL, comment: "tether-selftest-pp", passphrase: "pp-secret-456") }
                 catch { say("FAIL keygen \(error.localizedDescription)"); return }
                 let pub = (try? String(contentsOf: keyURL.appendingPathExtension("pub"), encoding: .utf8)) ?? ""
                 let auth = URL(fileURLWithPath: rig).appendingPathComponent("authorized_keys")
@@ -246,6 +246,64 @@ enum SelfTest {
                 say(direct.terminationStatus != 0 && !answer.contains("pp-secret") && !r.succeeded
                     ? "PASS a token used by another process gets nothing" : "FAIL stolen token answered: \(answer)")
                 model.sessions.close(s.id, killRemote: true)
+                try? await Task.sleep(for: .seconds(1))
+
+                // From here every sign-in starts its own ssh with nothing loaded, as after a restart.
+                model.settings.useControlMaster = false
+                let account = CredentialKey.passphrase(keyPath: keyURL.path)
+                /// Connects, hands each prompt to `reply` (none: cancelled), and closes again.
+                @MainActor func signIn(_ alias: String, reply: ((PendingPrompt) -> Void)? = nil) async -> (online: Bool, asked: [PendingPrompt]) {
+                    let t = state.connect(.alias(alias), persistence: .off)
+                    var asked: [PendingPrompt] = []
+                    for _ in 0..<150 where !t.phase.isOnline && !t.phase.isDead {
+                        if let p = model.prompts.first(where: { p in !asked.contains { $0.id == p.id } }) {
+                            asked.append(p)
+                            if let reply { reply(p) } else { model.resolvePrompt(p, answer: nil, save: false) }
+                        }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    let online = t.phase.isOnline
+                    model.sessions.close(t.id, killRemote: true)
+                    try? await Task.sleep(for: .seconds(1))
+                    return (online, asked)
+                }
+                let fresh = await signIn("pptest")
+                say(fresh.online && fresh.asked.isEmpty ? "PASS a new ssh signs in with the kept passphrase, nothing asked"
+                                                        : "FAIL fresh sign-in online=\(fresh.online) asked=\(fresh.asked.map(\.request.prompt))")
+
+                // Not kept: asked once; with "remember" the answer is kept and the next sign-in asks nothing.
+                PasswordVault.deletePassword(for: account)
+                let typed = await signIn("pptest") { model.resolvePrompt($0, answer: "pp-secret-456", save: true) }
+                let kept = PasswordVault.password(for: account) == "pp-secret-456"
+                let after = await signIn("pptest")
+                say(typed.online && typed.asked.count == 1 && kept && after.online && after.asked.isEmpty
+                    ? "PASS a typed passphrase is remembered and used next time"
+                    : "FAIL remember typed=\(typed.online)/\(typed.asked.count) kept=\(kept) after=\(after.online)/\(after.asked.count)")
+
+                // A kept passphrase that is wrong (the key was changed elsewhere): sent once, then asked.
+                PasswordVault.setPassword("not-the-passphrase", for: account)
+                let wrong = await signIn("pptest") { model.resolvePrompt($0, answer: "pp-secret-456", save: true) }
+                say(wrong.online && wrong.asked.count == 1 && wrong.asked.first?.savedWasRejected == true
+                    && PasswordVault.password(for: account) == "pp-secret-456"
+                    ? "PASS a wrong kept passphrase is noticed, asked for and replaced"
+                    : "FAIL wrong kept online=\(wrong.online) asked=\(wrong.asked.count) rejected=\(wrong.asked.first?.savedWasRejected == true)")
+
+                // A key path longer than ssh shows in its prompt (it cuts it at 100 characters).
+                let deep = dir.appendingPathComponent(String(repeating: "deep-folder-", count: 8), isDirectory: true)
+                AppPaths.ensure(deep, permissions: 0o700)
+                let longURL = deep.appendingPathComponent("id_pp_long")
+                do { _ = try await KeySetup.generate(at: longURL, comment: "tether-selftest-long", passphrase: "pp-long-789") }
+                catch { say("FAIL keygen long \(error.localizedDescription)") }
+                let longPub = (try? String(contentsOf: longURL.appendingPathExtension("pub"), encoding: .utf8)) ?? ""
+                try? (before + pub + longPub).write(to: auth, atomically: true, encoding: .utf8)
+                let text = (try? String(contentsOf: config, encoding: .utf8)) ?? ""
+                try? (text + "\n" + text.replacingOccurrences(of: "Host pptest", with: "Host pplong")
+                    .replacingOccurrences(of: keyURL.path, with: longURL.path)).write(to: config, atomically: true, encoding: .utf8)
+                model.reloadConfig()
+                PasswordVault.setPassword("pp-long-789", for: CredentialKey.passphrase(keyPath: longURL.path))
+                let long = await signIn("pplong")
+                say(long.online && long.asked.isEmpty ? "PASS a long key path (\(longURL.path.count) characters) finds its kept passphrase"
+                                                      : "FAIL long path online=\(long.online) asked=\(long.asked.map(\.request.prompt))")
                 try? before.write(to: auth, atomically: true, encoding: .utf8)
                 try? FileManager.default.removeItem(at: dir)
                 try? await Task.sleep(for: .seconds(1))
@@ -264,12 +322,21 @@ enum SelfTest {
                 let url = dir.appendingPathComponent("id_test")
                 say("socket dir private: \(AppPaths.controlSocketDirectory.path.contains("-dbg-"))")
                 do {
-                    _ = try await KeySetup.generate(at: url, comment: "selftest", passphrase: "kp-secret-123", addToKeychain: false)
+                    _ = try await KeySetup.generate(at: url, comment: "selftest", passphrase: "kp-secret-123")
                     @MainActor func opens(_ pw: String) async -> Bool {
                         await ProcessRunner.run("/usr/bin/ssh-keygen", arguments: ["-y", "-P", pw, "-f", url.path], timeout: 20).succeeded
                     }
                     let right = await opens("kp-secret-123"), wrong = await opens("nope"), empty = await opens("")
                     say(right && !wrong && !empty ? "PASS key encrypted with the passphrase" : "FAIL right=\(right) wrong=\(wrong) empty=\(empty)")
+                    // Changing it (askpass answers old and new), and a wrong old one leaving the key as it was.
+                    if let key = KeySetup.key(at: url) {
+                        let changed = try await KeySetup.changePassphrase(key, old: "kp-secret-123", new: "kp-new-789")
+                        let newWorks = await opens("kp-new-789"), oldGone = await !opens("kp-secret-123")
+                        say(newWorks && oldGone && changed.isEncrypted == true ? "PASS passphrase changed" : "FAIL change new=\(newWorks) oldGone=\(oldGone)")
+                        let before = try Data(contentsOf: url)
+                        let refused = (try? await KeySetup.changePassphrase(changed, old: "wrong", new: "x")) == nil
+                        say(refused && (try? Data(contentsOf: url)) == before ? "PASS wrong old passphrase changes nothing" : "FAIL wrong old passphrase")
+                    }
                 } catch {
                     say("FAIL \(error.localizedDescription)")
                 }

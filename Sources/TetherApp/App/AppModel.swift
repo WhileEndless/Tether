@@ -9,6 +9,7 @@ import TerminalUI
 import FileTransferKit
 import MonitorKit
 import RecordingKit
+import KeySetupKit
 
 /// A password or confirmation request waiting for the user.
 struct PendingPrompt: Identifiable {
@@ -399,6 +400,9 @@ final class AppModel {
     func checkKeyLogin(_ target: ConnectionTarget) {
         guard case .alias(let alias) = target, !keyChecks.contains(alias) else { return }
         keyChecks.insert(alias)
+        // A key with a passphrase cannot be tried without asking for it (BatchMode never asks): a
+        // host set up with one is a key host already, and the check would only say it is not.
+        guard !usesKeyWithPassphrase(alias) else { return }
         var options = SSHOptions(settings: settings)
         options.useControlMaster = false
         let args = options.commonOptions(multiplex: false)
@@ -408,6 +412,20 @@ final class AppModel {
             let r = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 20)
             updateMetadata(for: alias) { $0.keyLoginWorks = r.status == 0 }
         }
+    }
+
+    /// The host's config names a key file that is protected with a passphrase.
+    func usesKeyWithPassphrase(_ alias: String) -> Bool {
+        guard let entry = hosts.first(where: { $0.alias == alias }) else { return false }
+        return entry.identityFiles.contains { path in
+            KeySetup.isEncrypted(URL(fileURLWithPath: (path as NSString).expandingTildeInPath)) == true
+        }
+    }
+
+    /// Whether to offer setting up a key for a host: not when key login works, nor when it already
+    /// uses a key with a passphrase (whose login cannot be checked without asking for it).
+    func offersKeySetup(_ alias: String) -> Bool {
+        metadata(for: alias).keyLoginWorks != true && !usesKeyWithPassphrase(alias)
     }
 
     /// Best latency measurement available for a host: from an online tmux session, if any.
