@@ -17,17 +17,21 @@ struct KubernetesPanel: View {
             switch monitor.kubernetes {
             case .success(let cluster)?: clusterView(cluster)
             case .failure(let error)?:
-                EmptyStateView(symbol: "exclamationmark.triangle", title: "Kubernetes Not Reachable",
-                               message: error.message.isEmpty ? "kubectl could not list pods." : error.message)
+                header(title: "Kubernetes", detail: "not reachable", warn: true)
+                StateNote(symbol: "exclamationmark.triangle", title: "Kubernetes Not Reachable",
+                          message: error.message.isEmpty ? "kubectl could not list pods." : error.message)
             case nil:
+                header(title: "Kubernetes", detail: monitor.kubernetesLoaded ? "no client" : "checking…", warn: false)
                 if monitor.kubernetesLoaded {
-                    EmptyStateView(symbol: "circle.hexagongrid", title: "No Kubernetes",
-                                   message: "No Kubernetes client (kubectl, k3s, microk8s or oc) was found on this host.")
+                    StateNote(symbol: "circle.hexagongrid", title: "No Kubernetes",
+                              message: "No Kubernetes client (kubectl, k3s, microk8s or oc) was found on this host.")
                 } else {
-                    ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ProgressView().controlSize(.small).padding(.top, 24)
                 }
             }
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .task { await monitor.refreshKubernetes() }
         .sheet(isPresented: Binding(get: { output != nil }, set: { if !$0 { output = nil } })) {
             LogSheet(title: output?.title ?? "", text: output?.text ?? "")
@@ -36,6 +40,38 @@ struct KubernetesPanel: View {
             Button("Delete Pod", role: .destructive) { if let pod = deleting { run("delete", pod) } }
         } message: {
             Text("If a deployment or another controller owns it, a new pod replaces it (a restart). A pod on its own is gone for good.")
+        }
+    }
+
+    /// The panel's top row while there is no cluster to show: what it is, and refresh.
+    private func header(title: String, detail: String, warn: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "circle.hexagongrid").foregroundStyle(.secondary)
+            Text(title).fontWeight(.medium)
+            Text(detail).font(.caption).foregroundStyle(warn ? .orange : .secondary)
+            Spacer()
+            Button { Task { await monitor.refreshKubernetes() } } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+                .help("Check again")
+        }
+        .padding(10)
+    }
+
+    /// A message under the header, at the top (an error can be several lines of kubectl output).
+    private struct StateNote: View {
+        let symbol: String
+        let title: String
+        let message: String
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(title, systemImage: symbol).font(.headline)
+                Text(message)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14).padding(.top, 8)
         }
     }
 

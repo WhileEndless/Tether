@@ -23,6 +23,9 @@ struct RemoteCommandsView: View {
                         row("When", c.when)
                         row("Reads", c.reads)
                         row("Changes", c.changes)
+                        if !c.switchedBy.isEmpty {
+                            row("Turned off by", c.switchedBy.map(\.title).joined(separator: ", "))
+                        }
                         row("Ends", c.ends)
                     }
                     .font(.callout)

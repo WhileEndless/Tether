@@ -655,14 +655,15 @@ private struct SidebarBottomBar: View {
                 Button("Edit SSH Config File…") { state.showConfigEditor = true }
                 Button("Reload SSH Config") { model.reloadConfig() }
             } label: {
-                Image(systemName: "plus")
+                // Not the tab bar's "+" (a new tab): this one adds to the host list, and says so.
+                Label("Add", systemImage: "server.rack").labelStyle(.titleAndIcon).font(.callout)
             }
             .menuStyle(.button)
-            .menuIndicator(.hidden)
+            .menuIndicator(.visible)
             .buttonStyle(.borderless)
             .fixedSize()
-            .frame(width: 28, height: 24)
-            .help("Add a host or group")
+            .frame(height: 24)
+            .help("Add a host or group, or edit the SSH config")
 
             // Icon-only buttons with tooltips: they fit any sidebar width.
             BarButton(symbol: refreshing ? "arrow.clockwise.circle.fill" : "arrow.clockwise", active: refreshing,
@@ -822,11 +823,15 @@ struct SessionRow: View {
         let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID)
         VStack(alignment: .leading, spacing: 1) {
         HStack(spacing: 6) {
-            Image(systemName: session.attention != nil ? "bell.badge.fill"
-                  : session.phase.isSuspended ? "pause.circle.fill" : inBackground ? "moon.zzz.fill" : "terminal")
-                .font(.caption)
-                .foregroundStyle(session.attention != nil ? Color.orange : session.phase.tint)
-                .frame(width: 16)
+            if session.phase.isSuspended || (inBackground && session.attention == nil && !(session.agent?.activity.isWaiting ?? false)) {
+                Image(systemName: session.phase.isSuspended ? "pause.circle.fill" : "moon.zzz.fill")
+                    .font(.caption)
+                    .foregroundStyle(session.phase.tint)
+                    .frame(width: 16)
+            } else {
+                // The same as the tab: an agent waiting, attention, an agent, a working command.
+                TabStatusIcon(session: session, size: 10, restingSymbol: "terminal")
+            }
             if session.phase.isSuspended {
                 Text("Suspended").font(.caption2).foregroundStyle(.blue)
             }
@@ -917,6 +922,9 @@ struct HostContextMenu: View {
         }
         Toggle("Favorite", isOn: Binding(get: { model.metadata(for: alias).favorite },
                                          set: { v in model.updateMetadata(for: alias) { $0.favorite = v } }))
+        Menu("Monitoring") {
+            HostFeaturesMenu(target: .alias(alias)) { state.hostEditor = HostEditorRequest(alias: alias) }
+        }
         Menu("Move to Group") {
             Button("None") { model.moveHost(alias, toGroup: nil) }
             ForEach(model.groups) { g in

@@ -14,6 +14,32 @@ The app shows the same list, with the full text of each script, in
 **Settings ▸ Monitoring ▸ What Runs on Hosts…**. That list is built from the scripts the app runs,
 so it is always current. A test checks that this page names every entry in it.
 
+## Switching it off
+
+Everything below that runs by itself can be switched off: for every host in **Settings ▸
+Monitoring**, or for one host from its sidebar menu (**Monitoring**), the host panel's menu, or its
+editor. A host's own choice comes before the system setting. **Monitor the host** off stops every
+script that reads the host's system at once; browsing files and your port forwards keep working.
+The in-app list names, for each script, the switches that stop it.
+
+## Network devices and limited shells
+
+Routers, switches and firewalls (Cisco IOS/NX-OS/ASA, Arista, Junos, FortiOS, PAN-OS, RouterOS,
+Check Point, F5), menus and limited shells (git-shell, ForceCommand) have no shell Tether's scripts
+could run in, and their command line could take a script's lines as its own commands. So:
+
+- On first contact Tether asks two harmless questions: `echo "TETHER:%OS%:$PSHOME:"` (which also
+  tells sh, cmd and PowerShell apart) and, only when that got no shell's answer, `echo TETHER-SHELL`
+  (which csh, fish and every other shell answer). A host that answers neither is remembered as a
+  network device or limited shell. A host that cannot be reached is asked again later.
+- To such a host Tether sends nothing but the terminal's login: `ssh -tt host` with no command, so
+  the device shows its own command line. No script below runs there; monitoring, file browsing,
+  uploads, session persistence and key setup are off. Downloads use classic scp (`scp -O`), and port
+  forwards use the connection (`ssh -O forward`), checked with `ssh -O check`.
+- If a host does not start Tether's session at all but shows something (a menu, a device that
+  ignores the command), the tab is used as it is after 20 seconds instead of waiting.
+- Each host's choice can be set by hand: Edit Host ▸ Shell, or the host's Monitoring menu.
+
 ## Principles
 
 - **Nothing is installed.** Scripts are POSIX `sh` on Linux, macOS and the BSDs, and PowerShell on
@@ -54,7 +80,9 @@ so it is always current. A test checks that this page names every entry in it.
 - **When:** while the host status bar or the host panel is shown, every few seconds (Settings ▸
   Monitoring ▸ Refresh).
 - **Reads:** CPU, memory, disk, load, network counters, GPU (nvidia-smi, rocm-smi or sysfs when
-  present) and OS details.
+  present) and OS details. Once per stream it also checks which of docker, podman, kubectl, k3s,
+  microk8s and oc exist (`command -v`), so the Containers and Kubernetes tabs show only where they
+  can work.
 - **Changes:** nothing. Ends when Tether stops reading.
 
 ### Running command watcher

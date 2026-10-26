@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import TetherCore
 import TestSupport
+import SSHTransport
 @testable import SessionKit
 
 /// Collects everything the session displays.
@@ -129,6 +130,40 @@ final class RecordingSink: TerminalSink {
         first.close(killRemote: true)
         second.close(killRemote: true)
         try await Task.sleep(for: .milliseconds(500))
+    }
+
+    /// A network device gets `ssh -tt host` with no remote command (its own CLI, not Tether's
+    /// bootstrap) and is online at once; nothing else is sent to it.
+    @Test func deviceGetsAPlainLogin() async throws {
+        let args = dir.appendingPathComponent("device-args")
+        let device = dir.appendingPathComponent("device-ssh")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$@" > '\(args.path)'
+        printf 'Router> '
+        exec cat
+        """.write(to: device, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: device.path)
+        var s = AppSettings()
+        s.sshBinary = device.path
+        s.useControlMaster = false
+        s.recordingEnabled = false
+        s.autoReconnect = false
+        let cfg = SessionConfiguration(settings: s)
+        let target = ConnectionTarget.alias("router-\(UUID().uuidString.prefix(6))")
+        PlatformCache.shared.setAccess(.device, for: target.key)
+        defer { PlatformCache.shared.setAccess(.automatic, for: target.key) }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: target, persistence: .auto)) { cfg }
+        let sink = RecordingSink()
+        session.attach(sink: sink)
+        session.start()
+        try await wait("online") { session.phase.isOnline }
+        try await wait("prompt") { sink.text.contains("Router>") }
+        let sent = try String(contentsOf: args, encoding: .utf8).split(separator: "\n").map(String.init)
+        #expect(sent.contains("-tt"))
+        #expect(sent.last == target.key, "no remote command after the host: \(sent.suffix(3))")
+        #expect(!sent.contains { $0.contains("sh -c") || $0.contains("7770") })
+        session.close(killRemote: false)
     }
 
     @Test func plainShellRoundTrip() async throws {

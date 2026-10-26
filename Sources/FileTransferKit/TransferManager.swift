@@ -228,7 +228,7 @@ public final class TransferManager {
                             completion: (([TransferItem]) -> Void)? = nil) -> [TransferItem] {
         // Packed streams need a POSIX shell and tar on the host; Windows hosts copy file by file.
         let shouldPack = (pack ?? policy.packs(fileCount: fileCount)) && files.count >= 1 && fileCount > 1
-            && PlatformCache.shared.cached(target.key)?.isWindows != true
+            && PlatformCache.shared.cached(target.key)?.isWindows != true && !PlatformCache.shared.isDevice(target.key)
         if shouldPack {
             let item = TransferItem(direction: .upload, method: .archive, target: target,
                                     localURL: files[0].deletingLastPathComponent(), remotePath: remoteDirectory)
@@ -262,7 +262,7 @@ public final class TransferManager {
                               as localNames: [String], target: ConnectionTarget, fileCount: Int, totalBytes: Int64?,
                               pack: Bool? = nil, completion: (([TransferItem]) -> Void)? = nil) -> [TransferItem] {
         let shouldPack = (pack ?? policy.packs(fileCount: fileCount)) && fileCount > 1 && !target.isLocal
-            && PlatformCache.shared.cached(target.key)?.isWindows != true
+            && PlatformCache.shared.cached(target.key)?.isWindows != true && !PlatformCache.shared.isDevice(target.key)
         if shouldPack {
             let item = TransferItem(direction: .download, method: .archive, target: target,
                                     localURL: localDirectory, remotePath: remoteDirectory)
@@ -340,6 +340,14 @@ public final class TransferManager {
     }
 
     private func start(_ item: TransferItem) {
+        let device = !item.target.isLocal && PlatformCache.shared.isDevice(item.target.key)
+        // Nothing on a network device can say whether a name is taken, so nothing is uploaded
+        // there (an existing file must never be overwritten). Downloads work, by plain scp.
+        if device, item.direction == .upload {
+            item.state = .failed("Uploads to a network device are off: Tether cannot check there that no file would be replaced.")
+            finished(item)
+            return
+        }
         item.state = .running
         item.startedAt = Date()
         let options = optionsProvider()
@@ -363,7 +371,8 @@ public final class TransferManager {
                                                               : [item.remotePath, item.localURL.path])
         } else {
             let (destOpts, host) = SSHOptions.scpArguments(for: item.target)
-            args = options.commonOptions() + destOpts + ["-r", "-p"]
+            // Devices often speak only the classic scp protocol, not SFTP (scp's default now).
+            args = options.commonOptions() + destOpts + (device ? ["-O"] : []) + ["-r", "-p"]
             switch item.direction {
             case .upload:
                 args += ["--", item.localURL.path, "\(host):\(item.remoteName == nil ? item.remotePath : item.uploadedPath)"]

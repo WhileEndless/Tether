@@ -168,6 +168,7 @@ public final class CommandHub {
             self.watcher = nil
             self.watched = []
             self.watchedAnchors = []
+            if err.contains(RemoteExecutor.deviceMessage) { self.watcherRetryAt = Date().addingTimeInterval(600); return }
             // Ended on its own (the host has no sh features it needs, or it failed): looks go on as
             // before; tried again in a minute.
             self.watcherRetryAt = Date().addingTimeInterval(60)

@@ -80,10 +80,93 @@ public final class TerminalSession: Identifiable {
     @ObservationIgnored public var onAttention: ((TerminalSession, Attention) -> Void)?
     @ObservationIgnored private var notificationParser = TerminalNotificationParser()
 
-    /// An OSC sequence that may be a notification (9, 777 or 99), from the terminal emulator.
+    /// An OSC sequence that may be a notification (9, 777 or 99) or a program's status (7501),
+    /// from the terminal emulator.
     public func terminalOSC(code: Int, payload: [UInt8]) {
+        if code == 7501 {
+            guard let status = ProgramStatus.parse(payload) else { return }
+            if status == .query {
+                if agentStatusEnabled { send(ProgramStatus.reply[...]) }
+            } else if case .update(_, _, _, let app) = status, let activity = status.activity {
+                let kind = app.flatMap { AgentKind(program: $0) } ?? agent?.kind ?? foregroundName.flatMap { AgentKind(program: $0) } ?? .other
+                agentReported(kind: kind, activity: activity, at: Date())
+            }
+            return
+        }
         guard let n = notificationParser.parse(code: code, payload: payload) else { return }
         raiseAttention(.message(n))
+    }
+
+    // MARK: Output activity
+
+    /// Output arrived in the last moments (not the echo of typing, not a replay): the command in
+    /// the terminal is visibly doing something. Changes only when it starts or stops.
+    public private(set) var outputActive = false
+    /// How long without output before `outputActive` goes back to false (Settings ▸ Tabs).
+    @ObservationIgnored public var outputQuietDelay: TimeInterval = 3
+    @ObservationIgnored private var lastOutputAt = Date.distantPast
+    @ObservationIgnored private var lastInputAt = Date.distantPast
+    @ObservationIgnored private var quietCheck: DispatchWorkItem?
+    @ObservationIgnored private var passthrough = TmuxPassthrough()
+
+    private func noteOutput() {
+        guard progress == nil, phase.isOnline else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastInputAt) > 0.15 else { return }       // the echo of typing
+        lastOutputAt = now
+        if !outputActive { outputActive = true }
+        guard quietCheck == nil else { return }                              // one check at a time
+        scheduleQuietCheck(after: outputQuietDelay)
+    }
+
+    private func scheduleQuietCheck(after delay: TimeInterval) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.quietCheck = nil
+            let quiet = Date().timeIntervalSince(self.lastOutputAt)
+            if quiet >= self.outputQuietDelay { if self.outputActive { self.outputActive = false } }
+            else { self.scheduleQuietCheck(after: self.outputQuietDelay - quiet) }
+        }
+        quietCheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: Coding agents
+
+    /// A coding agent running in this terminal and where it stands (from OSC 7501, or the agent's
+    /// status file read by the host probe; the newest report wins).
+    public struct AgentState: Equatable, Sendable {
+        public var kind: AgentKind
+        public var activity: AgentActivity
+        public var updated: Date
+    }
+    public private(set) var agent: AgentState?
+    /// Whether agents' status is followed (Settings ▸ Monitoring and the host's choice; set by the app).
+    @ObservationIgnored public var agentStatusEnabled = true
+    /// Whether an agent waiting for the user, or finishing, marks the tab and notifies (Settings).
+    @ObservationIgnored public var notifyAgentWaiting = true
+    @ObservationIgnored public var notifyAgentDone = false
+
+    /// An agent's status, from any source. Older than what is known: ignored. Going into
+    /// "waiting" marks the tab and notifies once.
+    public func agentReported(kind: AgentKind, activity: AgentActivity, at date: Date) {
+        if let agent, agent.updated > date { return }
+        let before = agent?.activity
+        let next = AgentState(kind: kind, activity: activity, updated: date)
+        if agent != next { agent = next }
+        switch activity {
+        case .waiting(let why) where !(before?.isWaiting ?? false) && notifyAgentWaiting:
+            raiseAttention(.message(TerminalNotification(title: kind.title, body: "\(kind.title) \(why)")))
+        case .done where before == .working && notifyAgentDone:
+            raiseAttention(.message(TerminalNotification(title: kind.title, body: "\(kind.title) is done")))
+        default:
+            break
+        }
+    }
+
+    /// No agent runs in the terminal any more.
+    public func agentEnded() {
+        if agent != nil { agent = nil }
     }
 
     /// The bell rang in this terminal.
@@ -214,7 +297,8 @@ public final class TerminalSession: Identifiable {
 
     // MARK: Public API
 
-    public static let shells: Set<String> = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh", "-bash", "-zsh", "-sh"]
+    /// Whether a program is a shell (at its prompt), see `ShellNames`.
+    public static func isShell(_ program: String) -> Bool { ShellNames.contains(program) }
 
     /// The program in the foreground of the terminal right now, when tmux can tell (nil otherwise:
     /// screen, plain shells, or no answer within 2 s).
@@ -277,7 +361,7 @@ public final class TerminalSession: Identifiable {
         let host = descriptor.target.displayName
         if let agentTitle, !agentTitle.isEmpty { return "\(agentTitle) — \(host)" }
         if let activity, !activity.command.isEmpty {
-            if Self.shells.contains(activity.command) {
+            if Self.isShell(activity.command) {
                 let dir = (activity.path as NSString).lastPathComponent
                 return dir.isEmpty ? host : "\(host): \(Self.abbreviate(activity.path, dir))"
             }
@@ -321,11 +405,12 @@ public final class TerminalSession: Identifiable {
     /// re-attached to an existing session (which may hold earlier work). Closing it needs no question.
     public var isUnused: Bool {
         if hasRunCommands || restoredFromDisk || openedForAttach { return false }
-        if let command = activity?.command, !command.isEmpty, !Self.shells.contains(command) { return false }
+        if let command = activity?.command, !command.isEmpty, !Self.isShell(command) { return false }
         return true
     }
 
     public func send(_ bytes: ArraySlice<UInt8>) {
+        lastInputAt = Date()
         if !hasRunCommands {
             for b in bytes {
                 if b == 0x0d || b == 0x0a { if typedOnLine { hasRunCommands = true }; typedOnLine = false }
@@ -488,7 +573,17 @@ public final class TerminalSession: Identifiable {
             // Without a shared connection every tab is its own login: start them one at a time
             // (the gate is released once this one is online or has failed).
             connectTask = Task { [weak self] in
-                guard let self, await self.waitForGate(target.key) else { return }
+                guard let self else { return }
+                // A host never seen: one short question first, so a network device gets a plain
+                // login and no shell script (with a shared connection this happens below). Before
+                // taking the gate: the question waits for logins in progress, this one included.
+                if !PlatformCache.shared.isKnown(target.key) {
+                    self.progress?.detail = "Checking the server's shell"
+                    let executor = RemoteExecutor(target: target, options: self.sshOptions(config))
+                    self.platform = await executor.resolvedPlatform()
+                    guard !Task.isCancelled, !self.intentionalStop else { return }
+                }
+                guard await self.waitForGate(target.key) else { return }
                 self.startTerminal(attachOnly: attachOnly)
             }
             return
@@ -561,8 +656,12 @@ public final class TerminalSession: Identifiable {
         progress?.step = .startSession
         progress?.detail = descriptor.target.isLocal ? "Starting a local shell" : "Starting the session on the server"
 
+        if !descriptor.target.isLocal, PlatformCache.shared.isDevice(descriptor.target.key) {
+            startPlainLogin(attachOnly: attachOnly, config: config, windows: false)
+            return
+        }
         if platform.isWindows {
-            startWindowsTerminal(attachOnly: attachOnly, config: config)
+            startPlainLogin(attachOnly: attachOnly, config: config, windows: true)
             return
         }
         let mode: PersistenceMode
@@ -606,21 +705,48 @@ public final class TerminalSession: Identifiable {
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh",
                              currentDirectory: local ? (descriptor.initialDirectory ?? NSHomeDirectory()) : nil)
         AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
+        if !local { watchForMissingMarker(process) }
     }
 
-    /// Windows hosts: an interactive PowerShell over ssh. There is no tmux or screen on Windows,
-    /// so the shell ends with the connection (like a plain shell on other systems).
-    private func startWindowsTerminal(attachOnly: Bool, config: SessionConfiguration) {
+    /// The server never answered the bootstrap, yet something is on the screen and nothing asks
+    /// for a password: a device that ignores the command it was given and shows its own command
+    /// line, or a menu. After a while the tab is used as it is (a plain session) instead of waiting
+    /// for ever behind "Connecting".
+    private func watchForMissingMarker(_ started: LocalProcess) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self, self.process === started, !self.markerResolved, !self.phase.isDead, !self.intentionalStop else { return }
+            guard self.fedAnything, self.passwordPrompt == nil, Date().timeIntervalSince(self.lastReceivedAt) >= 5 else {
+                self.watchForMissingMarker(started)          // still busy (a slow profile, a prompt): look again
+                return
+            }
+            self.markerResolved = true
+            self.handleMarker(.plain)
+        }
+    }
+
+    /// A login without Tether's bootstrap: PowerShell on Windows, or — for a network device or
+    /// limited shell — the device's own command line, exactly as `ssh host` gives it. Neither can be
+    /// kept running by tmux or screen.
+    private func startPlainLogin(attachOnly: Bool, config: SessionConfiguration, windows: Bool) {
         if attachOnly {
-            progress?.failure = "Windows sessions end when the connection drops."
-            progress?.hint = "Windows has no tmux or screen to keep the shell running. Open a new session to continue."
+            if windows {
+                progress?.failure = "Windows sessions end when the connection drops."
+                progress?.hint = "Windows has no tmux or screen to keep the shell running. Open a new session to continue."
+            } else {
+                progress?.failure = "Sessions on this device end when the connection drops."
+                progress?.hint = "A network device or limited shell has no tmux or screen to keep it running. Open a new session to continue."
+            }
             intentionalStop = true
-            finish(reason: "The Windows shell ended with the connection", archive: wasOnline)
+            finish(reason: windows ? "The Windows shell ended with the connection" : "The device's session ended with the connection",
+                   archive: wasOnline)
             return
         }
-        let shell = WindowsShell(platform: platform, directory: descriptor.initialDirectory)
-        windowsShellTag = shell.tag
-        let command = shell.command
+        var command: String?
+        if windows {
+            let shell = WindowsShell(platform: platform, directory: descriptor.initialDirectory)
+            windowsShellTag = shell.tag
+            command = shell.command
+        }
         let args = sshOptions(config).interactiveArguments(target: descriptor.target, remoteCommand: command)
         AskPassBridge.shared.revoke(environment: askPassEnv)
         askPassEnv = AskPassBridge.shared.environment(targetKey: descriptor.target.key, purpose: "terminal", mode: "prefer")
@@ -636,7 +762,7 @@ public final class TerminalSession: Identifiable {
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: "ssh")
         AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
         markerResolved = true
-        progress?.detail = "Starting PowerShell"
+        progress?.detail = windows ? "Starting PowerShell" : "Opening the device's command line"
         handleMarker(.plain)
     }
 
@@ -922,11 +1048,12 @@ public final class TerminalSession: Identifiable {
     }
 
     private func display(_ raw: [UInt8]) {
-        let (bytes, title) = titleFilter.filter(raw)
+        let (bytes, title) = titleFilter.filter(passthrough.filter(raw))
         if let title, title != remoteTitle { remoteTitle = title }
         guard !bytes.isEmpty else { return }
         fedAnything = true
         sink?.feed(bytes[...])
+        noteOutput()
         if let recorder {
             // The recording notes the terminal's size before output laid out for it, so replays
             // and the recording's text lay it out the same way (`SizeMarker`, invisible).

@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import TetherCore
 import SessionKit
+import TerminalUI
 
 /// Shared tab-bar state: the ⌘-held number overlay and tab dragging between windows.
 @MainActor
@@ -21,6 +22,18 @@ final class TabBarCenter {
             MainActor.assumeIsolated { TabBarCenter.shared.modifiersChanged(event.modifierFlags) }
             return event
         }) { monitors.append(m) }
+        // ⌘ released while Tether was not getting the event (⌘Tab, ⌘H, Spotlight, a menu being
+        // tracked): the numbers must not stay. Leaving the app or a window hides them; coming back
+        // looks at the keys as they are now.
+        let nc = NotificationCenter.default
+        for name in [NSApplication.didResignActiveNotification, NSWindow.didResignKeyNotification] {
+            monitors.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { TabBarCenter.shared.hideNumbers() }
+            })
+        }
+        monitors.append(nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { TabBarCenter.shared.modifiersChanged(NSEvent.modifierFlags) }
+        })
         // A mouse wheel scrolls the tab bar sideways; the middle button closes the tab under it.
         if let m = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .otherMouseUp], handler: { event in
             nonisolated(unsafe) let e = event   // local monitors run on the main thread
@@ -108,16 +121,48 @@ final class TabBarCenter {
         scrollViews.values.compactMap(\.view).first { $0.window === window }?.contentView.bounds.origin.x
     }
 
+    private static func showsNumbers(flags: NSEvent.ModifierFlags, appActive: Bool) -> Bool {
+        TabNumberHold.shows(flags: flags, appActive: appActive)
+    }
+
     private func modifiersChanged(_ flags: NSEvent.ModifierFlags) {
-        let commandOnly = flags.intersection([.command, .option, .control, .shift]) == .command
         numberTimer?.cancel()
-        if commandOnly {
-            // Show after a short hold so normal ⌘ shortcuts do not flash the numbers.
-            let work = DispatchWorkItem { MainActor.assumeIsolated { TabBarCenter.shared.showNumbers = true } }
+        if Self.showsNumbers(flags: flags, appActive: NSApp.isActive) {
+            // Show after a short hold so normal ⌘ shortcuts do not flash the numbers. By then the
+            // app may have gone to the background (⌘Tab): the keys are looked at again.
+            let work = DispatchWorkItem {
+                MainActor.assumeIsolated {
+                    let center = TabBarCenter.shared
+                    guard Self.showsNumbers(flags: NSEvent.modifierFlags, appActive: NSApp.isActive) else { return }
+                    center.showNumbers = true
+                    center.watchRelease()
+                }
+            }
             numberTimer = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
-        } else if showNumbers {
-            showNumbers = false
+        } else {
+            hideNumbers()
+        }
+    }
+
+    private func hideNumbers() {
+        numberTimer?.cancel()
+        numberTimer = nil
+        releaseCheck?.cancel()
+        releaseCheck = nil
+        if showNumbers { showNumbers = false }
+    }
+
+    /// While the numbers show, the keys are looked at a few times a second: a release that no
+    /// event reported (inside a menu, a window drag) still hides them. Stops once they are hidden.
+    @ObservationIgnored private var releaseCheck: Task<Void, Never>?
+    private func watchRelease() {
+        releaseCheck?.cancel()
+        releaseCheck = Task { @MainActor in
+            while !Task.isCancelled, showNumbers {
+                try? await Task.sleep(for: .milliseconds(250))
+                if !Self.showsNumbers(flags: NSEvent.modifierFlags, appActive: NSApp.isActive) { hideNumbers(); return }
+            }
         }
     }
 
@@ -395,13 +440,24 @@ struct TabStrip: View {
                 .fixedSize()
                 .help("All \(tabs.count) tabs")
             }
-            Button {
-                state.showQuickConnect = true
+            // "+" opens another tab like the one in front, as in browsers; its menu has the others.
+            Menu {
+                Button("New Local Terminal") { state.connect(.local) }
+                Button("New Private Tab") {
+                    if let s = state.session { state.newSession(like: s, isPrivate: true) }
+                    else { state.connect(state.inspectedTarget ?? .local, isPrivate: true) }
+                }
+                Divider()
+                Button("New Connection…") { state.showQuickConnect = true }
             } label: {
                 Image(systemName: "plus").frame(width: 26, height: 24)
+            } primaryAction: {
+                state.newTabLikeCurrent()
             }
-            .buttonStyle(.borderless)
-            .help("New connection (⌘N)")
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.visible)
+            .fixedSize()
+            .help(state.newTabHelp + " · hold for more")
             .padding(.trailing, 6)
         }
         .frame(height: 36)
@@ -432,15 +488,9 @@ private struct TabChip: View {
                         .foregroundStyle(.white)
                         .frame(width: 16, height: 16)
                         .background(Circle().fill(Color.accentColor))
-                } else if session.attention != nil {
-                    // A program asked for attention (finished, has a question, rang the bell).
-                    Image(systemName: "bell.badge.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.orange)
-                        .help(attentionHelp)
                 } else {
-                    StatusDot(phase: session.phase, size: 6)
-                        .help(session.phase.label)
+                    // An agent waiting for you, attention, an agent, a working command, or the state.
+                    TabStatusIcon(session: session)
                 }
             }
             .frame(width: 16, height: 16)
@@ -661,13 +711,3 @@ private struct TabArrow: View {
     }
 }
 
-extension TabChip {
-    /// What the program said, for the tooltip.
-    fileprivate var attentionHelp: String {
-        switch session.attention {
-        case .message(let n): return [n.title, n.body].compactMap { $0 }.joined(separator: " — ")
-        case .bell: return "The bell rang"
-        case nil: return ""
-        }
-    }
-}

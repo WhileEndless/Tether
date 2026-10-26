@@ -112,7 +112,8 @@ struct Shortcut: Identifiable {
     static let renameTab = Shortcut("Rename Tab…", .tabs, k("r", [.command, .shift]), note: "Or double-click the tab")
 
     // MARK: Session
-    static let reconnect = Shortcut("Reconnect Now", .session, k("r"), note: "While a session is waiting")
+    static let reconnect = Shortcut("Reconnect Now", .session, k("r"),
+                                    note: "While the session is not connected (waiting, or ended by a failed connection)")
     static let moveToBackground = Shortcut("Move Tab to Background", .session, k("b", [.command, .shift]),
                                            note: "Keeps the session running and connected")
     static let disconnect = Shortcut("Disconnect & Move to Background", .session, k("b", [.command, .option, .shift]),
@@ -126,6 +127,8 @@ struct Shortcut: Identifiable {
 
     // MARK: Terminal
     static let clearScrollback = Shortcut("Clear Scrollback", .terminal, k("k"))
+    static let mouseReporting = Shortcut("Allow Mouse Reporting", .terminal, k("r"),
+                                         note: "While connected, as in Terminal.app: in this terminal, programs that ask for the mouse (vim, htop, tmux) get it; ⌥-drag selects text anyway")
     static let clearScreen = Shortcut("Clear Screen", .terminal, display: "⌃L", note: "Handled by the shell")
     static let copy = Shortcut("Copy / Paste / Select All", .terminal, display: "⌘C  ⌘V  ⌘A",
                                note: "Pasting files uploads them and pastes their remote paths")
@@ -143,14 +146,14 @@ struct Shortcut: Identifiable {
     static let find = Shortcut("Find in Terminal…", .search, k("f"))
     static let findNext = Shortcut("Find Next", .search, k("g"))
     static let findPrevious = Shortcut("Find Previous", .search, k("g", [.command, .shift]))
-    static let useSelection = Shortcut("Use Selection for Find", .search, k("e"))
+    static let useSelection = Shortcut("Use Selection for Find", .search, k("e", [.command, .shift]))
     static let searchAll = Shortcut("Search All Sessions…", .search, k("f", [.command, .shift]),
                                     note: "Open terminals, archive and recordings")
     static let searchSession = Shortcut("Search in This Session…", .search, k("f", [.command, .option]))
 
     // MARK: Files
-    static let browseHere = Shortcut("Browse Files Here", .files, k("o", [.command, .shift]),
-                                     note: "File manager tab in the terminal's current directory")
+    static let browseHere = Shortcut("Browse Files Here", .files, k("e"),
+                                     note: "File manager tab in the terminal's current directory (as the Browse button)")
     static let filesWindow = Shortcut("Open File Manager Window", .files, k("o", [.command, .option]))
     static let transfers = Shortcut("Show Transfers", .files, k("l", [.command, .option]))
     static let fileCopyPaste = Shortcut("Copy to Mac / Paste from Mac", .files, display: "⌘C  ⌘V",
@@ -177,7 +180,7 @@ struct Shortcut: Identifiable {
         closeTab, middleClick, closeWindow, previousTab, nextTab, cycleAlternates, tabNumbers, goToSession, moveTabToWindow,
         mergeWindows, renameTab,
         reconnect, moveToBackground, disconnect, fillPassword, terminate, saveSession,
-        clearScrollback, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
+        clearScrollback, mouseReporting, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
         browseHere, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
@@ -190,5 +193,10 @@ extension View {
     @ViewBuilder
     func shortcut(_ s: Shortcut) -> some View {
         if let key = s.key { keyboardShortcut(key) } else { self }
+    }
+
+    /// The shortcut only while `active` (one key for two commands, each in its own situation).
+    func shortcut(_ s: Shortcut, when active: Bool) -> some View {
+        keyboardShortcut(active ? s.key : nil)
     }
 }

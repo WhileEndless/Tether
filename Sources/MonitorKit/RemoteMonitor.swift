@@ -20,7 +20,8 @@ public final class RemoteMonitor {
         public var id: Date { date }
     }
 
-    public let executor: RemoteExecutor
+    /// How this host is reached; replaced when the ssh settings change (the next probe uses it).
+    public var executor: RemoteExecutor
     /// Traffic per process on this host (streamed only while someone looks).
     public let traffic: ProcessTraffic
     public private(set) var snapshot: SystemSnapshot?
@@ -56,6 +57,14 @@ public final class RemoteMonitor {
     @ObservationIgnored private var lastFrameAt: Date?
     /// Demo data loaded: never contact the host.
     @ObservationIgnored private var frozen = false
+    /// Whether a feature may run on this host (Settings ▸ Monitoring and the host's own choices).
+    /// Nothing switched off is ever run; set by the app.
+    @ObservationIgnored public var allows: (HostFeature) -> Bool = { _ in true }
+
+    /// The switches changed: the live stream stops or starts to match at once.
+    public func featuresChanged() {
+        if !allows(.monitoring) { stopStream() } else if interest > 0 && stream == nil && !frozen && !paused { startStream() }
+    }
 
     public init(executor: RemoteExecutor) {
         self.executor = executor
@@ -68,14 +77,14 @@ public final class RemoteMonitor {
     public func retain(interval: TimeInterval) {
         interest += 1
         self.interval = max(interval, 1)
-        if stream == nil && !frozen && !paused { startStream() }
+        if stream == nil && !frozen && !paused && allows(.monitoring) { startStream() }
     }
 
     /// While paused (no window of the app is visible), nothing is streamed; the last data stays.
     public var paused = false {
         didSet {
             guard paused != oldValue else { return }
-            if paused { stopStream() } else if interest > 0 && stream == nil && !frozen { startStream() }
+            if paused { stopStream() } else if interest > 0 && stream == nil && !frozen && allows(.monitoring) { startStream() }
         }
     }
 
@@ -91,7 +100,7 @@ public final class RemoteMonitor {
     }
 
     private func startStream() {
-        guard !frozen, !paused else { return }
+        guard !frozen, !paused, allows(.monitoring) else { return }
         restartTask?.cancel()
         let s = RemoteStream(separator: "@@end\n")
         s.onRecord = { [weak self] text in self?.ingest(text) }
@@ -99,6 +108,8 @@ public final class RemoteMonitor {
             guard let self, self.stream === s else { return }
             self.stream = nil
             self.isStreaming = false
+            // A network device or limited shell: nothing was sent, and nothing will be.
+            if err.contains(RemoteExecutor.deviceMessage) { return }
             if status != 0 && status != 15, !err.isEmpty {
                 self.error = err.split(separator: "\n").suffix(2).joined(separator: "\n")
             }
@@ -117,7 +128,9 @@ public final class RemoteMonitor {
         let interval = self.interval
         Task { [weak self] in
             // A terminal may be logging in to this host right now: stream over its connection.
-            if executor.options.useControlMaster { await ConnectionGate.shared.waitForTurn(executor.target.key) }
+            // Wait for a login to this host in progress, shared connection or not: its host-key
+            // question is answered once, and known_hosts has the key when this ssh starts.
+            await ConnectionGate.shared.waitForTurn(executor.target.key)
             let platform = await executor.resolvedPlatform()
             guard let self, self.stream === s else { return }
             self.platform = platform
@@ -147,7 +160,7 @@ public final class RemoteMonitor {
 
     /// One-off refresh (e.g. the Retry button).
     public func refresh(firstSample: Bool = false) async {
-        guard !frozen else { return }
+        guard !frozen, allows(.monitoring) else { return }
         do {
             let start = Date()
             let text = try await executor.output(RemoteScript(ProbeScripts.system, windows: WindowsProbeScripts.system), arguments: ["1"], timeout: 20, purpose: "monitor")
@@ -162,14 +175,14 @@ public final class RemoteMonitor {
     // MARK: On-demand data
 
     public func refreshProcesses() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.processesPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.processes, windows: WindowsProbeScripts.processes), timeout: 20, purpose: "monitor") {
             processes = ProbeParser.processes(text)
         }
     }
 
     public func refreshListeningPorts() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.portsPanel), allows(.monitoring) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.listening, windows: WindowsProbeScripts.listening), timeout: 20, purpose: "monitor") {
             if containers.isEmpty { await refreshContainers() }
             listeningPorts = ProbeParser.listening(text, containers: containers)
@@ -177,14 +190,14 @@ public final class RemoteMonitor {
     }
 
     public func refreshGPUProcesses() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.gpuPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.gpuProcesses, windows: WindowsProbeScripts.gpuProcesses), timeout: 20, purpose: "monitor") {
             gpuProcesses = ProbeParser.gpuProcesses(text)
         }
     }
 
     public func refreshConnections() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.networkPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.connections, windows: WindowsProbeScripts.connections), timeout: 20, purpose: "monitor") {
             let parsed = ProbeParser.connections(text)
             logins = parsed.logins
@@ -193,21 +206,21 @@ public final class RemoteMonitor {
     }
 
     public func refreshServices() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.servicesPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.services, windows: WindowsProbeScripts.services), timeout: 20, purpose: "monitor") {
             services = ProbeParser.services(text)
         }
     }
 
     public func refreshContainers() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.containersPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.containers, windows: WindowsProbeScripts.containers), timeout: 20, purpose: "monitor") {
             containers = ProbeParser.containers(text)
         }
     }
 
     public func refreshKubernetes() async {
-        guard !frozen else { return }
+        guard !frozen, allows(.kubernetesPanel) else { return }
         if let text = try? await executor.output(RemoteScript(KubeScripts.list, windows: KubeScripts.listWindows),
                                                  timeout: 30, purpose: "monitor") {
             kubernetes = ProbeParser.kubernetes(text)
@@ -233,7 +246,7 @@ public final class RemoteMonitor {
     @ObservationIgnored public var onRemoteSessions: (([RemoteSessionEntry]) -> Void)?
 
     public func refreshRemoteSessions(maxAge: TimeInterval = 0) async {
-        guard !frozen else { return }
+        guard !frozen, allows(.serverSessions) || allows(.sessionsPanel) || allows(.agentStatus) else { return }
         if sessionsRefreshing {
             // The running look may have started before the change the caller knows about.
             if maxAge == 0 { sessionsRefreshAgain = true }
@@ -261,7 +274,7 @@ public final class RemoteMonitor {
     }
 
     public func loadLogs(_ source: LogSource, lines: Int) async {
-        guard !frozen else { return }
+        guard !frozen, allows(.logsPanel) else { return }
         let (script, args) = ProbeScripts.logs(source, lines: lines)
         let windowsArgs = [WindowsProbeScripts.logName(source), String(max(lines, 10))]
         do {

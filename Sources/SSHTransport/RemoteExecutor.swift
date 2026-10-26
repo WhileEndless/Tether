@@ -36,7 +36,9 @@ public struct RemoteExecutor: Sendable {
             return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + arguments, environment: ChildEnvironment.local,
                                            input: input, timeout: timeout)
         }
-        if options.useControlMaster { await ConnectionGate.shared.waitForTurn(target.key) }
+        // Wait for a login to this host in progress, shared connection or not: its host-key
+        // question is answered once, and known_hosts has the key when this ssh starts.
+        await ConnectionGate.shared.waitForTurn(target.key)
         let platform = await resolvedPlatform()
         let call: (command: String, input: Data)
         do {

@@ -99,7 +99,7 @@ extension AppModel {
         guard let command = await session.foregroundCommand()?.trimmingCharacters(in: .whitespaces), !command.isEmpty else {
             return .unknown
         }
-        if TerminalSession.shells.contains(command) { return .shell(command) }
+        if TerminalSession.isShell(command) { return .shell(command) }
         return Self.askers[prompt.kind]?.contains(command) == true ? .waiting : .other(command)
     }
 

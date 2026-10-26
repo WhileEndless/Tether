@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.6.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.7.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.6.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.7.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -155,8 +155,8 @@ Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option (cha
 | Fill a saved password (sudo, su, ssh prompt) | ⌥⌘P |
 | Lock Tether (with App Lock on) | ⌃⌘L |
 | Jump between commands / select a command's output | ⌘↑ ⌘↓ / ⇧⌘↑ ⇧⌘↓ |
-| Find in terminal / search all sessions | ⌘F (⌘G, ⇧⌘G, ⌘E) / ⇧⌘F |
-| Browse files here / file manager window / transfers | ⇧⌘O / ⌥⌘O / ⌥⌘L |
+| Find in terminal / search all sessions | ⌘F (⌘G, ⇧⌘G, ⇧⌘E) / ⇧⌘F |
+| Browse files here / file manager window / transfers | ⌘E / ⌥⌘O / ⌥⌘L |
 | Sidebar / host panel | ⌃⌘S / ⌥⌘I |
 | Clear scrollback · font size | ⌘K · ⌘+ ⌘- ⌘0 |
 
@@ -217,7 +217,7 @@ Tether sessions that are still running on servers can be ended from the sidebar 
 
 1. **⌘N** to connect: pick a host from your ssh config or type `user@host:port`, optionally with a jump host.
 2. Hosts from `~/.ssh/config` appear in the sidebar. Click one to see its status; double-click to open a terminal.
-3. **⌥⌘I** shows the host panel (system, processes, services, containers, ports, logs). **⇧⌘O** opens a file manager in the terminal's current folder.
+3. **⌥⌘I** shows the host panel (system, processes, services, containers, ports, logs). **⌘E** opens a file manager in the terminal's current folder.
 4. **⌘/** lists every keyboard shortcut.
 
 ## Building

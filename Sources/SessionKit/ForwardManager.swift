@@ -25,6 +25,27 @@ public final class ForwardManager {
     /// Which host each running forward belongs to.
     @ObservationIgnored private var owners: [UUID: (target: ConnectionTarget, forward: PortForward)] = [:]
     @ObservationIgnored private var keepAlive: [String: RemoteStream] = [:]
+    /// Network devices: the shared connection is checked every 30 s instead (nothing runs there).
+    @ObservationIgnored private var deviceWatch: [String: Task<Void, Never>] = [:]
+
+    private func watchDeviceConnection(_ target: ConnectionTarget) {
+        guard deviceWatch[target.key] == nil else { return }
+        let executor = RemoteExecutor(target: target, options: optionsProvider())
+        deviceWatch[target.key] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, !(await executor.isMasterAlive()) else { continue }
+                guard let self else { return }
+                self.deviceWatch[target.key] = nil
+                for (id, owner) in self.owners where owner.target == target {
+                    self.owners[id] = nil
+                    self.pendingRestore.insert(id)
+                    self.status[id] = .failed("Connection lost — will restore on reconnect")
+                }
+                return
+            }
+        }
+    }
     /// Forwards that were active when their connection died; restored on the next connect.
     @ObservationIgnored private var pendingRestore: Set<UUID> = []
     @ObservationIgnored private let optionsProvider: () -> SSHOptions
@@ -54,13 +75,22 @@ public final class ForwardManager {
             status[forward.id] = .failed(msg)
             return msg
         }
-        // Make sure a master connection exists (this authenticates if needed).
+        // Make sure a master connection exists (this authenticates if needed). A network device
+        // runs no script: its terminal's shared connection is used as it is.
         let executor = RemoteExecutor(target: target, options: options)
-        let probe = await executor.run(script: ":", timeout: 30, purpose: "forward")
-        guard probe.succeeded else {
-            let msg = Self.clean(probe.errorOutput, fallback: "Could not connect to \(target.displayName).")
-            status[forward.id] = .failed(msg)
-            return msg
+        if PlatformCache.shared.isDevice(target.key) {
+            guard await executor.isMasterAlive() else {
+                let msg = "Open a terminal to \(target.displayName) first: forwards to a network device use its connection."
+                status[forward.id] = .failed(msg)
+                return msg
+            }
+        } else {
+            let probe = await executor.run(script: ":", timeout: 30, purpose: "forward")
+            guard probe.succeeded else {
+                let msg = Self.clean(probe.errorOutput, fallback: "Could not connect to \(target.displayName).")
+                status[forward.id] = .failed(msg)
+                return msg
+            }
         }
         let args = options.commonOptions() + ["-O", "forward", forward.kind.flag, forward.specification]
             + SSHOptions.destinationArguments(for: target)
@@ -86,7 +116,10 @@ public final class ForwardManager {
             + SSHOptions.destinationArguments(for: owner.target)
         _ = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 15)
         status[forward.id] = .inactive
-        if activeCount(for: owner.target) == 0 { keepAlive.removeValue(forKey: owner.target.key)?.stop() }
+        if activeCount(for: owner.target) == 0 {
+            keepAlive.removeValue(forKey: owner.target.key)?.stop()
+            deviceWatch.removeValue(forKey: owner.target.key)?.cancel()
+        }
     }
 
     /// Starts forwards marked auto-start, and re-establishes active ones after a reconnect.
@@ -138,6 +171,7 @@ public final class ForwardManager {
 
     /// Holds the master open while forwards are active and notices when it dies.
     private func ensureKeepAlive(for target: ConnectionTarget) {
+        if PlatformCache.shared.isDevice(target.key) { watchDeviceConnection(target); return }
         guard keepAlive[target.key] == nil else { return }
         let stream = RemoteStream(separator: "\n")
         stream.onEnd = { [weak self] _, _ in

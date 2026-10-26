@@ -119,6 +119,11 @@ public enum ProbeParser {
         } else if let prev = previous {
             snap.osInfo = prev.osInfo
         }
+        if let tools = s["tools"] {
+            snap.tools = Set(tools.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        } else {
+            snap.tools = previous?.tools
+        }
         if snap.hostname.isEmpty, let prev = previous {
             snap.hostname = prev.hostname; snap.kernel = prev.kernel
             snap.architecture = prev.architecture; snap.osName = prev.osName
@@ -492,6 +497,10 @@ public enum ProbeParser {
                 if let name = json["name"] as? String, !name.isEmpty { agent.sessionName = name }
                 agent.namedByUser = (json["nameSource"] as? String).map { $0 != "auto" } ?? false
                 agent.status = json["status"] as? String
+                agent.waitingFor = (json["waitingFor"] as? String).flatMap { $0.isEmpty ? nil : String($0.prefix(120)) }
+                if let t = json["statusUpdatedAt"] as? Double {
+                    agent.statusUpdatedAt = Date(timeIntervalSince1970: t > 10_000_000_000 ? t / 1000 : t)   // ms or s
+                }
                 if let tmux = json["tmux"] as? String, let i = tmux.lastIndex(of: "%") { agent.paneID = String(tmux[i...]) }
             case "index":
                 // Codex keeps names the user gave threads here; they win over generated titles.

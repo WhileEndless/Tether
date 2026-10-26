@@ -19,7 +19,7 @@ extension AppModel {
         sampler.keepHistory = keepsCommandHistory(session)
         sampler.keepProcesses = settings.keepCommandProcesses
         sampler.keepConnections = settings.keepCommandConnections
-        sampler.showLive = settings.showCommandStats
+        sampler.showLive = isEnabled(.commandStats, for: target)
         sampler.lookInterval = settings.commandLookInterval
         sampler.traffic = monitor(for: target).traffic
         commandSamplers[id] = sampler
@@ -32,7 +32,7 @@ extension AppModel {
     func commandHub(for target: ConnectionTarget) -> CommandHub {
         if let h = commandHubs[target.key] { return h }
         let h = CommandHub(executor: executor(for: target))
-        h.watchEnabled = settings.commandWatchEnabled
+        h.watchEnabled = isEnabled(.commandWatch, for: target)
         h.watchInterval = settings.commandWatchInterval
         commandHubs[target.key] = h
         return h
@@ -49,7 +49,9 @@ extension AppModel {
             commandSamplers.removeValue(forKey: session.id)?.close()
             return
         }
-        guard settings.keepCommandHistory || settings.showCommandStats || commandSamplers[session.id] != nil else { return }
+        let target = session.descriptor.target
+        guard isEnabled(.commandHistory, for: target) || isEnabled(.commandStats, for: target) || isEnabled(.tabActivity, for: target)
+            || commandSamplers[session.id] != nil else { return }
         commandSampler(for: session).update(online: session.phase.isOnline, foreground: session.foregroundName)
     }
 
@@ -61,7 +63,7 @@ extension AppModel {
 
     /// Private sessions leave no history.
     private func keepsCommandHistory(_ session: TerminalSession) -> Bool {
-        settings.keepCommandHistory && !session.descriptor.isPrivate
+        isEnabled(.commandHistory, for: session.descriptor.target) && !session.descriptor.isPrivate
     }
 
     func commandSessionRemoved(_ id: UUID) {
@@ -75,17 +77,15 @@ extension AppModel {
             s.keepHistory = sessions.session(id).map(keepsCommandHistory) ?? false
             s.keepProcesses = settings.keepCommandProcesses
             s.keepConnections = settings.keepCommandConnections
-            s.showLive = settings.showCommandStats
+            s.showLive = sessions.session(id).map { isEnabled(.commandStats, for: $0.descriptor.target) } ?? false
             s.lookInterval = settings.commandLookInterval
         }
-        for h in commandHubs.values {
-            h.watchEnabled = settings.commandWatchEnabled
+        for (key, h) in commandHubs {
+            h.watchEnabled = isEnabled(.commandWatch, for: target(forKey: key))
             h.watchInterval = settings.commandWatchInterval
         }
         // Turned on: terminals already online start being watched.
-        if settings.keepCommandHistory || settings.showCommandStats {
-            for s in sessions.sessions where s.phase.isOnline { commandStateChanged(s) }
-        }
+        for s in sessions.sessions where s.phase.isOnline { commandStateChanged(s) }
     }
 }
 

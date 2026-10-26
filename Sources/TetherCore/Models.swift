@@ -47,9 +47,44 @@ public enum RemotePlatform: String, Codable, Sendable {
     public static func parse(probeOutput: String) -> RemotePlatform? {
         guard let line = probeOutput.split(whereSeparator: \.isNewline).first(where: { $0.contains("TETHER:") }) else { return nil }
         if line.contains("Windows_NT") { return .windowsCmd }
+        // Nothing expanded: not a shell's answer but the command shown back (a device CLI's error).
+        if line.contains("TETHER:%OS%:$PSHOME") { return nil }
         guard let r = line.range(of: "TETHER:%OS%:") else { return .posix }
         let rest = line[r.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "\" \r"))
         return rest == ":" || rest.isEmpty || rest.hasPrefix("$PSHOME") ? .posix : .windowsPowerShell
+    }
+}
+
+/// How Tether may use a host beyond the terminal: run its small scripts (monitoring, files,
+/// persistence), or — for network devices, firewalls and limited shells (Cisco, Junos, FortiOS,
+/// RouterOS, menus, git-shell) — only open the device's own command line and send it nothing else.
+public enum ShellAccess: String, Codable, CaseIterable, Identifiable, Sendable {
+    /// Detected on first contact.
+    case automatic
+    /// A shell Tether can run scripts with (POSIX sh, or PowerShell on Windows).
+    case scripts
+    /// A device or limited shell: a plain login only.
+    case device
+
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .scripts: "Shell (Linux, macOS, BSD, Windows)"
+        case .device: "Network device or limited shell"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self = ShellAccess(rawValue: (try? decoder.singleValueContainer().decode(String.self)) ?? "") ?? .automatic
+    }
+
+    /// The second question asked when the first got no shell's answer: any shell (sh, csh, fish,
+    /// cmd, PowerShell) prints exactly `TETHER-SHELL`; a device CLI prints an error or the line itself.
+    public static let shellProbeCommand = "echo TETHER-SHELL"
+
+    public static func answersShell(_ output: String) -> Bool {
+        output.split(whereSeparator: \.isNewline).contains { $0.trimmingCharacters(in: .whitespaces) == "TETHER-SHELL" }
     }
 }
 
@@ -90,6 +125,13 @@ public struct HostMetadata: Codable, Hashable, Sendable {
     public var forwards: [PortForward]?
     /// Detected shell/OS family (nil = not detected yet).
     public var platform: RemotePlatform?
+    /// Found to be a network device or limited shell on first contact (see `ShellAccess`).
+    public var detectedDevice: Bool?
+    /// The user's choice, over what was detected.
+    public var shellAccess: ShellAccess?
+    /// This host's own choices for `HostFeature`s (raw value → on/off); absent ones follow the
+    /// system setting.
+    public var features: [String: Bool]?
 
     public init(groupID: UUID? = nil, color: TagColor = .none, persistence: PersistenceMode? = nil,
                 favorite: Bool = false, notes: String = "", lastRemoteDirectory: String? = nil) {

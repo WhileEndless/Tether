@@ -12,13 +12,16 @@ import SwiftTerm
 /// - Full-screen programs on the alternate screen are left alone.
 public enum ScrollbackRule {
     /// Feeds `bytes` to `terminal` through `feed` (a view's own feed, so it redraws), applying the rule.
+    /// `cleared` is told after each clear of the normal screen.
     public static func feed(_ bytes: ArraySlice<UInt8>, terminal t: Terminal, programsMayClear: Bool = false,
-                            feed: (ArraySlice<UInt8>) -> Void) {
+                            cleared: (() -> Void)? = nil, feed: (ArraySlice<UInt8>) -> Void) {
         var rest = bytes
         while let (range, code) = findErase(in: rest) {
             feed(rest[rest.startIndex..<range.lowerBound])
-            if keepsScreen(code, terminal: t) { keepScreen(t, feed: feed) }
+            let clears = keepsScreen(code, terminal: t)
+            if clears { keepScreen(t, feed: feed) }
             erase(code, rest[range], terminal: t, programsMayClear: programsMayClear, feed: feed)
+            if clears { cleared?() }
             rest = rest[range.upperBound...]
         }
         if !rest.isEmpty { feed(rest) }

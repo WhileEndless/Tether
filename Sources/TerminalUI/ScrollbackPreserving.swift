@@ -7,8 +7,8 @@ extension TerminalView {
     /// lines into the scrollback, so nothing is lost, and output cannot erase the scrollback (ESC[3J).
     /// A clear is `ESC[2J`, or — as shells inside tmux and screen send it — `ESC[J` with the cursor
     /// at the top left (after `ESC[H`). Full-screen programs on the alternate screen are left alone.
-    func feedKeepingScrollback(_ bytes: ArraySlice<UInt8>, programsMayClear: Bool = false) {
-        ScrollbackRule.feed(bytes, terminal: getTerminal(), programsMayClear: programsMayClear) { feed(byteArray: $0) }
+    func feedKeepingScrollback(_ bytes: ArraySlice<UInt8>, programsMayClear: Bool = false, cleared: (() -> Void)? = nil) {
+        ScrollbackRule.feed(bytes, terminal: getTerminal(), programsMayClear: programsMayClear, cleared: cleared) { feed(byteArray: $0) }
     }
 
     /// The next erase-in-display (see `ScrollbackRule.findErase`).

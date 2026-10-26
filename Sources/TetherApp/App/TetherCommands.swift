@@ -23,6 +23,14 @@ struct TetherCommands: Commands {
 
     private var active: TerminalSession? { window?.session }
 
+    /// Not connected, and a new attempt can be made now: waiting to reconnect, or ended because
+    /// the connection failed.
+    private var canReconnect: Bool {
+        guard let active else { return false }
+        if case .waiting = active.phase { return true }
+        return active.phase.isDead && active.endedByConnectionFailure
+    }
+
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About Tether") { openWindow(id: "about") }
@@ -49,18 +57,7 @@ struct TetherCommands: Commands {
             .shortcut(.newConnection)
             Button(window?.selectedItem.map { if case .files = $0 { true } else { false } } == true
                    ? "New File Manager Tab" : "New Tab to Same Host") {
-                guard let window else { return }
-                // In a file manager, ⌘T opens another file manager there (like a Finder window), not a terminal.
-                if case .files(let f)? = window.selectedItem {
-                    let dir = model.fileTabs.browser(for: f).directory
-                    window.openFiles(f.target, path: dir.isEmpty ? f.path : dir)
-                } else if let active {
-                    window.newSession(like: active)
-                } else if let t = window.inspectedTarget {
-                    window.connect(t, mode: .tab)
-                } else {
-                    window.showQuickConnect = true
-                }
+                window?.newTabLikeCurrent()
             }
             .shortcut(.newTab)
             Button("New Local Terminal") {
@@ -106,9 +103,13 @@ struct TetherCommands: Commands {
         }
 
         CommandMenu("Session") {
-            Button("Reconnect Now") { active?.reconnectNow() }
-                .shortcut(.reconnect)
-                .disabled(active.map { if case .waiting = $0.phase { false } else { true } } ?? true)
+            // ⌘R reconnects while the session is not connected; while it is, ⌘R is mouse reporting.
+            Button("Reconnect Now") {
+                guard let active else { return }
+                if active.phase.isDead { active.retryAfterFailure() } else { active.reconnectNow() }
+            }
+            .shortcut(.reconnect, when: canReconnect)
+            .disabled(!canReconnect)
             Button("New Session to Same Host in New Window") {
                 if let active { window?.newSession(like: active, mode: .window) }
             }
@@ -186,6 +187,12 @@ struct TetherCommands: Commands {
             Toggle("Show Host Status Bar", isOn: Binding(get: { model.settings.showStatusStrip },
                                                          set: { model.settings.showStatusStrip = $0 }))
                 .shortcut(.statusBar)
+            // As in Terminal.app: in this terminal, whether programs (vim, htop, tmux) get the mouse.
+            Toggle("Allow Mouse Reporting", isOn: Binding(
+                get: { active.flatMap { TerminalRegistry.shared.existingView(for: $0.id) }?.mouseReportingAllowed ?? model.settings.allowMouseReporting },
+                set: { on in active.flatMap { TerminalRegistry.shared.existingView(for: $0.id) }?.mouseReportingChoice = on }))
+                .shortcut(.mouseReporting, when: active?.phase.isOnline == true)
+                .disabled(active == nil || active?.phase.isDead == true)
             Divider()
             Button("Bigger") { model.adjustFont(+1) }
                 .shortcut(.biggerFont)

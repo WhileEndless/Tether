@@ -36,6 +36,8 @@ function Frame($first) {
       Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
         Where-Object { $sshd.Id -contains $_.OwningProcess } | ForEach-Object { "cfg:$($_.LocalPort)" } | Sort-Object -Unique
     }
+    '@@tools'
+    foreach ($t in 'docker', 'podman', 'kubectl', 'oc') { if (Get-Command $t -ErrorAction SilentlyContinue) { $t } }
   }
   '@@conn'; $env:SSH_CONNECTION
   '@@uptime'; [int64]((Get-Date) - $os.LastBootUpTime).TotalSeconds

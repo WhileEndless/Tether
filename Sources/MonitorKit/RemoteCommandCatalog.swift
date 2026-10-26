@@ -1,4 +1,5 @@
 import Foundation
+import TetherCore
 
 /// Everything the host panel and the running-command features run on a host, described for the
 /// user: when it runs, what it reads, what it changes, how it ends — and the script itself. The app
@@ -19,9 +20,28 @@ public struct RemoteCommand: Identifiable, Sendable {
     public var posix: String
     public var windows: String?
     public var id: String { title }
+    /// The switches that stop it (Settings ▸ Monitoring, or the host's own); empty: only runs
+    /// when you ask for it (an action you click).
+    public var switchedBy: [HostFeature] { RemoteCommandCatalog.switches[title] ?? [] }
 }
 
 public enum RemoteCommandCatalog {
+    static let switches: [String: [HostFeature]] = [
+        "Host status stream": [.monitoring, .statusStrip, .overviewPanel],
+        "Running command watcher": [.monitoring, .commandWatch],
+        "Running command look": [.monitoring, .commandStats, .commandHistory, .tabActivity],
+        "Traffic by process": [.monitoring, .processTraffic],
+        "Processes": [.monitoring, .processesPanel],
+        "Listening ports": [.monitoring, .portsPanel],
+        "Connections and logins": [.monitoring, .networkPanel],
+        "GPU processes": [.monitoring, .gpuPanel],
+        "Services": [.monitoring, .servicesPanel],
+        "Containers": [.monitoring, .containersPanel],
+        "Server sessions": [.monitoring, .serverSessions, .sessionsPanel, .agentStatus],
+        "Logs": [.monitoring, .logsPanel],
+        "Kubernetes": [.monitoring, .kubernetesPanel],
+    ]
+
     static let oneOff = "When done (a single command)."
     static let stream = "When Tether stops reading: the connection closes and the next write fails, within seconds (a heartbeat makes sure of it while nothing else is written)."
     static let nothing = "Nothing."

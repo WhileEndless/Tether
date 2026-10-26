@@ -180,7 +180,9 @@ final class MasterConnector {
         process = nil
         // The master keeps logging to this file; remove the name so nothing accumulates.
         try? FileManager.default.removeItem(at: logURL)
-        return status == 0 ? nil : "ssh exited with code \(status)"
+        // ssh itself fails with 255; any other code is `exit`'s own answer — the login worked (a
+        // device CLI may not know `exit`, or may report it as an error).
+        return status >= 0 && status != 255 ? nil : "ssh exited with code \(status)"
     }
 
     func cancel() {

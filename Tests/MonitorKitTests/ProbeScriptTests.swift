@@ -27,6 +27,10 @@ import TestSupport
         #expect(!snap.interfaces.isEmpty)
         #expect(snap.osInfo["kernelbuild"] != nil)
         #expect(snap.osInfo["hardware"] != nil)
+        // Tools are looked for in the first frame and kept for the frames after it.
+        #expect(snap.tools != nil)
+        let second = ProbeParser.system(frames.dropFirst().first ?? "", previous: snap)
+        #expect(second.tools == snap.tools)
     }
 
     /// The command probe finds the processes below a shell and what they use. The tree runs inside

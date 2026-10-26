@@ -3,6 +3,7 @@ import SwiftTerm
 import RecordingKit
 import TetherCore
 import SessionKit
+import TerminalText
 
 /// The terminal view bound to one `TerminalSession`.
 public final class TetherTerminalView: TerminalView, TerminalViewDelegate, TerminalSink {
@@ -46,8 +47,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // Outside a window SwiftTerm sizes cells for the main screen.
         metricsScale = NSScreen.main?.backingScaleFactor ?? 1
         KeyboardRouter.shared.install()
-        // Notifications from programs (OSC 9, 777, 99) — never while old output is replayed.
-        for code in [9, 777, 99] {
+        // Notifications from programs (OSC 9, 777, 99) and their status (OSC 7501, coding agents) —
+        // never while old output is replayed.
+        for code in [9, 777, 99, 7501] {
             getTerminal().registerOscHandler(code: code) { [weak self] payload in
                 guard let self, !self.loadingHistory else { return }
                 self.session?.terminalOSC(code: code, payload: Array(payload))
@@ -65,7 +67,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         if newFont != font { setFont(newFont) }
         applyTheme()
         optionAsMetaKey = settings.optionAsMeta
-        allowMouseReporting = settings.allowMouseReporting
+        syncMouseReporting()
         getTerminal().setCursorStyle(settings.swiftTermCursor)
         getTerminal().changeScrollback(settings.scrollbackLines)
         KeyboardRouter.shared.mappings = settings.keyMappings
@@ -155,10 +157,63 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 guard let self, self.heldEscape == held, !held.isEmpty else { return }
                 self.heldEscape = []
-                self.feedKeepingScrollback(held[...], programsMayClear: self.settings.programsMayClearScrollback)
+                self.feedKeepingScrollback(held[...], programsMayClear: self.settings.programsMayClearScrollback,
+                                           cleared: { [weak self] in self?.noteClear() })
             }
         }
-        if !chunk.isEmpty { feedKeepingScrollback(chunk[...], programsMayClear: settings.programsMayClearScrollback) }
+        if !chunk.isEmpty {
+            syncMouseReporting()
+            feedKeepingScrollback(chunk[...], programsMayClear: settings.programsMayClearScrollback, cleared: { [weak self] in self?.noteClear() })
+            syncMouseReporting()
+        }
+    }
+
+    /// This terminal's own choice (View ▸ Allow Mouse Reporting, ⌘R); nil follows Settings.
+    public var mouseReportingChoice: Bool? {
+        didSet { syncMouseReporting() }
+    }
+
+    /// Whether programs in this terminal may use the mouse, as the menu shows it.
+    public var mouseReportingAllowed: Bool { mouseReportingChoice ?? settings.allowMouseReporting }
+
+    /// SwiftTerm drops the selection on every output and line feed while mouse reporting is
+    /// allowed — whether or not the program asked for the mouse — so text selected in the history
+    /// vanished as soon as a command printed again. Reporting is only allowed while a program has
+    /// turned mouse tracking on (vim, htop, tmux with `mouse on`), the only time it reports
+    /// anything anyway; otherwise a selection stays while output streams.
+    private func syncMouseReporting() {
+        let wanted = mouseReportingAllowed && getTerminal().mouseMode != .off
+        if allowMouseReporting != wanted { allowMouseReporting = wanted }
+    }
+
+    // MARK: Clears and a taller terminal
+
+    /// The scroll-invariant row at the top of the screen right after the last clear: what is above
+    /// it was cleared away into the scrollback.
+    private var clearTop: Int?
+
+    private func noteClear() {
+        let t = getTerminal()
+        clearTop = ScrollbackRule.lineCount(t) - t.rows
+    }
+
+    /// The terminal getting taller pulls lines back down from the scrollback (like xterm). After a
+    /// clear those are the cleared screen, and the prompt would move down mid-screen: they go back up.
+    private func keepClearedScreenUp() {
+        let t = getTerminal()
+        guard let clearTop, !t.isCurrentBufferAlternate, t.buffer.scrollTop == 0, t.buffer.scrollBottom == t.rows - 1 else { return }
+        let top = ScrollbackRule.lineCount(t) - t.rows
+        let pulled = clearTop - top
+        let cursor = t.getCursorLocation()
+        guard pulled > 0, cursor.y >= pulled else { return }
+        let scroll = "\u{1b}[\(t.rows);1H" + String(repeating: "\n", count: pulled) + "\u{1b}[\(cursor.y - pulled + 1);\(cursor.x + 1)H"
+        feed(byteArray: Array(scroll.utf8)[...])
+    }
+
+    /// Resizes the terminal as a layout change does (for tests), keeping a cleared screen cleared.
+    func resizeKeepingPrompt(cols: Int, rows: Int) {
+        getTerminal().resize(cols: cols, rows: rows)
+        keepClearedScreenUp()
     }
 
     /// Bytes held back by `feed` (the start of an erase sequence).
@@ -231,6 +286,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        keepClearedScreenUp()
         reportSizeIfNeeded()
         drawFind()
     }
@@ -262,6 +318,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public func clearBuffer() {
         feed(byteArray: Array("\u{1b}[H\u{1b}[2J\u{1b}[3J".utf8)[...])
         markLines.removeAll()
+        clearTop = nil
         // Ask the shell to redraw its prompt.
         if session?.phase.isOnline == true { session?.send([0x0c][...]) }
     }
@@ -577,6 +634,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             guard let bytes = Self.tail(of: url, lines: request), bytes.count > lastSize else { break }
             lastSize = bytes.count
             t.resetToInitialState()
+            clearTop = nil
             changeScrollback(wanted)
             // The same rule as live output: a replayed `clear` never erases the history.
             feedKeepingScrollback(bytes[...], programsMayClear: settings.programsMayClearScrollback)

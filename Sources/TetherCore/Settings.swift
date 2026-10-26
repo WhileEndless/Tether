@@ -266,6 +266,24 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var allowMouseReporting = true
     public var copyOnSelect = false
     public var findHighlight = FindHighlightStyle()
+    /// System-wide switches of host features not covered by a setting of their own (see
+    /// `HostFeature`); only the ones switched off are stored.
+    public var hostFeatures: [String: Bool] = [:]
+    /// Host panel tabs for tools a host does not have (no docker, no kubectl) are not shown.
+    public var hideAbsentToolPanels = true
+    /// Seconds between looks at coding agents' status on hosts where one runs in a tab.
+    public var agentPollInterval: Double = 4
+    /// Notify when a coding agent waits for you / when it is done.
+    public var notifyAgentWaiting = true
+    public var notifyAgentDone = false
+    /// Tabs: a mark while the command works; idle programs (vim, less) get a faint dot or nothing.
+    public var markIdlePrograms = false
+    /// CPU (% of a core) above which a quiet command counts as working; seconds without output
+    /// before a command counts as quiet again.
+    public var workingCPUThreshold: Double = 5
+    public var workingQuietDelay: Double = 3
+    /// Coding agents get their own symbol on tabs and in the sidebar.
+    public var showAgentIcons = true
     public var floatingBars = FloatingBarSettings()
     /// Secrets masked in recordings once their session is archived.
     public var secretRedaction = SecretRedactionSettings()
@@ -439,6 +457,15 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.allowMouseReporting, &allowMouseReporting)
         d(.copyOnSelect, &copyOnSelect)
         d(.findHighlight, &findHighlight)
+        d(.hostFeatures, &hostFeatures)
+        d(.hideAbsentToolPanels, &hideAbsentToolPanels)
+        d(.agentPollInterval, &agentPollInterval)
+        d(.notifyAgentWaiting, &notifyAgentWaiting)
+        d(.notifyAgentDone, &notifyAgentDone)
+        d(.markIdlePrograms, &markIdlePrograms)
+        d(.workingCPUThreshold, &workingCPUThreshold)
+        d(.workingQuietDelay, &workingQuietDelay)
+        d(.showAgentIcons, &showAgentIcons)
         d(.floatingBars, &floatingBars)
         d(.secretRedaction, &secretRedaction)
         d(.optionAsMeta, &optionAsMeta)

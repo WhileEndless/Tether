@@ -114,6 +114,7 @@ public final class ProcessTraffic {
         s.onEnd = { [weak self] status, err in
             guard let self, self.stream === s else { return }
             self.stream = nil
+            if err.contains(RemoteExecutor.deviceMessage) { return }      // a device: nothing runs there
             if status != 0 && status != 15, !err.isEmpty {
                 self.message = DiagnosticLog.tail(err, lines: 2)
                 self.diagnostics.add("The traffic stream stopped (exit \(status)): " + DiagnosticLog.tail(err), source: "network")

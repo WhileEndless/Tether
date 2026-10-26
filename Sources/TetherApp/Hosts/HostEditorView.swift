@@ -122,6 +122,11 @@ struct HostEditorView: View {
                     TextField("Notes", text: $notes, axis: .vertical).lineLimit(2...4)
                 }
 
+                // Saved at once (they are Tether's own, not part of the ssh config).
+                if let existing = request.alias {
+                    HostFeaturesSection(target: .alias(existing))
+                }
+
                 Section {
                     ForEach($extras) { $opt in
                         HStack {

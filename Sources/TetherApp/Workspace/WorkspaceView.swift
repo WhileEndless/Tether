@@ -45,7 +45,7 @@ struct SessionPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.settings.showStatusStrip {
+            if model.isEnabled(.statusStrip, for: session.descriptor.target) {
                 HostStatusStrip(session: session)
             }
             ZStack(alignment: .top) {
@@ -234,7 +234,7 @@ struct SessionFooter: View {
             }
             CommandStatsPill(session: session)
             Spacer()
-            // The terminal's folder, one click from a file manager there (⇧⌘O). A real button, so it
+            // The terminal's folder, one click from a file manager there (⌘E). A real button, so it
             // reads as one and is never squeezed away by the labels beside it.
             Button {
                 state.browse(session.descriptor.target, path: session.currentDirectory)
@@ -247,8 +247,8 @@ struct SessionFooter: View {
             .fixedSize()
             .disabled(session.phase.isDead)
             .help(state.browsesInFinder(session.descriptor.target)
-                  ? "Open \(session.currentDirectory ?? "the home folder") in Finder (⇧⌘O)"
-                  : "Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⇧⌘O)")
+                  ? "Open \(session.currentDirectory ?? "the home folder") in Finder (⌘E)"
+                  : "Open a file manager tab in \(session.currentDirectory ?? "the home folder") (⌘E)")
             Text(session.descriptor.target.displayName).foregroundStyle(.secondary)
                 .truncationMode(.middle)
                 .help("Host of this terminal")

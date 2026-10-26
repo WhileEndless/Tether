@@ -31,6 +31,8 @@ if [ "$1" = 1 ]; then
   echo "@@sshports"
   if command -v ss >/dev/null 2>&1; then ss -tlnpH 2>/dev/null | grep -E '"sshd' | awk '{print $4}'; fi
   grep -iE '^[[:space:]]*Port[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print "cfg:" $NF}'
+  echo "@@tools"
+  for t in docker podman kubectl k3s microk8s oc; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done
 fi
 echo "@@conn"; echo "$SSH_CONNECTION"
 if [ "$OS" = Linux ]; then
@@ -256,8 +258,9 @@ pcwd() { readlink "/proc/$1/cwd" 2>/dev/null || lsof -n -P -w -a -p "$1" -d cwd 
   case $kind in
   claude)
     f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/$pid.json"
-    [ -r "$f" ] && awk '{ for (i = 1; i <= 4; i++) { k = (i == 1 ? "name" : i == 2 ? "nameSource" : i == 3 ? "status" : "tmux")
-        if (match($0, "\"" k "\":\"([^\"\\\\]|\\\\.)*\"")) o = o (o == "" ? "" : ",") substr($0, RSTART, RLENGTH) } }
+    [ -r "$f" ] && awk '{ for (i = 1; i <= 5; i++) { k = (i == 1 ? "name" : i == 2 ? "nameSource" : i == 3 ? "status" : i == 4 ? "tmux" : "waitingFor")
+        if (match($0, "\"" k "\":\"([^\"\\\\]|\\\\.)*\"")) o = o (o == "" ? "" : ",") substr($0, RSTART, RLENGTH) }
+        if (match($0, "\"statusUpdatedAt\":[0-9.]+")) o = o (o == "" ? "" : ",") substr($0, RSTART, RLENGTH) }
         END { print "'"$pid"'|claude|json|{" o "}" }' "$f"
     echo "$pid|claude|found|" ;;
   codex)

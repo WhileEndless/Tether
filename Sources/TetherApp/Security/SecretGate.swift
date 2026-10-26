@@ -120,7 +120,7 @@ enum CredentialKey {
             if hostKey == ConnectionTarget.local.key, let path = localKeyPath(in: prompt.text) { return passphrase(keyPath: path) }
             return "passphrase:\(hostKey):\(prompt.text)"
         case .generic:
-            let asker = (process?.command ?? program).flatMap { $0.isEmpty || TerminalSession.shells.contains($0) ? nil : $0 }
+            let asker = (process?.command ?? program).flatMap { $0.isEmpty || TerminalSession.isShell($0) ? nil : $0 }
             let user = process.map { ":" + $0.user } ?? ""
             return "prompt:\(hostKey):\(asker.map { $0 + user + ":" } ?? "")\(prompt.user ?? prompt.text)"
         }

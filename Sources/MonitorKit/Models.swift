@@ -1,4 +1,5 @@
 import Foundation
+import TetherCore
 
 public struct DiskUsage: Identifiable, Hashable, Sendable {
     public var filesystem: String
@@ -52,6 +53,11 @@ public struct SystemSnapshot: Sendable {
     /// Detailed operating system information (key → value: id, version, codename, build,
     /// kernelbuild, virt, hardware, shell…), filled from the first frame.
     public var osInfo: [String: String] = [:]
+    /// Container and Kubernetes tools found on the host (`docker`, `kubectl`, …), looked for once
+    /// per stream; nil until known.
+    public var tools: Set<String>?
+    public var hasContainerTool: Bool? { tools.map { !$0.isDisjoint(with: ["docker", "podman"]) } }
+    public var hasKubernetesTool: Bool? { tools.map { !$0.isDisjoint(with: ["kubectl", "k3s", "microk8s", "oc"]) } }
 
     /// Total download / upload rate over physical (or, failing that, all non-loopback) interfaces.
     public var networkRates: (rx: Double, tx: Double)? {
@@ -156,12 +162,8 @@ public struct RemoteSessionPane: Hashable, Sendable {
     /// A coding agent (Claude Code, Codex, opencode) runs in the foreground.
     public var agent: CodingAgent?
 
-    static let shells: Set<String> = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu"]
-
     /// The pane sits at a shell prompt.
-    public var isShell: Bool {
-        Self.shells.contains(command.hasPrefix("-") ? String(command.dropFirst()) : command)
-    }
+    public var isShell: Bool { ShellNames.contains(command) }
 
     /// What runs here: the agent and its session name, the full command line, or the program name.
     public var displayCommand: String {
@@ -190,8 +192,12 @@ public struct CodingAgent: Hashable, Sendable {
     public var sessionName: String?
     /// The user named the session (Claude Code `/rename`, Codex thread name).
     public var namedByUser = false
-    /// Claude Code reports `busy` / `idle`.
+    /// Claude Code reports `busy` / `idle` / `waiting`.
     public var status: String?
+    /// What it waits for (Claude Code: "permission prompt", …) while `status` is `waiting`.
+    public var waitingFor: String?
+    /// When the agent last changed its status.
+    public var statusUpdatedAt: Date?
     /// The tmux pane the agent says it runs in (Claude Code: `session:@window.%pane`).
     var paneID: String?
 
@@ -203,6 +209,24 @@ public struct CodingAgent: Hashable, Sendable {
     }
 
     public var isWorking: Bool { status == "busy" }
+
+    /// The status as the tab shows it.
+    public var activity: AgentActivity {
+        switch status {
+        case "busy": .working
+        case "waiting": .waiting(waitingFor.map { "is waiting: \($0)" } ?? "is waiting for you")
+        default: .idle
+        }
+    }
+
+    /// The same agent kind for tabs.
+    public var agentKind: AgentKind {
+        switch kind {
+        case .claude: .claude
+        case .codex: .codex
+        case .opencode: .opencode
+        }
+    }
 
     /// `Claude Code: Fix login bug` — the terminal title stands in when no name is known.
     public func label(fallbackTitle: String = "") -> String {

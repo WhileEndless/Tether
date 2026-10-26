@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 @testable import MonitorKit
+import SSHTransport
+import TetherCore
 
 @Suite struct ProbeParserTests {
     let linux = """
@@ -42,6 +44,16 @@ import Testing
         #expect(s.memUsed == 2_000_000 * 1024)
         #expect(s.swapUsed == 500_000 * 1024)
         #expect(s.disks.map(\.mount) == ["/"])
+    }
+
+    /// The container and Kubernetes tabs show only for hosts that have the tools.
+    @Test func parsesTools() {
+        #expect(ProbeParser.system(linux, previous: nil).tools == nil)              // not known yet
+        let none = ProbeParser.system(linux + "\n@@tools\n", previous: nil)
+        #expect(none.tools == [] && none.hasContainerTool == false && none.hasKubernetesTool == false)
+        let some = ProbeParser.system(linux + "\n@@tools\npodman\nk3s\n", previous: nil)
+        #expect(some.hasContainerTool == true && some.hasKubernetesTool == true)
+        #expect(ProbeParser.system(linux, previous: some).tools == ["podman", "k3s"])
     }
 
     @Test func parsesProcesses() {
@@ -185,6 +197,17 @@ import Testing
         #expect(pane.agent?.sessionName == "Ship it")
         #expect(pane.agent?.namedByUser == false && pane.agent?.isWorking == false)
         #expect(pane.displayCommand == "Claude Code: Ship it")
+    }
+
+    /// Claude Code waiting for plan approval, a question or a permission says so in its status file.
+    @Test func claudeWaitingIsRead() {
+        let agents = ProbeParser.codingAgents([
+            #"455|claude|json|{"status":"waiting","waitingFor":"permission prompt","statusUpdatedAt":1700000000123}"#,
+        ])
+        let a = agents["455"]
+        #expect(a?.activity == .waiting("is waiting: permission prompt"))
+        #expect(a?.statusUpdatedAt == Date(timeIntervalSince1970: 1_700_000_000.123))
+        #expect(a?.agentKind == .claude)
     }
 
     @Test func remoteSessionsWithoutPaneSections() {
@@ -388,5 +411,21 @@ import Testing
         """
         let s = ProbeParser.system(frame, previous: nil)
         #expect(abs((s.disks.first?.fraction ?? 0) - 90000.0 / 95000.0) < 0.001)
+    }
+}
+
+/// A host feature switched off means its probe never runs (nothing is started on the host).
+@MainActor
+@Suite struct MonitorGateTests {
+    @Test func switchedOffProbesDoNotRun() async {
+        let monitor = RemoteMonitor(executor: RemoteExecutor(target: .local, options: SSHOptions()))
+        monitor.allows = { _ in false }
+        monitor.retain(interval: 5)
+        #expect(!monitor.isStreaming)
+        await monitor.refreshKubernetes()
+        #expect(!monitor.kubernetesLoaded)
+        await monitor.refreshContainers()
+        #expect(monitor.containers.isEmpty)
+        monitor.release()
     }
 }

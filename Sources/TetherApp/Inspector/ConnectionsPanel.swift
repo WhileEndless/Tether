@@ -95,6 +95,7 @@ struct ProcessTrafficCard: View {
     }
 
     private var traffic: ProcessTraffic { monitor.traffic }
+    @State private var streaming = false
 
     private var rows: [ProcessTrafficEntry] {
         var list = frozen ?? traffic.entries
@@ -155,8 +156,13 @@ struct ProcessTrafficCard: View {
             }
             .disabled(entries.isEmpty)
         }
-        .onAppear { traffic.retain(interval: max(AppModel.shared.settings.trafficInterval, 1)) }
-        .onDisappear { traffic.release() }
+        .onAppear {
+            // Switched off for this host (Settings ▸ Monitoring or the host's own choice): nothing runs.
+            guard monitor.allows(.processTraffic) else { return }
+            streaming = true
+            traffic.retain(interval: max(AppModel.shared.settings.trafficInterval, 1))
+        }
+        .onDisappear { if streaming { streaming = false; traffic.release() } }
     }
 
     private var controls: some View {

@@ -152,7 +152,7 @@ struct WorkspaceToolbar: ToolbarContent {
             Button {
                 state.showQuickConnect = true
             } label: {
-                Label("New Connection", systemImage: "plus")
+                Label("New Connection", systemImage: "bolt.horizontal")
             }
             .help("New connection (⌘N)")
 
@@ -182,7 +182,7 @@ struct WorkspaceToolbar: ToolbarContent {
                 Label("Browse Files Here", systemImage: "folder")
             }
             .disabled(state.session == nil)
-            .help("Open a file manager tab in the terminal's current directory (⇧⌘O)")
+            .help("Open a file manager tab in the terminal's current directory (⌘E)")
 
             // Only with App Lock on: lock Tether now (sessions keep running). Left of the panel toggle,
             // which stays last, above the panel it opens.

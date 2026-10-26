@@ -400,3 +400,29 @@ extension View {
         background(WindowAccessor { $0.tabbingMode = .disallowed })
     }
 }
+
+extension WindowState {
+    /// ⌘T and the tab bar's "+": another tab like the one in front — a terminal to the same host,
+    /// or in a file manager another file manager there (like a Finder window). Without either,
+    /// the host shown in the panel, else Quick Connect.
+    func newTabLikeCurrent() {
+        if case .files(let f)? = selectedItem {
+            let dir = model.fileTabs.browser(for: f).directory
+            openFiles(f.target, path: dir.isEmpty ? f.path : dir)
+        } else if let session {
+            newSession(like: session)
+        } else if let t = inspectedTarget {
+            connect(t, mode: .tab)
+        } else {
+            showQuickConnect = true
+        }
+    }
+
+    /// What `newTabLikeCurrent` opens, for its button's tooltip.
+    var newTabHelp: String {
+        if case .files(let f)? = selectedItem { return "New file manager tab on \(f.target.displayName) (⌘T)" }
+        if let session { return "New tab to \(session.descriptor.target.displayName) (⌘T)" }
+        if let t = inspectedTarget { return "New tab to \(t.displayName) (⌘T)" }
+        return "New connection (⌘T)"
+    }
+}

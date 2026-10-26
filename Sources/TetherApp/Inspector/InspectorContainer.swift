@@ -34,11 +34,15 @@ struct InspectorContainer: View {
         @Bindable var state = state
         if let target = state.inspectedTarget {
             let monitor = model.monitor(for: target)
-            let tabs = InspectorTab.allCases.filter { $0 != .gpu || !(monitor.snapshot?.gpus.isEmpty ?? true) }
+            let tabs = InspectorTab.allCases.filter { model.showsPanel($0, for: target, monitor: monitor) }
             VStack(spacing: 0) {
                 HostHeader(target: target, monitor: monitor)
-                InspectorTabBar(tabs: tabs, selection: $state.inspectorTab)
+                InspectorTabBar(tabs: tabs, selection: $state.inspectorTab, target: target)
                 Divider()
+                if !model.isEnabled(.monitoring, for: target) {
+                    MonitoringOffNote(target: target)
+                    Divider()
+                }
                 Group {
                     switch state.inspectorTab {
                     case .overview: OverviewPanel(target: target, monitor: monitor)
@@ -57,9 +61,13 @@ struct InspectorContainer: View {
                     case .sessions: RemoteSessionsPanel(monitor: monitor, target: target)
                     }
                 }
+                // Every panel fills the column from the top: one with little content (a message,
+                // a spinner) must not pull the header and the tab bar to the middle.
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .id(target.key + state.inspectorTab.rawValue)
             }
-            // Keep the stream alive while the panel shows this host.
+            // Keep the stream alive while the panel shows this host (it runs only while monitoring
+            // is on for the host, see `RemoteMonitor.allows`).
             .onAppear { monitor.retain(interval: model.settings.monitorRefreshInterval) }
             .onDisappear { monitor.release() }
             .id(target.key)
@@ -74,7 +82,24 @@ struct InspectorContainer: View {
 private struct InspectorTabBar: View {
     let tabs: [InspectorTab]
     @Binding var selection: InspectorTab
+    let target: ConnectionTarget
+    @Environment(WindowState.self) private var state
     @Namespace private var ns
+
+    /// The host's own switches (see `HostFeaturesMenu`).
+    private var featuresMenu: some View {
+        var editHost: (() -> Void)?
+        if case .alias(let alias) = target { editHost = { state.hostEditor = HostEditorRequest(alias: alias) } }
+        return Menu {
+            HostFeaturesMenu(target: target, showAll: editHost)
+        } label: {
+            Image(systemName: "slider.horizontal.3").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("What Tether runs and shows for this host")
+    }
 
     var body: some View {
         HStack(spacing: 2) {
@@ -97,11 +122,12 @@ private struct InspectorTabBar: View {
                 .buttonStyle(.plain)
                 .help(tab.rawValue)
             }
+            featuresMenu
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
         .animation(.snappy(duration: 0.2), value: selection)
-        .onChange(of: tabs) { _, t in if !t.contains(selection) { selection = .overview } }
+        .onChange(of: tabs, initial: true) { _, t in if !t.contains(selection), let first = t.first { selection = first } }
     }
 }
 

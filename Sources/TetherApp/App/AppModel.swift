@@ -18,6 +18,12 @@ struct PendingPrompt: Identifiable {
     let continuation: CheckedContinuation<String?, Never>
     /// The saved password was just sent and not accepted (it probably changed on the server).
     var savedWasRejected = false
+    /// The same host-key question from other ssh processes of this host, answered together.
+    var followers: [CheckedContinuation<String?, Never>] = []
+
+    /// What makes two host-key questions the same: the connection and ssh's own text, which
+    /// names the host and the key's fingerprint.
+    var confirmationKey: String? { request.isConfirmation ? request.targetKey + "\n" + request.prompt : nil }
 }
 
 /// Items in the sidebar.
@@ -54,7 +60,8 @@ final class AppModel {
     @ObservationIgnored var openSearch: (() -> Void)?
 
     @ObservationIgnored private let libraryStore = JSONStore<HostLibrary>(filename: "hosts.json")
-    @ObservationIgnored private var monitors: [String: RemoteMonitor] = [:]
+    @ObservationIgnored var monitors: [String: RemoteMonitor] = [:]
+    @ObservationIgnored var agentWatch: Task<Void, Never>?
     /// Commands run in Tether's terminals, with their duration and usage (this Mac only).
     let commandHistory = CommandHistoryStore(directory: AppPaths.commandHistoryDirectory, codec: .recordingKey)
     /// One per host: the watcher and batched looks for all its terminals.
@@ -89,6 +96,7 @@ final class AppModel {
             session.onPasswordPrompt = { s, prompt in AppModel.shared.passwordPromptAppeared(prompt, in: s) }
             session.onAttention = { s, attention in Notifier.shared.attention(attention, in: s) }
             session.onStateChange = { s in AppModel.shared.commandStateChanged(s) }
+            AppModel.shared.applyAgentSettings(to: session)
             session.onOnline = { s in
                 let model = AppModel.shared
                 model.forwards.sessionConnected(to: s.descriptor.target,
@@ -132,6 +140,16 @@ final class AppModel {
                 }
             }
         }
+        // Network devices and limited shells found earlier, and the user's choices per host.
+        PlatformCache.shared.seed(devices: Set(library.metadata.filter { $0.value.detectedDevice == true }.keys),
+                                  access: library.metadata.compactMapValues(\.shellAccess))
+        PlatformCache.shared.onDeviceDetected = { key in
+            MainActor.assumeIsolated {
+                let model = AppModel.shared
+                model.updateMetadata(for: key) { $0.detectedDevice = true }
+                model.hostFeaturesChanged(model.target(forKey: key))
+            }
+        }
     }
 
     func launch() {
@@ -142,6 +160,7 @@ final class AppModel {
             self.sessions.restoreOpenSessions()
             // Archived recordings not masked yet (Tether quit or was locked before it was done).
             self.sessions.redactArchive()
+            self.startAgentWatch()
             self.commandHistory.load()
             self.applyCommandSettings()
             // Commands of terminals that did not come back cannot be followed any more.
@@ -368,7 +387,9 @@ final class AppModel {
     func refreshSidebar() async {
         reloadConfig()
         var targets: [String: ConnectionTarget] = [:]
-        for s in sessions.sessions where s.phase.isOnline { targets[s.descriptor.target.key] = s.descriptor.target }
+        for s in sessions.sessions where s.phase.isOnline && isEnabled(.serverSessions, for: s.descriptor.target) {
+            targets[s.descriptor.target.key] = s.descriptor.target
+        }
         let wanted = targets.values.map { monitor(for: $0) }
         await withTaskGroup(of: Void.self) { group in
             for m in wanted { group.addTask { @MainActor in await m.refreshRemoteSessions() } }
@@ -378,6 +399,7 @@ final class AppModel {
     func monitor(for target: ConnectionTarget) -> RemoteMonitor {
         if let m = monitors[target.key] { return m }
         let m = RemoteMonitor(executor: executor(for: target))
+        m.allows = { [weak self] f in self?.isEnabled(f, for: target) ?? false }
         m.paused = !NSApp.windows.contains { $0.isVisible && $0.occlusionState.contains(.visible) && !($0 is NSPanel) }
             && !NSApp.windows.isEmpty
         monitors[target.key] = m
@@ -388,10 +410,19 @@ final class AppModel {
     /// Tabs on tmux whose active pane runs a coding agent take its session name (unless renamed by
     /// hand, or turned off in Settings ▸ General); they go back to the usual title when it ends.
     func nameTabsAfterAgents(target: ConnectionTarget, _ entries: [RemoteSessionEntry]) {
+        let followStatus = isEnabled(.agentStatus, for: target)
         for s in sessions.sessions(for: target.key) where s.persistence == .tmux {
             let pane = entries.first { $0.kind == .tmux && $0.name == s.descriptor.remoteSessionName }?.activePane
             let title = settings.tabTitleFromAgent ? pane?.agent?.label(fallbackTitle: pane?.title ?? "") : nil
             if s.agentTitle != title { s.agentTitle = title }
+            // The agent's own status file says when it waits (plan approval, a question, a permission).
+            if let agent = pane?.agent {
+                if followStatus {
+                    s.agentReported(kind: agent.agentKind, activity: agent.activity, at: agent.statusUpdatedAt ?? Date())
+                }
+            } else if s.agent != nil, s.persistence == .tmux, pane != nil {
+                s.agentEnded()
+            }
         }
     }
 
@@ -400,7 +431,7 @@ final class AppModel {
     /// Once per launch and host: checks whether the host accepts key login without a password, so
     /// the key setup offer is only shown where it is useful.
     func checkKeyLogin(_ target: ConnectionTarget) {
-        guard case .alias(let alias) = target, !keyChecks.contains(alias) else { return }
+        guard case .alias(let alias) = target, !keyChecks.contains(alias), isEnabled(.keyLoginCheck, for: target) else { return }
         keyChecks.insert(alias)
         // A key with a passphrase cannot be tried without asking for it (BatchMode never asks): a
         // host set up with one is a key host already, and the check would only say it is not.
@@ -427,7 +458,8 @@ final class AppModel {
     /// Whether to offer setting up a key for a host: not when key login works, nor when it already
     /// uses a key with a passphrase (whose login cannot be checked without asking for it).
     func offersKeySetup(_ alias: String) -> Bool {
-        metadata(for: alias).keyLoginWorks != true && !usesKeyWithPassphrase(alias)
+        // Installing a key runs a script on the host: not on a network device (its own way applies).
+        metadata(for: alias).keyLoginWorks != true && !usesKeyWithPassphrase(alias) && !isDevice(.alias(alias))
     }
 
     /// Best latency measurement available for a host: from an online tmux session, if any.
@@ -585,10 +617,27 @@ final class AppModel {
         }
         return await withCheckedContinuation { cont in
             Task { @MainActor in
-                self.prompts.append(PendingPrompt(request: request, continuation: cont, savedWasRejected: rejected))
+                let prompt = PendingPrompt(request: request, continuation: cont, savedWasRejected: rejected)
+                // Several ssh processes logging in to a new host at once (a tab, monitoring, files)
+                // each ask about the same key: the question is shown once and answers them all, and
+                // one asked again right after it was answered gets the same answer.
+                if let key = prompt.confirmationKey {
+                    if let recent = self.recentConfirmations[key], Date().timeIntervalSince(recent.date) < 120 {
+                        cont.resume(returning: recent.answer)
+                        return
+                    }
+                    if let i = self.prompts.firstIndex(where: { $0.confirmationKey == key }) {
+                        self.prompts[i].followers.append(cont)
+                        return
+                    }
+                }
+                self.prompts.append(prompt)
             }
         }
     }
+
+    /// Host-key questions answered in the last minutes (see `answer`).
+    @ObservationIgnored private var recentConfirmations: [String: (answer: String?, date: Date)] = [:]
 
     nonisolated static func reason(for request: AskPassRequest, key: String) -> String {
         if request.isPassphrasePrompt { return "unlock your SSH key \((request.keyPath.map { ($0 as NSString).lastPathComponent }) ?? "")" }
@@ -605,11 +654,14 @@ final class AppModel {
     @ObservationIgnored var autoFilled: [UUID: (key: String, date: Date)] = [:]
 
     func resolvePrompt(_ prompt: PendingPrompt, answer: String?, save: Bool) {
+        let current = prompts.first { $0.id == prompt.id } ?? prompt
         prompts.removeAll { $0.id == prompt.id }
         if save, let answer, prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
             PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request))
         }
+        if let key = prompt.confirmationKey { recentConfirmations[key] = (answer, Date()) }
         prompt.continuation.resume(returning: answer)
+        for follower in current.followers { follower.resume(returning: answer) }
     }
 
     // MARK: One copy
@@ -634,7 +686,13 @@ final class AppModel {
                                  partMB: settings.recordingPartMB, shortenLargestFirst: settings.recordingShortenLargestFirst)
         if config.mainURL != settings.resolvedSSHConfigURL { reloadConfig() }
         applyCommandSettings()
-        for (key, m) in monitors { nameTabsAfterAgents(target: target(forKey: key), m.remoteSessions) }
+        for s in sessions.sessions { applyAgentSettings(to: s) }
+        for (key, m) in monitors {
+            // Probes started from now on use the new ssh settings (binary, shared connection, …).
+            let options = SSHOptions(settings: settings)
+            if m.executor.options != options { m.executor = RemoteExecutor(target: m.executor.target, options: options) }
+            nameTabsAfterAgents(target: target(forKey: key), m.remoteSessions)
+        }
     }
 }
 

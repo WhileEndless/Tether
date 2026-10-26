@@ -32,7 +32,45 @@ public final class PlatformCache: @unchecked Sendable {
     }
 
     public func forget(_ key: String) {
-        lock.lock(); platforms[key] = nil; lock.unlock()
+        lock.lock(); platforms[key] = nil; devices.remove(key); lock.unlock()
+    }
+
+    // MARK: Network devices and limited shells
+
+    private var devices: Set<String> = []
+    private var access: [String: ShellAccess] = [:]
+    /// Called on the main queue when a host turned out to be a device or limited shell.
+    public var onDeviceDetected: (@Sendable (String) -> Void)?
+
+    public func seed(devices keys: Set<String>, access choices: [String: ShellAccess]) {
+        lock.lock(); devices.formUnion(keys); access.merge(choices) { _, b in b }; lock.unlock()
+    }
+
+    /// The user's choice for a host (from the host editor).
+    public func setAccess(_ choice: ShellAccess, for key: String) {
+        lock.lock(); access[key] = choice; lock.unlock()
+    }
+
+    /// Whether Tether sends this host nothing but a plain login: chosen so, or detected and not
+    /// overridden. Nothing is ever run on such a host (`RemoteExecutor.invocation` refuses).
+    public func isDevice(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        switch access[key] ?? .automatic {
+        case .device: return true
+        case .scripts: return false
+        case .automatic: return devices.contains(key)
+        }
+    }
+
+    /// Whether the host's kind is known, or chosen (then the terminal does not wait for a probe).
+    public func isKnown(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return platforms[key] != nil || devices.contains(key) || (access[key] ?? .automatic) != .automatic
+    }
+
+    func markDevice(_ key: String) {
+        let isNew: Bool = lock.withLock { devices.insert(key).inserted }
+        if isNew, let onDeviceDetected { DispatchQueue.main.async { onDeviceDetected(key) } }
     }
 
     func resolve(_ key: String, detect: @escaping @Sendable () async -> RemotePlatform?) async -> RemotePlatform {
@@ -117,19 +155,39 @@ extension RemoteExecutor {
     }
 
     /// Asks the host's default shell a question only it can answer (see `RemotePlatform.probeCommand`).
+    /// No shell's answer: a second, plainer question (`ShellAccess.shellProbeCommand`) tells a shell
+    /// that disliked the first (csh: "Undefined variable") from a device or limited shell, which is
+    /// then remembered as one — Tether sends it nothing but the terminal's login from then on.
     public func detectPlatform() async -> RemotePlatform? {
         if target.isLocal { return .posix }
-        if options.useControlMaster { await ConnectionGate.shared.waitForTurn(target.key) }
-        let args = options.batchArguments(target: target, remoteCommand: RemotePlatform.probeCommand)
+        // Wait for a login to this host in progress, shared connection or not: its host-key
+        // question is answered once, and known_hosts has the key when this ssh starts.
+        await ConnectionGate.shared.waitForTurn(target.key)
+        guard let first = await ask(RemotePlatform.probeCommand) else { return nil }
+        if let platform = RemotePlatform.parse(probeOutput: first) { return platform }
+        guard let second = await ask(ShellAccess.shellProbeCommand) else { return nil }
+        if ShellAccess.answersShell(second) { return .posix }
+        PlatformCache.shared.markDevice(target.key)
+        return .posix
+    }
+
+    /// One short command; nil when the host could not be reached (asked again later).
+    private func ask(_ command: String) async -> String? {
+        let args = options.batchArguments(target: target, remoteCommand: command)
         let env = AskPassBridge.shared.environment(targetKey: target.key, purpose: "connect")
         defer { AskPassBridge.shared.revoke(environment: env) }
         let r = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: Data(), timeout: 20)
         guard !r.timedOut, r.status != 255 else { return nil }
-        return RemotePlatform.parse(probeOutput: r.output)
+        return r.output + "\n" + r.errorOutput
     }
+
+    /// The message for features a device or limited shell cannot have.
+    public static let deviceMessage = "Not available on this host: it is a network device or limited shell, so Tether runs nothing on it (Host ▸ Edit ▸ Shell)."
 
     /// The remote command line and stdin that run `script` with the host's shell.
     func invocation(_ script: RemoteScript, arguments: [String], platform: RemotePlatform, extra: Data?) throws -> (command: String, input: Data) {
+        // A device CLI could take script lines as its own commands: nothing is sent to it.
+        if !target.isLocal, PlatformCache.shared.isDevice(target.key) { throw RemoteError(Self.deviceMessage) }
         if platform.isWindows {
             guard let ps = script.windows else { throw RemoteError("This is not available on Windows hosts yet.") }
             var input = PowerShell.input(ps, arguments: arguments)

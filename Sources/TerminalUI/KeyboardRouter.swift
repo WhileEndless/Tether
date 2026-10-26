@@ -39,3 +39,10 @@ final class KeyboardRouter {
         }
     }
 }
+
+/// When tabs show the number to press (⌘1…⌘9): while ⌘ alone is held in the active app.
+public enum TabNumberHold {
+    public static func shows(flags: NSEvent.ModifierFlags, appActive: Bool) -> Bool {
+        appActive && flags.intersection([.command, .option, .control, .shift]) == .command
+    }
+}

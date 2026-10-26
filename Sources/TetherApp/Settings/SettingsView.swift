@@ -56,7 +56,7 @@ private struct GeneralSettings: View {
                 Toggle("Name tabs after coding agent sessions", isOn: $store.settings.tabTitleFromAgent)
                     .help("A tab running Claude Code, Codex or opencode (in tmux) takes the name of its session, unless you renamed the tab yourself")
                 Toggle("Browse folders of this Mac in Finder", isOn: $store.settings.browseLocalInFinder)
-                    .help("Browse (⇧⌘O) in a terminal of this Mac opens its folder in Finder; off, in Tether's file manager. Hosts always use the file manager.")
+                    .help("Browse (⌘E) in a terminal of this Mac opens its folder in Finder; off, in Tether's file manager. Hosts always use the file manager.")
                 Picker("Sort sessions under a host", selection: $store.settings.sessionSortOrder) {
                     ForEach(SessionSortOrder.allCases) { Text($0.title).tag($0) }
                 }
@@ -126,12 +126,39 @@ private struct TerminalSettings: View {
                 }
                 Toggle("Show notifications from programs (Claude Code, builds…)", isOn: $store.settings.notifyFromPrograms)
                 Toggle("Notify when the bell rings in a tab you are not looking at", isOn: $store.settings.notifyOnBell)
-                Text("Programs can ask for attention — Claude Code when it finishes or has a question, `printf '\\e]9;Done\\a'` after a long job. Tether understands the common sequences (OSC 9, OSC 777, OSC 99 and the bell), marks the tab with a bell and, when you are not looking at it, shows a macOS notification. In Claude Code, any of its notification channels works (`/config` ▸ Notifications).")
+                Text("Programs can ask for attention — `printf '\\e]9;Done\\a'` after a long job. Tether understands the common sequences (OSC 9, OSC 777, OSC 99, the bell, also passed through tmux), marks the tab with a bell and, when you are not looking at it, shows a macOS notification.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Notify when a coding agent waits for you", isOn: $store.settings.notifyAgentWaiting)
+                Toggle("Notify when a coding agent is done", isOn: $store.settings.notifyAgentDone)
+                Picker("Look at coding agents every", selection: $store.settings.agentPollInterval) {
+                    Text("2 s").tag(2.0)
+                    Text("4 s").tag(4.0)
+                    Text("10 s").tag(10.0)
+                }
+                Text("Claude Code waiting for plan approval, a question or a permission marks its tab with a raised hand. Nothing needs to be set up in Claude Code: Tether reads the status Claude Code keeps for each session on the host (only on hosts where an agent runs in a tab), and understands the Program Status Protocol (OSC 7501) that Claude Code speaks outside tmux. Setting Claude Code's notifications to the terminal bell (`/config` ▸ Notifications) works too.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Allow programs to use the mouse (vim, htop, tmux…)", isOn: $store.settings.allowMouseReporting)
                 Text("Hold ⌥ while selecting to select text even when a program captures the mouse.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Copy text on selection", isOn: $store.settings.copyOnSelect)
+            }
+            Section("Tabs") {
+                Toggle("Show coding agents' symbols (Claude Code, Codex, …)", isOn: $store.settings.showAgentIcons)
+                Toggle("Mark programs that are open but idle (vim, less)", isOn: $store.settings.markIdlePrograms)
+                Picker("A quiet command is working above", selection: $store.settings.workingCPUThreshold) {
+                    Text("2 % CPU").tag(2.0)
+                    Text("5 % CPU").tag(5.0)
+                    Text("15 % CPU").tag(15.0)
+                    Text("40 % CPU").tag(40.0)
+                }
+                Picker("Back to quiet after no output for", selection: $store.settings.workingQuietDelay) {
+                    Text("2 s").tag(2.0)
+                    Text("3 s").tag(3.0)
+                    Text("5 s").tag(5.0)
+                    Text("10 s").tag(10.0)
+                }
+                Text("A tab's mark moves while its command works: printing output, using CPU, or moving data over the network or disk. A program that is only open — an editor, a pager, a quiet `tail -f` — gets no mark (or a faint dot), and a shell at its prompt shows the connection's state. Coding agents get their own symbol, which moves while they work and turns into a raised hand when they wait for you. Switch the mark off for every host in Settings ▸ Monitoring, or per host.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Find in Terminal") {
                 Toggle("Highlight the line of the current match", isOn: $store.settings.findHighlight.highlightLine)
@@ -450,6 +477,26 @@ private struct MonitoringSettings: View {
     var body: some View {
         @Bindable var store = model.settingsStore
         Form {
+            Section {
+                FeatureToggle(feature: .monitoring, settings: $store.settings)
+            } header: {
+                Text("Hosts")
+            } footer: {
+                Text("Off: Tether runs nothing on hosts to watch them — no status bar, no panels that read the system, no command tracking. Browsing files and your port forwards still work. Each host can be set on its own in its editor, from the sidebar menu or the host panel's menu; that choice comes first.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Host Panel Tabs") {
+                ForEach(HostFeature.panels) { FeatureToggle(feature: $0, settings: $store.settings) }
+                Toggle("Hide tabs for tools a host does not have", isOn: $store.settings.hideAbsentToolPanels)
+                    .help("Containers without Docker or Podman, Kubernetes without kubectl, k3s, microk8s or oc. A host can still show them when it turns the tab on itself.")
+            }
+            .disabled(!store.settings.monitorAutoLoad)
+            Section("In the Background") {
+                ForEach([HostFeature.serverSessions, .keyLoginCheck, .processTraffic, .agentStatus, .tabActivity]) {
+                    FeatureToggle(feature: $0, settings: $store.settings)
+                }
+            }
+            .disabled(!store.settings.monitorAutoLoad)
             Section("Status Bar") {
                 Toggle("Show host status above each terminal", isOn: $store.settings.showStatusStrip)
                 Text("CPU, memory, disk, load, GPU and latency, streamed over the existing connection.")
@@ -523,7 +570,6 @@ private struct MonitoringSettings: View {
             Section("Host Panel") {
                 Stepper("Refresh every \(Int(store.settings.monitorRefreshInterval)) s",
                         value: $store.settings.monitorRefreshInterval, in: 1...60)
-                Toggle("Load system information automatically", isOn: $store.settings.monitorAutoLoad)
                 Toggle("Confirm before sending signals to processes", isOn: $store.settings.confirmKill)
                 Stepper("Log lines: \(store.settings.logLines)", value: $store.settings.logLines, in: 50...5_000, step: 50)
             }
@@ -686,5 +732,19 @@ private struct ReplacePasswordSheet: View {
         }
         .padding(22)
         .frame(width: 420)
+    }
+}
+
+/// A host feature's system-wide switch, with what it runs on hosts.
+private struct FeatureToggle: View {
+    let feature: HostFeature
+    @Binding var settings: AppSettings
+    var body: some View {
+        Toggle(isOn: Binding(get: { settings.isEnabled(feature) }, set: { settings.setEnabled(feature, $0) })) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(feature.title)
+                Text(feature.detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 }
