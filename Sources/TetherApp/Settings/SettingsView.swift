@@ -133,6 +133,38 @@ private struct TerminalSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Copy text on selection", isOn: $store.settings.copyOnSelect)
             }
+            Section("Find in Terminal") {
+                Toggle("Highlight the line of the current match", isOn: $store.settings.findHighlight.highlightLine)
+                if store.settings.findHighlight.highlightLine {
+                    Picker("Line color", selection: $store.settings.findHighlight.lineColor) {
+                        ForEach(FindHighlightColor.allCases) { Text($0.title).tag($0) }
+                    }
+                }
+                Picker("Match color", selection: $store.settings.findHighlight.matchColor) {
+                    ForEach(FindHighlightColor.allCases) { Text($0.title).tag($0) }
+                }
+                Toggle("Tint the other matches", isOn: $store.settings.findHighlight.showOtherMatches)
+                Toggle("Mark matches beside the scroller", isOn: $store.settings.findHighlight.showScrollerMarks)
+                Picker("Search after typing pauses for", selection: $store.settings.findHighlight.searchDelay) {
+                    ForEach([0, 150, 300, 500, 800, 1200], id: \.self) { Text($0 == 0 ? "No delay" : "\($0) ms").tag($0) }
+                }
+                Picker("When a match is reached", selection: $store.settings.findHighlight.jumpEffect) {
+                    ForEach(FindJumpEffect.allCases) { Text($0.title).tag($0) }
+                }
+                Text("⌘F finds in the terminal, ↩ / ⌘G goes to the next match, ⇧↩ / ⇧⌘G to the previous one. The bar shows which match you are on and how many there are; the marks beside the scroller show where they are in the whole history. With Reduce Motion on, matches do not bounce or blink.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Floating Bars") {
+                Picker("Close the find bar when unused for", selection: $store.settings.floatingBars.findBarHideAfter) {
+                    ForEach([0, 5, 10, 20, 30, 60, 120], id: \.self) { Text($0 == 0 ? "Never" : "\($0) seconds").tag($0) }
+                }
+                Stepper("Show a finished upload for \(store.settings.floatingBars.uploadDoneHideAfter) s",
+                        value: $store.settings.floatingBars.uploadDoneHideAfter, in: 1...30)
+                Stepper("Show a failed upload for \(store.settings.floatingBars.uploadFailedHideAfter) s",
+                        value: $store.settings.floatingBars.uploadFailedHideAfter, in: 2...60)
+                Text("The find bar stays while you type, step through matches or keep the pointer over it; when it closes, the highlights go too.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }

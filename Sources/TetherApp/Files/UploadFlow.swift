@@ -77,7 +77,8 @@ extension AppModel {
                 }
                 FileBrowserModel.invalidate(target)
                 // Keep the confirmation visible for a moment.
-                DispatchQueue.main.asyncAfter(deadline: .now() + (batch.error == nil ? 3 : 8)) {
+                let bars = self.settings.floatingBars
+                DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(batch.error == nil ? bars.uploadDoneHideAfter : bars.uploadFailedHideAfter)) {
                     if self.uploadBatches[session.id] === batch { self.uploadBatches[session.id] = nil }
                 }
             }

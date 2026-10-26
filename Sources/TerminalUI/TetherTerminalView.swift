@@ -25,6 +25,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// lines have already been dropped (they are still in the session's recording on disk).
     public var onReachedHistoryLimit: ((Bool) -> Void)?
     private var atHistoryLimit = false
+    /// The find running in this terminal (see TerminalFind.swift).
+    var findSession: TerminalFindSession?
+    /// Called when the find's matches or current match change.
+    public var onFindStatus: ((TerminalFindStatus) -> Void)?
+    var settingsFindStyle: FindHighlightStyle { settings.findHighlight }
 
     public init(session: TerminalSession, settings: AppSettings) {
         self.session = session
@@ -64,6 +69,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         getTerminal().setCursorStyle(settings.swiftTermCursor)
         getTerminal().changeScrollback(settings.scrollbackLines)
         KeyboardRouter.shared.mappings = settings.keyMappings
+        drawFind()
     }
 
     private func applyTheme() {
@@ -226,6 +232,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         reportSizeIfNeeded()
+        drawFind()
     }
 
     public func screenTail(maxRows: Int) -> (lines: [String], lastRow: Int)? {
@@ -462,6 +469,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     // MARK: TerminalViewDelegate
 
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+        findBufferChanged()
         // Ignore transient tiny sizes during layout, and coalesce bursts (window resizing)
         // so the remote shell receives one final size instead of dozens of SIGWINCHs.
         // A view in no window has its initial frame, not a real size: a tab restored in the
@@ -502,6 +510,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     public func scrolled(source: TerminalView, position: Double) {
+        drawFind()
         let trimmed = getTerminal().buffer.totalLinesTrimmed > 0
         if position <= 0.0001 && trimmed && historySource != nil {
             // Older output is read back from disk as the user reaches the top (no visible break).
@@ -528,7 +537,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private var loadingHistory = false
     private var historyExtended = false
 
-    private var bufferLineCount: Int {
+    var bufferLineCount: Int {
         let t = getTerminal()
         var lo = t.buffer.totalLinesTrimmed, hi = lo + 4_000_000
         while lo < hi {   // first invariant row without a line
@@ -632,7 +641,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     public func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
 
-    public func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+    public func rangeChanged(source: TerminalView, startY: Int, endY: Int) { findBufferChanged() }
 
     private func flash() {
         let l = CALayer()

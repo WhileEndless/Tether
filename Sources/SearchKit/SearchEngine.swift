@@ -18,12 +18,8 @@ public struct SearchQuery: Sendable, Equatable {
 
     /// Builds the matcher, or throws a readable error for an invalid regular expression.
     public func makeRegex() throws -> NSRegularExpression {
-        var p = isRegex ? pattern : NSRegularExpression.escapedPattern(for: pattern)
-        if wholeWord { p = "\\b(?:\(p))\\b" }
-        var options: NSRegularExpression.Options = []
-        if !caseSensitive { options.insert(.caseInsensitive) }
         do {
-            return try NSRegularExpression(pattern: p, options: options)
+            return try BufferSearch.regex(pattern, isRegex: isRegex, caseSensitive: caseSensitive, wholeWord: wholeWord)
         } catch {
             throw SearchError.invalidPattern("Invalid regular expression")
         }

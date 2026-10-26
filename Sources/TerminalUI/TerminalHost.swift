@@ -56,6 +56,9 @@ public struct TerminalHost: NSViewRepresentable {
                 self.claim()   // in case a stale host held it a moment ago
                 guard let window = self.window, let terminal = self.subviews.first,
                       window.firstResponder !== terminal else { return }
+                // A text field over the terminal is being typed in (the find bar, renaming a tab):
+                // SwiftUI updates this host as the text changes, and must not take the keyboard away.
+                if window.firstResponder is NSText { return }
                 window.makeFirstResponder(terminal)
             }
         }

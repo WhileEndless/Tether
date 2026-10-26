@@ -221,9 +221,29 @@ struct TetherCommands: Commands {
     }
 
     private func sendFind(_ action: NSTextFinder.Action) {
-        // A search started from the search window steps through its own matches.
-        if let id = active?.id, model.terminalFind[id] != nil, action == .nextMatch || action == .previousMatch {
-            model.terminalFindStep[id] = AppModel.FindStep(forward: action == .nextMatch)
+        // Terminals use Tether's find bar (match count, highlighted matches); other views
+        // (transcripts) keep their own.
+        if let id = active?.id, let view = TerminalRegistry.shared.existingView(for: id) {
+            let selected = view.getSelection().flatMap { $0.isEmpty || $0.contains("\n") ? nil : $0 }
+            var find = model.terminalFind[id] ?? TerminalFind(term: "")
+            switch action {
+            case .nextMatch, .previousMatch:
+                if model.terminalFind[id] != nil {
+                    model.terminalFindStep[id] = AppModel.FindStep(forward: action == .nextMatch)
+                    return
+                }
+                guard let term = FindPasteboard.get(), !term.isEmpty else { NSSound.beep(); return }
+                find.term = term
+            case .setSearchString:
+                guard let selected else { NSSound.beep(); return }
+                FindPasteboard.set(selected)
+                find.term = selected
+            default:
+                if let selected { find.term = selected } else if find.term.isEmpty { find.term = FindPasteboard.get() ?? "" }
+            }
+            find.anchorRow = nil
+            find.focusToken = UUID()
+            model.terminalFind[id] = find
             return
         }
         let item = NSMenuItem()

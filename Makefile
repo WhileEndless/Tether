@@ -9,7 +9,7 @@ override INSTALL_DIR := $(patsubst ~%,$(HOME)%,$(INSTALL_DIR))
 NOTES        := release-notes/v$(VERSION).md
 
 .DEFAULT_GOAL := app
-.PHONY: help build test app debug run demo install uninstall zip check privacy notes clean version
+.PHONY: help build test app debug run demo install uninstall zip check privacy hooks notes clean version
 
 help: ## Show this help
 	@echo "Tether $(VERSION)"
@@ -68,11 +68,12 @@ notes: ## Check that release notes exist for the current version
 	@test -f $(NOTES) || { echo "Missing $(NOTES) — copy release-notes/TEMPLATE.md"; exit 1; }
 	@echo "Found $(NOTES)"
 
-privacy: ## Look for personal data that must not be published
-	@hits=$$(git grep --untracked -nIE '/Users/[A-Za-z]|/home/[a-z]+/|BEGIN [A-Z ]*PRIVATE KEY' -- ':!Makefile' ':!CLAUDE.md' \
-		| grep -vE '/(Users|home)/(user|example|me|you|name)/'); \
-	if [ -n "$$hits" ]; then echo "$$hits"; echo "Personal paths or keys found above — remove them before committing."; exit 1; fi
-	@echo "No personal paths or private keys found."
+privacy: ## Look for personal data and secrets (API keys, tokens, private keys) that must not be published
+	@scripts/privacy.sh
+
+hooks: ## Run the privacy check before every commit (git pre-commit hook)
+	git config core.hooksPath scripts/git-hooks
+	@echo "Commits now run scripts/privacy.sh first."
 
 check: privacy notes test ## Everything that must pass before a release
 

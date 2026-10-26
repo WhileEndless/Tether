@@ -265,6 +265,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var notifyOnBell = true
     public var allowMouseReporting = true
     public var copyOnSelect = false
+    public var findHighlight = FindHighlightStyle()
+    public var floatingBars = FloatingBarSettings()
+    /// Secrets masked in recordings once their session is archived.
+    public var secretRedaction = SecretRedactionSettings()
 
     // Keyboard
     /// Off by default, like Terminal.app: Option types the characters of the keyboard layout
@@ -434,6 +438,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.notifyOnBell, &notifyOnBell)
         d(.allowMouseReporting, &allowMouseReporting)
         d(.copyOnSelect, &copyOnSelect)
+        d(.findHighlight, &findHighlight)
+        d(.floatingBars, &floatingBars)
+        d(.secretRedaction, &secretRedaction)
         d(.optionAsMeta, &optionAsMeta)
         d(.keyMappings, &keyMappings)
         d(.defaultPersistence, &defaultPersistence)

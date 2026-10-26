@@ -140,6 +140,8 @@ final class AppModel {
         AppLock.shared.start { [weak self] in
             guard let self else { return }
             self.sessions.restoreOpenSessions()
+            // Archived recordings not masked yet (Tether quit or was locked before it was done).
+            self.sessions.redactArchive()
             self.commandHistory.load()
             self.applyCommandSettings()
             // Commands of terminals that did not come back cannot be followed any more.

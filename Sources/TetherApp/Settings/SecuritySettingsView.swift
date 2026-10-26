@@ -73,6 +73,8 @@ struct SecuritySettingsPane: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            SecretRedactionSection()
+
             Section {
                 Text("App Lock, encryption, the saved-password checks (Touch ID, how long it lasts, automatic filling), Secure Keyboard Entry, the ssh and scp programs, the SSH config file and host-key checking are also kept in your keychain. If another program changes them in Tether's preferences, Tether puts them back at launch and says so. Changes that weaken protection ask for Touch ID or your Mac password first.")
                     .font(.caption).foregroundStyle(.secondary)

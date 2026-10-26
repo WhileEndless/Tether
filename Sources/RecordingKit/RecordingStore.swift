@@ -37,6 +37,8 @@ public enum RecordingStore {
 
     static func markActive(_ url: URL) { lock.lock(); active.insert(url.path); lock.unlock() }
     static func markInactive(_ url: URL) { lock.lock(); active.remove(url.path); lock.unlock() }
+    /// Whether a session is still writing this recording.
+    static func isActive(_ url: URL) -> Bool { lock.lock(); defer { lock.unlock() }; return active.contains(url.path) }
 
     /// - Parameters:
     ///   - partMB: a recording still being written moves its output aside as a compressed part

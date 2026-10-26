@@ -272,6 +272,9 @@ public struct ArchivedSession: Codable, Identifiable, Hashable, Sendable {
     public var endedAt: Date
     public var reason: String
     public var recordingPath: String?
+    /// Secrets masked in the recording when it was archived (nil: not done yet, see
+    /// `SessionManager.redactArchive`).
+    public var secretsRedacted: Int?
 
     public init(id: UUID, target: ConnectionTarget, title: String, startedAt: Date, endedAt: Date,
                 reason: String, recordingPath: String?) {

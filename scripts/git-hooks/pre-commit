@@ -1,0 +1,3 @@
+#!/bin/sh
+# Installed with `make hooks`: no commit with personal data or secrets in the working tree.
+exec "$(git rev-parse --show-toplevel)/scripts/privacy.sh"

@@ -53,7 +53,7 @@ struct SearchView: View {
                 .font(.title2)
                 .focused($fieldFocused)
                 .onSubmit { search.run() }
-            if search.running {
+            if search.busy {
                 ProgressView().controlSize(.small)
             }
             if !search.query.pattern.isEmpty {
@@ -176,10 +176,14 @@ struct SearchView: View {
 
     private var statusBar: some View {
         HStack(spacing: 12) {
-            if search.running && search.searchedSources > 0 {
+            if search.phase == .waiting {
+                ProgressView().controlSize(.mini)
+                Text("Searching…")
+            } else if search.running && search.searchedSources > 0 {
                 ProgressView(value: Double(search.progressIndex), total: Double(max(search.searchedSources, 1)))
                     .frame(width: 140)
-                Text("\(min(search.progressIndex + 1, search.searchedSources)) / \(search.searchedSources) — \(search.progressTitle)")
+                Text("Searching \(min(search.progressIndex + 1, search.searchedSources)) of \(search.searchedSources) — \(search.progressTitle)"
+                     + (search.totalMatches > 0 ? " · \(search.totalMatches) match\(search.totalMatches == 1 ? "" : "es") so far" : ""))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Button("Stop") { search.cancel() }
@@ -188,7 +192,7 @@ struct SearchView: View {
             } else if search.query.pattern.isEmpty {
                 Text("Type to search \(model.sessions.sessions.count) open sessions and \(model.sessions.archive.count) archived ones.")
             } else {
-                Text("\(search.totalMatches) match\(search.totalMatches == 1 ? "" : "es") in \(search.groups.count) of \(search.searchedSources) sources"
+                Text((search.phase == .stopped ? "Stopped · " : "") + "\(search.totalMatches) match\(search.totalMatches == 1 ? "" : "es") in \(search.groups.count) of \(search.searchedSources) sources"
                      + (search.skippedCompressed > 0 && !search.filters.includeCompressed
                         ? " · \(search.skippedCompressed) compressed skipped" : ""))
             }
@@ -253,8 +257,26 @@ struct SearchView: View {
         .overlay {
             if search.query.pattern.isEmpty {
                 guide
-            } else if !search.running && search.groups.isEmpty && search.error == nil {
-                EmptyStateView(symbol: "text.magnifyingglass", title: "No Matches", message: "Try other filters or a different pattern.")
+            } else if search.groups.isEmpty && search.error == nil {
+                switch search.phase {
+                case .waiting, .running:
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Searching…").font(.headline)
+                        Text(search.running && search.searchedSources > 0
+                             ? "Looking through \(min(search.progressIndex + 1, search.searchedSources)) of \(search.searchedSources) sources"
+                             : "Gathering sessions and recordings")
+                            .font(.callout).foregroundStyle(.secondary)
+                            .contentTransition(.numericText())
+                    }
+                    .transition(.opacity)
+                case .stopped:
+                    EmptyStateView(symbol: "stop.circle", title: "Search Stopped", message: "Nothing was found before the search was stopped. Press ↩ to search again.")
+                case .finished:
+                    EmptyStateView(symbol: "text.magnifyingglass", title: "No Matches", message: "Try other filters or a different pattern.")
+                case .idle:
+                    EmptyView()
+                }
             }
         }
     }
@@ -263,6 +285,7 @@ struct SearchView: View {
 
     private func scheduleSearch() {
         debounce?.cancel()
+        search.willRun()
         debounce = Task {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
@@ -287,7 +310,8 @@ struct SearchView: View {
                 TerminalRegistry.shared.existingView(for: sessionID)?.reveal(invariantRow: base + match.line, columns: columns)
                 // Keep searching inside that terminal: its find bar steps through the other matches.
                 model.terminalFind[sessionID] = TerminalFind(term: q.pattern, regex: q.isRegex,
-                                                            caseSensitive: q.caseSensitive, wholeWord: q.wholeWord)
+                                                            caseSensitive: q.caseSensitive, wholeWord: q.wholeWord,
+                                                            anchorRow: base + match.line)
             }
         case .recording(let url, let archiveID):
             let total = max(Double(source.lines?.count ?? 0), 1)

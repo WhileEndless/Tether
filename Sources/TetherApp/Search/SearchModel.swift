@@ -85,7 +85,12 @@ final class SearchModel {
     var query = SearchQuery(pattern: "")
     var filters = SearchFilters()
     private(set) var groups: [SearchResultGroup] = []
-    private(set) var running = false
+    /// Where the search for the current query stands. "No matches" is only true once `finished`.
+    enum Phase { case idle, waiting, running, finished, stopped }
+    private(set) var phase = Phase.idle
+    /// A search is under way (or about to start for what was just typed).
+    var running: Bool { phase == .running }
+    var busy: Bool { phase == .waiting || phase == .running }
     private(set) var error: String?
     private(set) var searchedSources = 0
     /// Progress while running: index of the source being searched, and its name.
@@ -105,22 +110,30 @@ final class SearchModel {
         if preset.session != nil { filters.archive = false; filters.otherRecordings = false }
     }
 
+    /// The query or filters changed and a search starts in a moment: earlier results no longer
+    /// count, and nothing says "no matches" before the new search has looked.
+    func willRun() {
+        task?.cancel()
+        phase = query.pattern.isEmpty ? .idle : .waiting
+    }
+
     /// Starts (or restarts) the search.
     func run() {
         task?.cancel()
         groups = []
         error = nil
         selection = []
-        guard !query.pattern.isEmpty else { running = false; return }
+        guard !query.pattern.isEmpty else { phase = .idle; return }
         do { _ = try query.makeRegex() } catch {
             self.error = error.localizedDescription
+            phase = .finished
             return
         }
         let sources = collectSources()
         searchedSources = sources.count
         progressIndex = 0
         progressTitle = ""
-        running = true
+        phase = .running
         let q = query
         task = Task {
             do {
@@ -134,17 +147,19 @@ final class SearchModel {
                     }
                 }
                 progressIndex = searchedSources
+                phase = .finished
             } catch is CancellationError {
+                // Restarted (the new run set the phase) or stopped (cancel did).
             } catch {
                 self.error = error.localizedDescription
+                phase = .finished
             }
-            running = false
         }
     }
 
     func cancel() {
         task?.cancel()
-        running = false
+        if busy { phase = .stopped }
     }
 
     /// Gathers sources on the main thread (live terminal text must be read here).

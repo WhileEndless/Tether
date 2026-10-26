@@ -221,10 +221,42 @@ public final class SessionManager {
         archive.insert(entry, at: 0)
         if archive.count > 500 { archive.removeLast(archive.count - 500) }
         archiveStore.saveSoon(archive)
+        redactArchive()
         // A background session has no tab to show its end, so drop it once archived.
         if background.contains(s.id) { close(s.id, killRemote: false) }
         saveOpenSessions()
     }
+
+    /// Masks secrets (Settings ▸ Security ▸ Secrets in the Archive) in the recordings of archived
+    /// sessions not done yet — or, with `again`, in all of them (after the rules changed). Runs
+    /// when a session is archived and at launch; a recording that cannot be done now (encrypted
+    /// while Tether is locked) is done on a later pass. Open sessions are never changed.
+    public func redactArchive(again: Bool = false) {
+        if again { for i in archive.indices { archive[i].secretsRedacted = nil } }
+        guard redactionTask == nil else { redactAgain = true; return }
+        let config = settings.settings.secretRedaction
+        let redactor = SecretRedactor(rules: config.activeRules)
+        guard config.enabled, !redactor.isEmpty else { return }
+        redactionTask = Task { [weak self] in
+            while let self {
+                let todo = self.archive.filter { $0.secretsRedacted == nil && $0.recordingPath != nil }
+                for entry in todo {
+                    guard let path = entry.recordingPath else { continue }
+                    let outcome = await redactor.redactRecording(at: path)
+                    if case .done(let n) = outcome, let i = self.archive.firstIndex(where: { $0.id == entry.id }) {
+                        self.archive[i].secretsRedacted = n
+                    }
+                }
+                if !todo.isEmpty { self.archiveStore.saveSoon(self.archive) }
+                guard self.redactAgain else { break }
+                self.redactAgain = false
+            }
+            self?.redactionTask = nil
+        }
+    }
+
+    @ObservationIgnored private var redactionTask: Task<Void, Never>?
+    @ObservationIgnored private var redactAgain = false
 
     public func deleteArchived(_ id: UUID, deleteRecording: Bool) {
         if deleteRecording, let path = archive.first(where: { $0.id == id })?.recordingPath {
