@@ -169,10 +169,19 @@ Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | ForEach-
     /// Windows has no tmux or screen; the list is always empty.
     public static let remoteSessions = "'@@tmux'\n'@@end'\n"
 
-    /// Event logs. `$A[0]` = log name, `$A[1]` = count.
+    /// Event logs. `$A[0]` = log name, `$A[1]` = count, `$A[2]` = all|warnings|errors (levels
+    /// 1 critical, 2 error, 3 warning).
     public static let logs = #"""
-$events = Get-WinEvent -LogName $A[0] -MaxEvents ([int]$A[1]) -ErrorAction SilentlyContinue
-if (-not $events) { [Console]::Error.WriteLine("The $($A[0]) event log is empty or not readable (Security needs an administrator)."); exit 1 }
+# Readable at all first: a filter on a log one may not read would only say "no matching events".
+if (-not (Get-WinEvent -LogName $A[0] -MaxEvents 1 -ErrorAction SilentlyContinue)) {
+  [Console]::Error.WriteLine("The $($A[0]) event log is empty or not readable (Security needs an administrator)."); exit 1 }
+$filter = @{ LogName = $A[0] }
+if ($A[0] -eq 'Security') {
+  # Audit events have no level: failures are the ones that matter.
+  if ($A[2] -ne 'all') { $filter.Keywords = 4503599627370496 }
+} elseif ($A[2] -eq 'errors') { $filter.Level = 1, 2 } elseif ($A[2] -eq 'warnings') { $filter.Level = 1, 2, 3 }
+$events = Get-WinEvent -FilterHashtable $filter -MaxEvents ([int]$A[1]) -ErrorAction SilentlyContinue
+if (-not $events) { "No matching events in the $($A[0]) event log."; exit 0 }
 $events | Sort-Object TimeCreated | ForEach-Object {
   '{0:yyyy-MM-ddTHH:mm:ss} {1} {2}[{3}]: {4}' -f $_.TimeCreated, $env:COMPUTERNAME, $_.ProviderName, $_.Id, ($_.Message -replace '\s+', ' ') }
 """#

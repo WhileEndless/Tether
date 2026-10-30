@@ -14,7 +14,7 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
     public override init(frame: CGRect) {
         let settings = SettingsStore.shared.settings
         var options = TerminalOptions.default
-        options.scrollback = 100_000
+        options.scrollback = 100_000     // grown to what a replay holds (`replay`)
         super.init(frame: frame, font: settings.terminalFont, options: options)
         terminalDelegate = self
         // A transcript is for reading: a visible scroller, and the wheel always scrolls (a replayed
@@ -22,6 +22,7 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
         scrollerStyle = .legacy
         allowMouseReporting = false
         applyTheme()
+        getTerminal().registerOscHandler(code: 7771) { _ in }   // Tether's markers in the recording
     }
 
     public required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -62,16 +63,28 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
     /// Replays at the size the terminal had (`SizeMarker`s in the recording), so programs that
     /// place the cursor, and long lines, come out as they were shown. A slice that starts before
     /// its first marker uses that marker's size (Tether notes the size at least every megabyte).
+    /// The most lines a transcript holds: within about 256 MB (a line costs about 24 bytes per
+    /// column), and at least what it always held.
+    public static func maxLines(cols: Int) -> Int { max(100_000, (256 << 20) / (max(cols, 20) * 24 + 160)) }
+
     func replay(_ bytes: ArraySlice<UInt8>) {
+        let bytes = ImageSequenceFilter.filtered(Array(bytes))[...]
+        // Room for every line of what is shown, however long the session was: a transcript is for
+        // reading all of it (its slice is bounded in bytes, `RecordingReader.tailMaxBytes`).
+        let lines = bytes.withUnsafeBufferPointer { b in b.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) } }
+        let t = getTerminal()
+        if lines + t.rows > t.options.scrollback { t.changeScrollback(min(lines + t.rows + 1_000, Self.maxLines(cols: t.cols))) }
         let mayClear = SettingsStore.shared.settings.programsMayClearScrollback
+        let keepRedraws = SettingsStore.shared.settings.keepRedrawnFrames
+        var context = ScrollbackRule.Context(keepRedraws: keepRedraws, readsMarkers: true)
         var rest = bytes
         if let (_, first) = SizeMarker.find(in: rest) { resizeForReplay(first) }
         while let (range, size) = SizeMarker.find(in: rest) {
-            feedKeepingScrollback(rest[rest.startIndex..<range.lowerBound], programsMayClear: mayClear)
+            feedKeepingScrollback(rest[rest.startIndex..<range.lowerBound], programsMayClear: mayClear, context: &context)
             resizeForReplay(size)
             rest = rest[range.upperBound...]
         }
-        feedKeepingScrollback(rest, programsMayClear: mayClear)
+        feedKeepingScrollback(rest, programsMayClear: mayClear, context: &context)
     }
 
     private func resizeForReplay(_ size: (cols: Int, rows: Int)) {

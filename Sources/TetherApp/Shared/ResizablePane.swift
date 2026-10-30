@@ -10,6 +10,9 @@ struct ResizablePane<Primary: View, Secondary: View>: View {
     let axis: Axis
     @Binding var size: Double
     let range: ClosedRange<Double>
+    /// false: the primary view alone. It stays the same view either way (a list keeps its
+    /// keyboard focus, selection and scroll position when the pane comes and goes).
+    var showsSecondary = true
     @ViewBuilder var primary: Primary
     @ViewBuilder var secondary: Secondary
     @State private var dragStart: Double?
@@ -19,14 +22,18 @@ struct ResizablePane<Primary: View, Secondary: View>: View {
         case .horizontal:
             HStack(spacing: 0) {
                 primary.frame(maxWidth: .infinity, maxHeight: .infinity)
-                handle
-                secondary.frame(width: size).frame(maxHeight: .infinity)
+                if showsSecondary {
+                    handle
+                    secondary.frame(width: size).frame(maxHeight: .infinity)
+                }
             }
         case .vertical:
             VStack(spacing: 0) {
                 primary.frame(maxWidth: .infinity, maxHeight: .infinity)
-                handle
-                secondary.frame(height: size).frame(maxWidth: .infinity)
+                if showsSecondary {
+                    handle
+                    secondary.frame(height: size).frame(maxWidth: .infinity)
+                }
             }
         }
     }

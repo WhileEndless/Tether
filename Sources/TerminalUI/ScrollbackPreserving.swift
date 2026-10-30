@@ -11,6 +11,13 @@ extension TerminalView {
         ScrollbackRule.feed(bytes, terminal: getTerminal(), programsMayClear: programsMayClear, cleared: cleared) { feed(byteArray: $0) }
     }
 
+    /// The same for output that comes in pieces (see `ScrollbackRule.Context`).
+    func feedKeepingScrollback(_ bytes: ArraySlice<UInt8>, programsMayClear: Bool, context: inout ScrollbackRule.Context,
+                               cleared: (() -> Void)? = nil) {
+        ScrollbackRule.feed(bytes, terminal: getTerminal(), programsMayClear: programsMayClear, context: &context,
+                            cleared: cleared) { feed(byteArray: $0) }
+    }
+
     /// The next erase-in-display (see `ScrollbackRule.findErase`).
     static func findErase(in bytes: ArraySlice<UInt8>) -> (Range<Int>, UInt8)? {
         ScrollbackRule.findErase(in: bytes)

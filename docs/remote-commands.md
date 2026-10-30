@@ -79,8 +79,9 @@ could run in, and their command line could take a script's lines as its own comm
 ### Host status stream
 - **When:** while the host status bar or the host panel is shown, every few seconds (Settings ▸
   Monitoring ▸ Refresh).
-- **Reads:** CPU, memory, disk, load, network counters, GPU (nvidia-smi, rocm-smi or sysfs when
-  present) and OS details. Once per stream it also checks which of docker, podman, kubectl, k3s,
+- **Reads:** CPU, memory, load and network counters every time; disks (`df`) every 30 s and the
+  GPU (nvidia-smi, rocm-smi or sysfs when present) every 10 s or so, since those tools cost more and
+  what they report changes slowly; OS details once. Once per stream it also checks which of docker, podman, kubectl, k3s,
   microk8s and oc exist (`command -v`), so the Containers and Kubernetes tabs show only where they
   can work.
 - **Changes:** nothing. Ends when Tether stops reading.
@@ -188,16 +189,22 @@ could run in, and their command line could take a script's lines as its own comm
 - **Changes:** that action on that container.
 
 ### Server sessions
-- **When:** when terminals to the host connect, then every 15 s while a window is visible.
+- **When:** when terminals to the host connect, then every 15 s while a window is visible. A host
+  with a tab running a coding agent is looked at every 4 s (Settings ▸ Monitoring), also with no
+  window visible, so a question or a plan approval is noticed in any tab.
 - **Reads:**
-  - tmux and screen sessions and the program in front in each pane,
+  - tmux and screen sessions and the program in front in each pane (`ps` is asked about the panes'
+    terminals only, not every process on the host),
   - the names of coding-agent sessions (Claude Code, Codex, opencode), read from those tools' own
     files.
 - **Changes:** nothing.
 
 ### Logs
 - **When:** when you load a log in the Logs tab.
-- **Reads:** `journalctl`, `/var/log` files, `log show` or the Windows event log, as chosen.
+- **Reads:** `journalctl`, `/var/log` files, `log show` or the Windows event log, as chosen. With
+  *Errors* or *Warnings and Errors*, the server picks those lines (journalctl `-p`, the event log's
+  levels, `log show`'s errors and faults, `dmesg --level`, or the usual words in a log file's last
+  200,000 lines).
 - **Changes:** nothing.
 
 ### Kubernetes
@@ -211,10 +218,19 @@ could run in, and their command line could take a script's lines as its own comm
   - A one-line `sh` program picks the persistence that exists on the host (tmux, GNU screen, or a
     plain login shell). It reports its choice and the shell's process id with a private escape
     sequence that Tether removes from the output.
-  - tmux gets its own session for the tab, with its scrollback limit set on that session only.
+  - tmux gets its own session for the tab, with its scrollback limit set on that session only
+    (and `destroy-unattached off`, so a tmux.conf that ends unattached sessions does not end it).
     Your tmux settings and other sessions are not touched.
+  - Coming back to a tab, the session counts as ended only when tmux says so (it answers without
+    it, or no tmux server runs). A tmux that cannot be asked (another version after an upgrade, no
+    tmux 3 any more) leaves the tab waiting for Reconnect, with why, instead of ending it.
   - GNU screen gets a private settings file (random name, readable only by you), removed after
     10 seconds.
+- **No tmux or screen:** the footer offers *Keep Shells Running…*. Only when you open it, a short
+  script asks which package manager there is (`command -v` for brew, apt-get, dnf, yum, zypper,
+  apk, pacman and others), the account's id and whether `sudo` exists, and the matching install
+  command is shown. *Type in Terminal* types it at the prompt without pressing Return: you run it,
+  Tether installs nothing.
 - **Windows:** the tab runs PowerShell with `-EncodedCommand`. The command contains a random tag as
   a comment, so the watcher and the look can find that PowerShell later.
 - **Latency:** without tmux, an empty command (`:`) is timed now and then over the shared connection.
@@ -224,12 +240,40 @@ could run in, and their command line could take a script's lines as its own comm
 - **File manager:**
   - Lists folders with `find`, `stat` or `ls` (PowerShell on Windows).
   - Creates, renames, moves or deletes only what you ask for.
+  - Paste (⌘V) of items copied on the same server copies them there with `cp -R -p` (or moves them
+    with `mv`, *Move Here*) under free names, never into themselves (PowerShell's `Copy-Item` /
+    `Move-Item` on Windows). Items copied on another server are downloaded to this Mac, uploaded as
+    any upload, and the temporary copy on the Mac is removed.
   - Never overwrites: new names are free ones (`name-1.ext`).
-- **Transfers:** use `scp`, or a `tar` stream for many files (unpacked by `tar` on the host). They
-  write only the files you transfer. Before an upload under a new name, the name is checked to be
-  still free (the file manager's listing script). When such an upload fails or is cancelled, the
-  partial file it made is removed (`rm -rf -- <that path>`, `Remove-Item` on Windows); nothing else
-  is touched.
+  - Search (the search field, ↩): only reads. `find` from the folder shown downwards with `-iname`
+    (a name containing the text, or a pattern such as `*.log`), or `find … -print | xargs grep -l -i -F`
+    for files up to 20 MB containing the text; details come from GNU `find -printf`, else `stat`.
+    Hidden folders are not entered unless hidden files are shown, `/proc`, `/sys`, `/dev` and `/run`
+    are skipped when searching from `/`, and it stops after 1,000 matches (`head`), after two
+    minutes, or when you press Stop (the ssh ends, so the commands on the server stop with it).
+    Windows: `Get-ChildItem -Recurse` with `-like`, or `Select-String -SimpleMatch`.
+- **Transfers:** use `scp`, or a `tar` stream for many files (unpacked by `tar` on the host). The
+  stream may be compressed with a program the host already has (`zstd`, `lz4`, `gzip`, `xz` or
+  `bzip2`: each is tried by compressing and uncompressing one byte, in one short look before a packed
+  transfer that also asks `command -v tar`, the number of processors (`getconf`, `nproc` or `sysctl`)
+  and the load (`/proc/loadavg` or `sysctl`); kept for five minutes, asked again after a compressed
+  transfer failed. A host without tar gets the files one by one with `scp`. When the compressing end
+  is slow (two cores or fewer, or busy), automatic compression uses `lz4` or none, and a method
+  chosen in Settings asks first for large transfers. The unpacking script reports where it is
+  (`@@stage` lines on its error output), which also lets it notice that Tether went away and stop;
+  a destination folder it made is removed again (`rmdir`, only when empty) if nothing arrived). They write only the
+  files you transfer. Right before each upload its name is checked to be still free (a short `sh`
+  script; the next free `name-1.ext` is used when it was taken). When such an upload fails, stalls or
+  is cancelled, the partial file it made is removed (`rm -rf -- <that path>`, `Remove-Item` on
+  Windows). A packed upload unpacks into a hidden `.tether-transfer-…` folder that its script removes
+  when the stream ends, however it ends; the stream's last member is an empty `.tether-end-…` mark,
+  and nothing is moved into place unless it arrived. Items take their final names only while they
+  are free (`mkdir` for a folder, `ln` for a file, both failing when the name exists), never
+  replacing or writing into anything; after a cancel or failure Tether also removes that one
+  folder (`rm -rf` of exactly that name, refused for any other). When Tether quits during a transfer,
+  these removals are sent through a last ssh that asks nothing (`BatchMode`; not to Windows hosts,
+  where a partial file is then left); nothing else is touched.
+  Counting a folder to download runs `find` (and `du` where `find` cannot print sizes).
 - **Key setup:** appends your public key to `~/.ssh/authorized_keys` (on Windows, also
   `administrators_authorized_keys` for administrators). Only when you ask, and only if the key is not
   there yet. Then one login with that key alone (`exit`, nothing else) checks that it works; a

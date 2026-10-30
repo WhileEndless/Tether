@@ -9,7 +9,7 @@ override INSTALL_DIR := $(patsubst ~%,$(HOME)%,$(INSTALL_DIR))
 NOTES        := release-notes/v$(VERSION).md
 
 .DEFAULT_GOAL := app
-.PHONY: help build test app debug run demo install uninstall zip check privacy hooks notes clean version
+.PHONY: help build test app debug run demo install install-built uninstall zip check privacy hooks notes clean version signing-identity
 
 help: ## Show this help
 	@echo "Tether $(VERSION)"
@@ -24,8 +24,8 @@ version: ## Print the current version
 build: ## Compile all modules (debug)
 	swift build
 
-test: ## Run the unit and integration tests
-	swift test
+test: ## Run the unit and integration tests (at a lower priority: the Mac stays usable)
+	nice -n 10 swift test
 
 app: ## Build the release app into dist/Tether.app (default)
 	scripts/build-app.sh release
@@ -47,11 +47,23 @@ demo: ## Open the app with synthetic demo data (your data is not used). SHOTS=1 
 	for s in "$$T"/tmux-*/*; do [ -S "$$s" ] && TMUX= "$$D/bin/tmux" -S "$$s" kill-server 2>/dev/null; done; \
 	rm -rf "$$D" "$$T"; defaults delete tether.demo >/dev/null 2>&1; true
 
-install: app ## Build and copy Tether.app to /Applications (INSTALL_DIR=… to change)
+signing-identity: ## Create a local signing certificate so macOS keeps Tether's permissions across builds
+	scripts/make-signing-identity.sh
+
+install: app install-built ## Build and copy Tether.app to /Applications (INSTALL_DIR=… to change)
+
+# The app already built in dist/ (the self-update builds first, then installs this once Tether has
+# quit). The new copy is made next to the old one and swapped in: a copy that fails leaves the
+# installed Tether as it was.
+install-built:
 	@if pgrep -qf "$(INSTALL_DIR)/Tether.app/Contents/MacOS/Tether"; then echo "Quit Tether first, then run make install again."; exit 1; fi
+	@test -d $(APP) || { echo "Nothing built in $(APP): run make install."; exit 1; }
 	mkdir -p "$(INSTALL_DIR)"
-	rm -rf "$(INSTALL_DIR)/Tether.app"
-	ditto $(APP) "$(INSTALL_DIR)/Tether.app"
+	rm -rf "$(INSTALL_DIR)/.Tether.app.new" "$(INSTALL_DIR)/.Tether.app.old"
+	ditto $(APP) "$(INSTALL_DIR)/.Tether.app.new"
+	if [ -d "$(INSTALL_DIR)/Tether.app" ]; then mv "$(INSTALL_DIR)/Tether.app" "$(INSTALL_DIR)/.Tether.app.old"; fi
+	mv "$(INSTALL_DIR)/.Tether.app.new" "$(INSTALL_DIR)/Tether.app" || { mv "$(INSTALL_DIR)/.Tether.app.old" "$(INSTALL_DIR)/Tether.app"; exit 1; }
+	rm -rf "$(INSTALL_DIR)/.Tether.app.old"
 	@echo "Installed to $(INSTALL_DIR)/Tether.app"
 
 uninstall: ## Remove Tether.app from /Applications (settings and recordings are kept)

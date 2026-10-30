@@ -6,18 +6,62 @@ public struct AskPassRequest: Sendable {
     public var token: String
     public var targetKey: String
     public var purpose: String
-    public var prompt: String
+    /// ssh's question (fixed: what is worked out from it below is worked out once, in `init`).
+    public let prompt: String
     /// The terminal tab whose login asks, if any (only the tab in front shows its prompt).
     public var sessionID: UUID? = nil
     /// How many prompts this token has produced so far (1-based). Used to detect wrong saved passwords.
     public var sequence: Int
+    /// The process that asks (the helper's parent: the ssh itself, or the ssh ProxyJump started for
+    /// a jump host, which has the same token). 0 when unknown.
+    public var askerPID: Int32 = 0
+    /// What ssh set `SSH_ASKPASS_PROMPT` to: "confirm" for a yes/no question (AddKeysToAgent=ask),
+    /// "none" for a notice that needs no answer (touch the security key); nil for a question.
+    public var askpassKind: String? = nil
+    /// The ssh asking is one that marks a server's own questions (OpenSSH 8.4 and later; checked by
+    /// its program file, see `AskingProcess`): only then is a passphrase question known to be its own.
+    public var askerNamesItsQuestions = false
+    /// The key file named by ssh's own passphrase prompt (`Enter passphrase for key '/path':`).
+    public let keyPath: String?
+    /// `keyPath` is a file on this Mac and the question is not marked as a server's.
+    private let namesLocalKeyFile: Bool
+
+    public init(token: String, targetKey: String, purpose: String, prompt: String, sequence: Int) {
+        self.token = token
+        self.targetKey = targetKey
+        self.purpose = purpose
+        self.prompt = prompt
+        self.sequence = sequence
+        // Looked at once (file checks, and for a cut path a walk through folders), here — off the
+        // main thread when the bridge makes the request — not each time a view asks.
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = p.wholeMatch(of: #/Enter passphrase for (?:key )?'(.+)': ?/#).map { Self.untruncated(String($0.1)) }
+        keyPath = path
+        var isDir: ObjCBool = false
+        namesLocalKeyFile = path.map { FileManager.default.fileExists(atPath: ($0 as NSString).expandingTildeInPath, isDirectory: &isDir) && !isDir.boolValue } == true
+            && p.prefixMatch(of: #/\([^@\s()]+@[^)\s]+\) /#) == nil
+    }
+
+    /// A notice ssh shows while it waits (a security key's "Confirm user presence"): no answer is
+    /// read; ssh ends the helper when it is done.
+    public var isNotice: Bool { askpassKind == "none" }
+
+    /// A yes/no question ssh asks for itself (`Add key … to agent?`): "yes" allows, anything else
+    /// does not.
+    public var isPermissionQuestion: Bool { askpassKind == "confirm" && !isServerText }
 
     public var isSecret: Bool {
+        guard askpassKind == nil else { return false }
         let p = prompt.lowercased()
         return p.contains("password") || p.contains("passphrase") || p.contains("pin") || p.contains("verification code")
     }
 
     public var isPasswordPrompt: Bool { prompt.lowercased().contains("password") }
+
+    /// A password question from an ssh that does not mark a server's questions (before OpenSSH 8.4,
+    /// or one that could not be checked — a ProxyCommand may run another ssh): a jump host could
+    /// have written it. Never answered by itself, from the keychain or from memory.
+    public var isUnverifiedPasswordPrompt: Bool { askpassKind == nil && isPasswordPrompt && !askerNamesItsQuestions }
 
     /// ssh's own password question (`user@host's password:`, or keyboard-interactive's plain
     /// `(user@host) Password:`) — not a one-time code or "New password:" a server asks for, which
@@ -35,19 +79,13 @@ public struct AskPassRequest: Sendable {
     }
 
     /// `Enter passphrase for key '/path/to/key':` exactly as ssh writes it (never server text), for a
-    /// key file that exists on this Mac.
-    public var isPassphrasePrompt: Bool {
-        guard !isServerText, let path = keyPath else { return false }
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath, isDirectory: &isDir) && !isDir.boolValue
-    }
+    /// key file that exists on this Mac, asked by an ssh that marks a server's questions.
+    public var isPassphrasePrompt: Bool { askpassKind == nil && namesLocalKeyFile && askerNamesItsQuestions }
 
-    /// The key file named by ssh's own passphrase prompt.
-    public var keyPath: String? {
-        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let m = p.wholeMatch(of: #/Enter passphrase for (?:key )?'(.+)': ?/#) else { return nil }
-        return Self.untruncated(String(m.1))
-    }
+    /// Worded as ssh's question for a key on this Mac, but asked by an ssh that does not mark a
+    /// server's questions (before OpenSSH 8.4, or one that could not be checked): the server may
+    /// have written it. Never answered from the keychain, never saved under the key.
+    public var isUnverifiedPassphrasePrompt: Bool { askpassKind == nil && namesLocalKeyFile && !askerNamesItsQuestions }
 
     /// ssh writes at most 100 bytes of the key's path in its prompt: a longer path is completed to
     /// the one file on this Mac that it starts (otherwise it stays as written).
@@ -76,7 +114,7 @@ public struct AskPassRequest: Sendable {
 
     /// ssh's own host-key question (`… continue connecting (yes/no/[fingerprint])?`), not server text.
     public var isConfirmation: Bool {
-        guard !isServerText else { return false }
+        guard askpassKind == nil, !isServerText else { return false }
         let p = prompt.lowercased()
         return p.contains("continue connecting") && p.contains("(yes/no")
     }
@@ -385,11 +423,23 @@ public final class AskPassBridge: @unchecked Sendable {
         var request = AskPassRequest(token: token, targetKey: ctx.targetKey, purpose: ctx.purpose,
                                      prompt: prompt, sequence: ctx.count)
         request.sessionID = ctx.sessionID
+        request.askerPID = Self.parentPID(of: peer) ?? 0
+        if let kind = obj["kind"], ["confirm", "none"].contains(kind) { request.askpassKind = kind }
         lock.lock(); contexts[token]?.asking += 1; lock.unlock()
         defer { lock.lock(); contexts[token]?.asking -= 1; lock.unlock() }
         let semaphore = DispatchSemaphore(value: 0)
         let box = AnswerBox()
+        let asked = request
         Task {
+            var request = asked
+            // A question naming a key on this Mac is ssh's own only from an ssh that marks a
+            // server's questions — the one asking, which may be a jump host's ssh found on PATH
+            // or one a ProxyCommand ran, not only the one in Settings.
+            // A password question too: a jump host reached through an older ssh (a ProxyCommand's)
+            // can word its own question as the target's, and must not be answered with its password.
+            if request.keyPath != nil || request.isPasswordPrompt {
+                request.askerNamesItsQuestions = await AskingProcess.namesItsQuestions(pid: request.askerPID)
+            }
             box.value = await handler?(request)
             semaphore.signal()
         }
@@ -423,5 +473,96 @@ public final class AskPassBridge: @unchecked Sendable {
         guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
         data.append(0x0a)
         data.withUnsafeBytes { _ = write(fd, $0.baseAddress, $0.count) }
+    }
+}
+
+/// The state of a terminal on this Mac, to tell whether a program on it is reading a secret.
+public enum LocalTTY {
+    /// The terminal device a process on this Mac belongs to (`/dev/ttys003`), or nil.
+    public static func path(ofProcess pid: Int32) -> String? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard pid > 0, sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let dev = info.kp_eproc.e_tdev
+        guard dev != -1, let name = devname(dev, S_IFCHR) else { return nil }
+        return "/dev/" + String(cString: name)
+    }
+
+    /// Whether the terminal waits for a typed secret: line-by-line input with echo off, as a
+    /// program on this Mac reading a passphrase sets it (ssh's own `readpassphrase`). A connected
+    /// ssh puts its terminal into raw mode instead, so text a server prints — even worded as a key
+    /// passphrase prompt — never makes this true. nil when the terminal cannot be looked at.
+    public static func isReadingSecret(path: String) -> Bool? {
+        let fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var t = termios()
+        guard tcgetattr(fd, &t) == 0 else { return nil }
+        return t.c_lflag & tcflag_t(ECHO) == 0 && t.c_lflag & tcflag_t(ICANON) != 0
+    }
+
+    /// The program files of the terminal's foreground process group (what reads typed input).
+    public static func foregroundPrograms(path: String) -> [String]? {
+        let fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        let pgid = tcgetpgrp(fd)
+        guard pgid > 0 else { return nil }
+        let programs = AskingProcess.group(pgid).compactMap(AskingProcess.executablePath)
+        return programs.isEmpty ? nil : programs
+    }
+
+    /// Why a key's passphrase must not be typed into this terminal now, or nil when it may: an
+    /// ssh tool on this Mac reads it (line mode, echo off) and every ssh among the programs reading
+    /// is one that marks a server's questions — an older ssh shows a server's keyboard-interactive
+    /// question, worded as this key's prompt, in exactly that state.
+    public static func refusalToTypeKeyPassphrase(path: String) async -> String? {
+        guard isReadingSecret(path: path) == true else {
+            return "This terminal is not waiting for a passphrase on this Mac. The prompt may have been printed by a server that ssh is connected to."
+        }
+        guard let programs = foregroundPrograms(path: path) else { return "Tether cannot tell which program is asking." }
+        let names = programs.map { ($0 as NSString).lastPathComponent }
+        guard names.contains(where: ["ssh", "ssh-add", "ssh-keygen"].contains) else {
+            return "No ssh program on this Mac is asking (\(names.joined(separator: ", ")))."
+        }
+        for program in programs where (program as NSString).lastPathComponent == "ssh" {
+            guard await SSHVersionCheck.shared.namesItsQuestions(path: program) else {
+                return "The ssh asking (\(program)) is older than OpenSSH 8.4: it does not mark a server's questions, so this one may come from the server."
+            }
+        }
+        return nil
+    }
+}
+
+/// Processes on this Mac: which program they run, and which ssh among them can be trusted to mark
+/// a server's questions.
+public enum AskingProcess {
+    /// The program file a process runs (symbolic links resolved), or nil.
+    public static func executablePath(_ pid: Int32) -> String? {
+        guard pid > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let n = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        return n > 0 ? String(cString: buffer) : nil
+    }
+
+    /// Whether this process is an ssh that marks a server's questions (OpenSSH 8.4 or later). A
+    /// program not named `ssh` is never asked (`-V` could mean anything to it).
+    public static func namesItsQuestions(pid: Int32) async -> Bool {
+        guard let path = executablePath(pid), (path as NSString).lastPathComponent == "ssh" else { return false }
+        return await SSHVersionCheck.shared.namesItsQuestions(path: path)
+    }
+
+    /// The processes of a process group.
+    public static func group(_ pgid: Int32) -> [Int32] {
+        guard pgid > 0 else { return [] }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let count = size / MemoryLayout<kinfo_proc>.stride + 8
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        size = count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        return procs.prefix(size / MemoryLayout<kinfo_proc>.stride).map(\.kp_proc.p_pid)
     }
 }

@@ -1,68 +1,92 @@
 import AppKit
+import RecordingKit
 import SearchKit
 import SessionKit
+import TetherCore
 import TerminalUI
 
-/// ⌘S: saves the whole session — older output from its recording, then what the terminal holds —
-/// to a file the user picks. The folder is remembered; writing happens off the main thread.
+/// ⌘S: saves the session to a file the user picks — the whole of it (older output from its
+/// recording, then what the terminal holds), only what the terminal holds now, or the last command
+/// run in it with all it printed. What is chosen first and the folder it opens in come from
+/// Settings ▸ Terminal (the Downloads folder unless set). Writing happens off the main thread.
 @MainActor
 enum SessionSave {
-    private static let directoryKey = "saveSession.directory"
     private static let formatKey = "saveSession.format"
 
+    /// The folder the panel opens in: the one set in Settings, or Downloads.
+    static var folder: URL {
+        let set = AppModel.shared.settings.saveSessionFolder
+        var isDir: ObjCBool = false
+        if !set.isEmpty, FileManager.default.fileExists(atPath: set, isDirectory: &isDir), isDir.boolValue {
+            return URL(fileURLWithPath: set, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
     static func run(_ session: TerminalSession) {
-        let hasRecording = session.recordingURL != nil
+        let recording = session.recordingURL
         let view = TerminalRegistry.shared.existingView(for: session.id)
         let host = session.descriptor.target.displayName
+        // The last command's place in the recording (where its line starts), when there is one.
+        let lastMark: Int? = {
+            guard let recording, let index = session.recordingIndex, index.isExact, let mark = index.marks.last else { return nil }
+            let base = index.partLengths.isEmpty ? 0 : index.removedLength(firstPart: RecordingParts.parts(of: recording).first?.number)
+            return mark.offset - base >= 0 ? mark.offset - base : nil
+        }()
+        var available: [SaveSessionContents] = [.whole]
+        if view != nil { available.append(.terminal) }
+        if lastMark != nil || view?.hasCommandInMemory == true { available.append(.lastCommand) }
 
         let panel = NSSavePanel()
         panel.title = "Save Session"
-        panel.message = "Everything this session has shown, including output no longer on screen."
         panel.prompt = "Save"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        if let path = UserDefaults.standard.string(forKey: directoryKey) {
-            panel.directoryURL = URL(fileURLWithPath: path, isDirectory: true)
-        }
-        // Raw output needs the recording; without one only plain text is offered.
-        let formats = hasRecording ? SessionExport.Format.allCases : [SessionExport.Format.text]
-        var format = SessionExport.Format(rawValue: UserDefaults.standard.string(forKey: formatKey) ?? "") ?? .text
-        if !formats.contains(format) { format = .text }
-        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        popup.addItems(withTitles: formats.map(\.title))
-        popup.selectItem(at: formats.firstIndex(of: format) ?? 0)
-        let target = FormatTarget(panel: panel, formats: formats, host: host, title: session.displayTitle)
-        popup.target = target
-        popup.action = #selector(FormatTarget.changed(_:))
-        let label = NSTextField(labelWithString: "Format:")
-        let stack = NSStackView(views: [label, popup])
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        panel.accessoryView = stack
-        panel.nameFieldStringValue = SessionExport.suggestedName(host: host, title: session.displayTitle, format: format)
+        panel.directoryURL = folder
+
+        let options = Options(panel: panel, available: available, hasRecording: recording != nil,
+                              lastMarkInRecording: lastMark != nil, host: host, title: session.displayTitle)
+        let wanted = AppModel.shared.settings.saveSessionContents
+        options.select(contents: available.contains(wanted) ? wanted : .whole,
+                       format: SessionExport.Format(rawValue: AppPaths.defaults.string(forKey: formatKey) ?? "") ?? .text)
+        panel.accessoryView = options.view
 
         let finish: (NSApplication.ModalResponse) -> Void = { response in
-            _ = target   // kept alive while the panel is open
-            guard response == .OK, let url = panel.url else { return }
-            let chosen = formats[max(0, popup.indexOfSelectedItem)]
-            UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: directoryKey)
-            UserDefaults.standard.set(chosen.rawValue, forKey: formatKey)
+            guard response == .OK, let url = panel.url else { _ = options; return }
+            let contents = options.contents
+            let format = options.format
+            AppPaths.defaults.set(format.rawValue, forKey: formatKey)
             // The screen and the recording's length are taken at the same moment (on the main
             // thread, where output arrives), so nothing is saved twice or mixed in from later.
-            let snapshot = session.recordingSnapshot()
+            var snapshot: (url: URL, length: Int)?
+            var start = 0
             var lines: [String] = []
-            let dropLast = 0
-            let source = snapshot
-            // With a recording, the text comes from it alone, as the terminal showed it: each line
-            // once (the screen keeps every redraw of programs such as Claude Code), and nothing to
-            // join with memory. Without one (a private tab, recording off), from the screen.
-            if chosen == .text, snapshot == nil, let view {
-                lines = view.logicalText().lines
+            switch contents {
+            case .whole:
+                // With a recording, the text comes from it alone, as the terminal showed it: each
+                // line once (the screen keeps every redraw of programs such as Claude Code). Without
+                // one (a private tab, recording off), from the screen.
+                snapshot = session.recordingSnapshot()
+                if snapshot == nil, let view { lines = view.logicalText().lines }
+            case .terminal:
+                lines = view?.logicalText().lines ?? []
+            case .lastCommand:
+                if let lastMark, let snap = session.recordingSnapshot() {
+                    snapshot = snap
+                    start = lastMark
+                } else {
+                    lines = view?.lastCommandText() ?? []
+                }
             }
+            let source = snapshot
+            let from = start
             Task.detached(priority: .utility) {
                 do {
-                    switch chosen {
-                    case .text: try SessionExport.writeText(recording: source?.url, length: source?.length, dropLast: dropLast, lines: lines, to: url)
-                    case .raw: if let source { try SessionExport.writeRaw(recording: source.url, length: source.length, to: url) }
+                    if format == .raw, let source {
+                        try SessionExport.writeRaw(recording: source.url, from: from, length: source.length, to: url)
+                    } else {
+                        try SessionExport.writeText(recording: source?.url, from: from, length: source?.length, dropLast: 0, lines: lines, to: url)
                     }
                 } catch {
                     _ = await MainActor.run { NSAlert(error: error).runModal() }
@@ -76,25 +100,100 @@ enum SessionSave {
         }
     }
 
-    /// Keeps the file name's extension in step with the chosen format.
+    /// The panel's own choices — what to save and in which form — laid out as a small form, and
+    /// the file name kept in step with them.
     @MainActor
-    private final class FormatTarget: NSObject {
+    private final class Options: NSObject {
         let panel: NSSavePanel
-        let formats: [SessionExport.Format]
+        let available: [SaveSessionContents]
+        let hasRecording: Bool
+        let lastMarkInRecording: Bool
         let host: String
         let title: String
+        let contentsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        let formatPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        let note = NSTextField(wrappingLabelWithString: "")
+        let view: NSView
 
-        init(panel: NSSavePanel, formats: [SessionExport.Format], host: String, title: String) {
+        init(panel: NSSavePanel, available: [SaveSessionContents], hasRecording: Bool, lastMarkInRecording: Bool,
+             host: String, title: String) {
             self.panel = panel
-            self.formats = formats
+            self.available = available
+            self.hasRecording = hasRecording
+            self.lastMarkInRecording = lastMarkInRecording
             self.host = host
             self.title = title
+            contentsPopup.addItems(withTitles: available.map(\.title))
+            formatPopup.addItems(withTitles: SessionExport.Format.allCases.map(\.title))
+            formatPopup.autoenablesItems = false
+            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            note.textColor = .secondaryLabelColor
+            note.preferredMaxLayoutWidth = 380
+            let contentsLabel = NSTextField(labelWithString: "Contents:")
+            let formatLabel = NSTextField(labelWithString: "Format:")
+            let grid = NSGridView(views: [[contentsLabel, contentsPopup], [formatLabel, formatPopup], [NSGridCell.emptyContentView, note]])
+            grid.rowSpacing = 8
+            grid.columnSpacing = 8
+            grid.column(at: 0).xPlacement = .trailing
+            grid.rowAlignment = .firstBaseline
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            let container = NSView()
+            container.addSubview(grid)
+            NSLayoutConstraint.activate([
+                grid.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 20),
+                grid.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
+                grid.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+                grid.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+                grid.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+                contentsPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
+                formatPopup.widthAnchor.constraint(equalTo: contentsPopup.widthAnchor),
+            ])
+            container.frame.size = container.fittingSize
+            view = container
+            super.init()
+            contentsPopup.target = self
+            contentsPopup.action = #selector(changed)
+            formatPopup.target = self
+            formatPopup.action = #selector(changed)
         }
 
-        @objc func changed(_ sender: NSPopUpButton) {
-            let format = formats[max(0, sender.indexOfSelectedItem)]
-            let name = (panel.nameFieldStringValue as NSString).deletingPathExtension
+        var contents: SaveSessionContents { available[max(0, contentsPopup.indexOfSelectedItem)] }
+        var format: SessionExport.Format {
+            let f = SessionExport.Format.allCases[max(0, formatPopup.indexOfSelectedItem)]
+            return rawPossible ? f : .text
+        }
+
+        /// Raw output is the recording's own bytes: for the whole session, and for the last command
+        /// when the recording knows where it starts.
+        private var rawPossible: Bool {
+            switch contents {
+            case .whole: hasRecording
+            case .terminal: false
+            case .lastCommand: lastMarkInRecording
+            }
+        }
+
+        func select(contents: SaveSessionContents, format: SessionExport.Format) {
+            contentsPopup.selectItem(at: available.firstIndex(of: contents) ?? 0)
+            formatPopup.selectItem(at: SessionExport.Format.allCases.firstIndex(of: format) ?? 0)
+            update()
+        }
+
+        @objc private func changed(_ sender: NSPopUpButton) { update() }
+
+        private func update() {
+            formatPopup.item(at: SessionExport.Format.allCases.firstIndex(of: .raw) ?? 1)?.isEnabled = rawPossible
+            if !rawPossible { formatPopup.selectItem(at: SessionExport.Format.allCases.firstIndex(of: .text) ?? 0) }
+            note.stringValue = switch contents {
+            case .whole: hasRecording ? "Everything this session has shown since it started, from its recording, however long."
+                : "Nothing is recorded for this tab: what the terminal holds is all there is."
+            case .terminal: "The lines the terminal holds now (its scrollback and screen)."
+            case .lastCommand: "The last command run in this tab: its line and everything it printed."
+            }
+            var name = (SessionExport.suggestedName(host: host, title: title, format: format) as NSString).deletingPathExtension
+            if contents == .lastCommand { name += " - last command" }
             panel.nameFieldStringValue = name + "." + format.fileExtension
+            view.frame.size = view.fittingSize
         }
     }
 }

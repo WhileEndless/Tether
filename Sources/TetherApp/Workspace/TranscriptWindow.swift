@@ -23,7 +23,11 @@ struct TranscriptWindow: View {
     @State private var position: Double = 1
     @State private var fileSize: Int64 = 0
     @State private var reloadToken = 0
-    private let sliceBytes = 16 * 1024 * 1024
+    /// Shown at a time (Earlier / Later page through the rest): every line of it can be scrolled to.
+    /// 16 MB, or less when its lines would take more memory than a transcript may
+    /// (`ReadOnlyTerminalView.maxLines`): very short lines are many.
+    @State private var sliceBytes = 16 * 1024 * 1024
+    private static let maxSliceBytes = 16 * 1024 * 1024
 
     private var archived: ArchivedSession? {
         request.archiveID.flatMap { id in model.sessions.archive.first { $0.id == id } }
@@ -91,10 +95,24 @@ struct TranscriptWindow: View {
         .task(id: reloadToken) {
             guard let path else { return }
             let url = URL(fileURLWithPath: path)
-            fileSize = Int64((try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0)
             if reloadToken == 0 { position = request.revealText != nil ? request.revealFraction : 1 }
-            let target = position
-            let (d, local) = await Task.detached { RecordingStore.slice(of: url, around: target) }.value
+            let target = position, most = Self.maxSliceBytes
+            let maxLines = ReadOnlyTerminalView.maxLines(cols: 80)
+            // A long session's earlier output is in parts: they count (their names say how much they hold).
+            let (size, d, local, used) = await Task.detached {
+                let file = Int64((try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0)
+                let size = RecordingParts.parts(of: url).reduce(file) { $0 + Int64($1.length) }
+                var bytes = most
+                var (d, local) = RecordingStore.slice(of: url, around: target, maxBytes: bytes)
+                let lines = d.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
+                if lines > maxLines {
+                    bytes = max(Int(Double(bytes) * Double(maxLines) / Double(lines) * 0.9), 256 * 1024)
+                    (d, local) = RecordingStore.slice(of: url, around: target, maxBytes: bytes)
+                }
+                return (size, d, local, bytes)
+            }.value
+            fileSize = size
+            sliceBytes = used
             fraction = request.revealText != nil && reloadToken == 0 ? local : 0
             data = d
         }

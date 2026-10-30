@@ -66,4 +66,16 @@ import TestSupport
         let fileMode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
         #expect(dirMode == 0o700 && fileMode == 0o600)
     }
+
+    /// UseKeychain is only known to Apple's ssh: IgnoreUnknown lists it, added to what is there.
+    @Test func ignoreUnknownListsUseKeychain() {
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain(nil) == "UseKeychain")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("") == "UseKeychain")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("AddKeysToAgent") == "AddKeysToAgent,UseKeychain")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("usekeychain") == "usekeychain")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("Use*, Other") == "Use*,Other")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("*") == "*")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("!UseKeychain") == "!UseKeychain,UseKeychain")
+        #expect(KeySetup.ignoreUnknownAddingUseKeychain("Use.Keychain") == "Use.Keychain,UseKeychain", "a dot is not a wildcard")
+    }
 }

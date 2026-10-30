@@ -68,7 +68,7 @@ public final class PlatformCache: @unchecked Sendable {
         return platforms[key] != nil || devices.contains(key) || (access[key] ?? .automatic) != .automatic
     }
 
-    func markDevice(_ key: String) {
+    public func markDevice(_ key: String) {
         let isNew: Bool = lock.withLock { devices.insert(key).inserted }
         if isNew, let onDeviceDetected { DispatchQueue.main.async { onDeviceDetected(key) } }
     }
@@ -166,13 +166,12 @@ extension RemoteExecutor {
     /// then remembered as one — Tether sends it nothing but the terminal's login from then on.
     public func detectPlatform(quiet: Bool = false) async -> RemotePlatform? {
         if target.isLocal { return .posix }
-        // Wait for a login to this host in progress, shared connection or not: its host-key
-        // question is answered once, and known_hosts has the key when this ssh starts.
-        await ConnectionGate.shared.waitForTurn(target.key)
-        if quiet, !(await backgroundWorkAllowed()) { return nil }
-        guard let first = await ask(RemotePlatform.probeCommand, quiet: quiet) else { return nil }
+        // Through the shared connection (signing in once for the host when this may ask), or after
+        // a login in progress without sharing: its host-key question is answered once.
+        guard case .ready(let me) = await prepared(purpose: quiet ? "platform" : "connect") else { return nil }
+        guard let first = await me.ask(RemotePlatform.probeCommand, quiet: quiet) else { return nil }
         if let platform = RemotePlatform.parse(probeOutput: first) { return platform }
-        guard let second = await ask(ShellAccess.shellProbeCommand, quiet: quiet) else { return nil }
+        guard let second = await me.ask(ShellAccess.shellProbeCommand, quiet: quiet) else { return nil }
         if ShellAccess.answersShell(second) { return .posix }
         PlatformCache.shared.markDevice(target.key)
         return .posix
@@ -184,7 +183,7 @@ extension RemoteExecutor {
         let env = AskPassBridge.shared.environment(for: target.key, purpose: quiet ? "platform" : "connect")
         defer { AskPassBridge.shared.revoke(environment: env) }
         let r = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: Data(), timeout: 20)
-        if quiet { BackgroundSignIn.shared.noteQuietResult(target.key, status: r.status, stderr: r.errorOutput) }
+        if quiet, !options.usesSharedConnection { BackgroundSignIn.shared.noteQuietResult(target.key, status: r.status, stderr: r.errorOutput) }
         guard !r.timedOut, r.status != 255 else { return nil }
         return r.output + "\n" + r.errorOutput
     }
@@ -202,9 +201,14 @@ extension RemoteExecutor {
             if let extra { input.append(extra) }
             return (PowerShell.launcher, input)
         }
-        var input = Data(script.posix.utf8)
+        let quoted = arguments.map(\.shellQuoted)
+        // A long command line (thousands of file names) is refused by the server (Linux takes no
+        // single argument over 128 KB, and the login shell gets the command as one): the arguments
+        // are set at the top of the script instead, which comes on stdin.
+        let inline = quoted.reduce(0) { $0 + $1.utf8.count + 1 } < 32 << 10
+        var input = Data(((inline ? "" : "set -- " + quoted.joined(separator: " ") + "\n") + script.posix).utf8)
         if !script.posix.hasSuffix("\n") { input.append(0x0a) }
         if let extra { input.append(extra) }
-        return ((["sh", "-s", "--"] + arguments.map(\.shellQuoted)).joined(separator: " "), input)
+        return ((["sh", "-s", "--"] + (inline ? quoted : [])).joined(separator: " "), input)
     }
 }

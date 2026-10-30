@@ -55,7 +55,12 @@ import Testing
         driver.receive(Array("%begin 1 3 0\nnew 1\nnew 2\n%end 1 3 0\n".utf8))            // still not in it
         #expect(written.joined().contains("capture-pane -p -e -S -50000 -t %1"))
         #expect(!driver.ready)
+        written = []
         driver.receive(Array("%begin 1 4 0\nlast line seen here\nnew 1\n%end 1 4 0\n".utf8))
+        // Found: the same look once more with wrapped lines joined, for what is added.
+        #expect(written.joined().contains("capture-pane -p -e -J -S -50000 -t %1"))
+        #expect(!driver.ready)
+        driver.receive(Array("%begin 1 6 0\nlast line seen here\nnew 1\n%end 1 6 0\n".utf8))
         #expect(driver.ready)
     }
 }

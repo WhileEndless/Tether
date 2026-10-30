@@ -27,32 +27,29 @@ public enum SessionExport {
     /// its last lines that are still in memory and come with `lines`, then `lines`. With no
     /// recording, only `lines`. Where the two meet is found by content (`HistorySeam`); `dropLast`
     /// (the count of lines in memory) is used when it cannot be. `length` stops reading the
-    /// recording there (what it held when `lines` were taken).
-    public static func writeText(recording: URL?, length: Int? = nil, dropLast: Int, lines: [String], to url: URL,
+    /// recording there (what it held when `lines` were taken); `from` starts it there (a command's
+    /// place: its line and what came after).
+    public static func writeText(recording: URL?, from offset: Int = 0, length: Int? = nil, dropLast: Int, lines: [String], to url: URL,
                                  key: SymmetricKey? = RecordingCrypto.key) throws {
         try write(to: url) { out in
             if let recording {
-                // Lines are held back deep enough to find the seam, so none also in `lines` is written.
-                let depth = dropLast > 0 ? dropLast * 2 + HistorySeam.margin : 0
-                var held: [String] = []
-                var start = 0
+                // Lines are held back deep enough to find the seam (also where a program redrawing
+                // made the text much longer than memory), so none also in `lines` is written.
+                var held = SeamTail(hold: dropLast > 0 ? dropLast * 2 + HistorySeam.margin : 0, memoryHead: Array(lines.prefix(HistorySeam.starts)))
                 let text = ScreenText()
                 func take(_ new: [String]) throws {
                     for line in new {
-                        held.append(line)
-                        if held.count - start > depth {
-                            try out.write(contentsOf: Data((held[start] + "\n").utf8))
-                            start += 1
+                        try held.push(line) { item in
+                            try out.write(contentsOf: Data((item.line + "\n").utf8))
+                            return true
                         }
                     }
-                    // Keep the buffer small: drop what was written.
-                    if start > 4_096 { held.removeFirst(start); start = 0 }
                 }
-                try forEachChunk(of: recording, length: length, key: key) { chunk in
+                try forEachChunk(of: recording, from: offset, length: length, key: key) { chunk in
                     try take(text.feed(chunk))
                 }
                 try take(text.finish())
-                let tail = Array(held[start...])
+                let tail = held.rest.map(\.line)
                 let cut = dropLast > 0 ? HistorySeam.overlap(tail: tail, memoryHead: lines, expected: dropLast) : 0
                 for line in tail.dropLast(cut) { try out.write(contentsOf: Data((line + "\n").utf8)) }
             }
@@ -61,23 +58,26 @@ public enum SessionExport {
     }
 
     /// Writes the recording's bytes as received (decrypted and decompressed).
-    public static func writeRaw(recording: URL, length: Int? = nil, to url: URL, key: SymmetricKey? = RecordingCrypto.key) throws {
+    public static func writeRaw(recording: URL, from start: Int = 0, length: Int? = nil, to url: URL, key: SymmetricKey? = RecordingCrypto.key) throws {
         try write(to: url) { out in
-            try forEachChunk(of: recording, length: length, key: key) { chunk in
+            try forEachChunk(of: recording, from: start, length: length, key: key) { chunk in
                 try out.write(contentsOf: chunk)
             }
         }
     }
 
-    /// The recording's output in order, up to `length` bytes (all of it when nil).
-    private static func forEachChunk(of recording: URL, length: Int?, key: SymmetricKey?, _ body: (Data) throws -> Void) throws {
-        var left = length ?? Int.max
+    /// The recording's output in order, from byte `start` up to byte `length` (the end when nil).
+    private static func forEachChunk(of recording: URL, from start: Int = 0, length: Int?, key: SymmetricKey?, _ body: (Data) throws -> Void) throws {
+        var at = 0
+        let end = length ?? Int.max
         try RecordingReader.forEachChunk(of: recording, key: key) { chunk in
-            guard left > 0 else { return false }
-            let part = chunk.count > left ? chunk.prefix(left) : chunk
-            left -= part.count
-            try body(Data(part))
-            return left > 0
+            let chunkStart = at
+            at += chunk.count
+            guard chunkStart < end else { return false }
+            guard at > start else { return true }        // before the place asked for
+            let lower = max(start - chunkStart, 0), upper = min(end - chunkStart, chunk.count)
+            if upper > lower { try body(Data(chunk[chunk.startIndex + lower ..< chunk.startIndex + upper])) }
+            return at < end
         }
     }
 

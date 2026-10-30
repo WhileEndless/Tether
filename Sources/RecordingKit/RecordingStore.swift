@@ -38,7 +38,7 @@ public enum RecordingStore {
     static func markActive(_ url: URL) { lock.lock(); active.insert(url.path); lock.unlock() }
     static func markInactive(_ url: URL) { lock.lock(); active.remove(url.path); lock.unlock() }
     /// Whether a session is still writing this recording.
-    static func isActive(_ url: URL) -> Bool { lock.lock(); defer { lock.unlock() }; return active.contains(url.path) }
+    public static func isActive(_ url: URL) -> Bool { lock.lock(); defer { lock.unlock() }; return active.contains(url.path) }
 
     /// - Parameters:
     ///   - partMB: a recording still being written moves its output aside as a compressed part
@@ -48,22 +48,49 @@ public enum RecordingStore {
     public static func configure(quotaMB: Int, retentionDays days: Int, compressAfterDays compressDays: Int = 7,
                                  partMB: Int = 16, shortenLargestFirst: Bool = true) {
         lock.lock()
-        quotaBytes = Int64(max(quotaMB, 16)) * 1024 * 1024
-        retentionDays = max(days, 0)
-        compressAfterDays = max(compressDays, 0)
-        _partBytes = max(partMB, 0) * 1024 * 1024
+        let values = (Int64(max(quotaMB, 16)) * 1024 * 1024, max(days, 0), max(compressDays, 0), max(partMB, 0) * 1024 * 1024)
+        // Settings change for many reasons (every keystroke in a field): a pass only when these did.
+        let changed = !configured || values != (quotaBytes, retentionDays, compressAfterDays, _partBytes)
+            || shortenLargestFirst != shortenLargest
+        (quotaBytes, retentionDays, compressAfterDays, _partBytes) = values
         shortenLargest = shortenLargestFirst
+        configured = true
         lock.unlock()
-        requestQuotaEnforcement()
+        if changed { requestQuotaEnforcement() }
     }
+    nonisolated(unsafe) private static var configured = false
+    /// Folders a pass is already queued for: requests made meanwhile are covered by it.
+    nonisolated(unsafe) private static var queuedPasses = Set<String>()
 
     /// The file currently holding a recording: compression renames `x.ttylog` to `x.ttylog.lzfse`.
+    // MARK: Which secret rules a recording was masked with
+
+    /// For recordings no archived session refers to: the rules they were last looked through with
+    /// (a fingerprint, in an extended attribute of the file), so each is read only once per set of rules.
+    private static let redactionAttribute = "io.github.whileendless.tether.masked"
+
+    public static func redactionMark(of url: URL) -> String? {
+        let size = getxattr(url.path, redactionAttribute, nil, 0, 0, XATTR_NOFOLLOW)
+        guard size > 0, size < 256 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: size)
+        guard getxattr(url.path, redactionAttribute, &bytes, size, 0, XATTR_NOFOLLOW) == size else { return nil }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    public static func setRedactionMark(_ mark: String, on url: URL) {
+        let bytes = Array(mark.utf8)
+        _ = setxattr(url.path, redactionAttribute, bytes, bytes.count, 0, XATTR_NOFOLLOW)
+    }
+
     public static func resolve(_ path: String) -> URL? {
         let fm = FileManager.default
         if fm.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
         let compressed = path + "." + RecordingCompression.compressedExtension
         return fm.fileExists(atPath: compressed) ? URL(fileURLWithPath: compressed) : nil
     }
+
+    /// Recordings older than this many days are compressed (0: never).
+    static var compressionDays: Int { lock.withLock { compressAfterDays } }
 
     /// Compresses inactive recordings older than the configured number of days.
     @discardableResult
@@ -86,9 +113,27 @@ public enum RecordingStore {
         return _partBytes
     }
 
-    public static func requestQuotaEnforcement(in directory: URL = AppPaths.recordingsDirectory) {
-        queue.async { enforceQuota(in: directory) }
+    /// Asks for a maintenance pass (compression, encryption, the storage limit). Requests that come
+    /// while one is waiting to start are covered by it: busy recorders ask every few megabytes.
+    /// With `minimumGap`, the pass starts no sooner than that long after the previous one (a
+    /// recorder writing hundreds of megabytes a minute would otherwise list the folder every few seconds).
+    public static func requestQuotaEnforcement(in directory: URL = AppPaths.recordingsDirectory,
+                                               minimumGap: TimeInterval = 0) {
+        let delay: TimeInterval? = lock.withLock {
+            guard queuedPasses.insert(directory.path).inserted else { return nil }
+            let since = lastPass[directory.path].map { Date().timeIntervalSince($0) } ?? .infinity
+            return max(0, minimumGap - since)
+        }
+        guard let delay else { return }
+        queue.asyncAfter(deadline: .now() + delay) {
+            lock.withLock {
+                _ = queuedPasses.remove(directory.path)
+                lastPass[directory.path] = Date()
+            }
+            enforceQuota(in: directory)
+        }
     }
+    nonisolated(unsafe) private static var lastPass: [String: Date] = [:]
 
     /// Runs `work` on the maintenance queue, after (and never at the same time as) quota checks,
     /// compression and other passes, so two of them never rewrite the same recording at once.
@@ -153,8 +198,9 @@ public enum RecordingStore {
         lock.unlock()
         // Leftovers of an interrupted compression or encryption (possibly plain text) go first.
         removeStaleTemporaryFiles(in: directory, now: now)
-        // Compress first: it frees most of the space without losing anything.
-        if quota == nil { compressOld(in: directory, now: now) }
+        // Compressing waits until the Mac is idle (`IdleCompression`) — unless the limit is reached:
+        // then it comes first, as it frees most of the space without losing anything.
+        if quota == nil, all(in: directory).reduce(0, { $0 + $1.size }) > limit { compressOld(in: directory, now: now) }
         // Recordings follow the encryption switch once they are closed: those still open when it was
         // turned on are encrypted, those still open when it was turned off are decrypted (only while
         // Tether is unlocked, when the key is there).
@@ -181,7 +227,9 @@ public enum RecordingStore {
                 var item = items[i]
                 while total > limit, item.size > limit / 2, let oldest = item.parts.first {
                     let size = Int64((try? oldest.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-                    guard (try? fm.removeItem(at: oldest)) != nil else { break }
+                    // Under the lock readers take the list of parts with: a read in progress sees
+                    // the list change and reads again (positions after a removed part all shift).
+                    guard RecordingParts.rotation.withLock({ (try? fm.removeItem(at: oldest)) != nil }) else { break }
                     item.parts.removeFirst()
                     item.size -= size
                     total -= size
@@ -248,8 +296,27 @@ public enum RecordingStore {
         // Everything not really encrypted with this key, including output that merely starts like an
         // encrypted file (a server can print that). Recordings of a key that was reset are removed
         // (`RecordingCrypto.revoke`, `deleteEncrypted`), so none is left to be wrapped again.
-        files(in: directory).filter { !RecordingCrypto.isEncrypted($0, with: key) }
+        let id = RecordingCrypto.keyID(key)
+        return files(in: directory).filter { !isEncrypted($0, with: key, keyID: id) }
             .reduce(0) { $0 + (RecordingCrypto.encryptFile($1, key: key) ? 1 : 0) }
+    }
+
+    /// Files found encrypted with a key in an earlier pass, while unchanged (same size and date):
+    /// each pass would otherwise open every recording and check its header again.
+    nonisolated(unsafe) private static var encryptedFiles: [String: (size: Int, modified: Date, keyID: Data)] = [:]
+
+    private static func isEncrypted(_ url: URL, with key: SymmetricKey, keyID: Data) -> Bool {
+        guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = v.fileSize, let modified = v.contentModificationDate else { return RecordingCrypto.isEncrypted(url, with: key) }
+        if let seen = lock.withLock({ encryptedFiles[url.path] }), seen.size == size, seen.modified == modified, seen.keyID == keyID {
+            return true
+        }
+        guard RecordingCrypto.isEncrypted(url, with: key) else { return false }
+        lock.withLock {
+            if encryptedFiles.count > 20_000 { encryptedFiles.removeAll() }
+            encryptedFiles[url.path] = (size, modified, keyID)
+        }
+        return true
     }
 
     /// Decrypts every inactive recording the loaded key opens (when encryption is switched off).
@@ -276,8 +343,14 @@ public enum RecordingStore {
     }
 
     /// Whether any recording is encrypted with the key that has this id.
+    /// Stops at the first one (asked at launch and unlock: the whole list is not needed).
     public static func anyEncrypted(keyID: Data, in directory: URL = AppPaths.recordingsDirectory) -> Bool {
-        all(in: directory).contains { $0.files.contains { RecordingCrypto.keyID(of: $0) == keyID } }
+        guard let e = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else { return false }
+        for case let url as URL in e where url.pathExtension != "tmp" {
+            guard url.lastPathComponent.contains("." + fileExtension) else { continue }
+            if RecordingCrypto.keyID(of: url) == keyID { return true }
+        }
+        return false
     }
 
     /// Deletes every encrypted recording (its key is gone for good).

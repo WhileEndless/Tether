@@ -17,7 +17,9 @@ import TestSupport
     }
 
     @Test func streamProducesFrames() throws {
-        let out = try run(ProbeScripts.systemStream, ["1"], seconds: 5)
+        // A frame on a Mac takes over a second (`top` samples for one): long enough for two even
+        // while the rest of the tests keep the machine busy.
+        let out = try run(ProbeScripts.systemStream, ["1"], seconds: 9)
         let frames = out.components(separatedBy: "@@end\n").filter { !$0.isEmpty }
         #expect(frames.count >= 2, "output: \(out.prefix(400))")
         let snap = ProbeParser.system(frames.first ?? "", previous: nil)
@@ -31,6 +33,8 @@ import TestSupport
         #expect(snap.tools != nil)
         let second = ProbeParser.system(frames.dropFirst().first ?? "", previous: snap)
         #expect(second.tools == snap.tools)
+        // Disks are read every half minute in a stream: the frames between keep the first ones.
+        #expect(second.disks == snap.disks)
     }
 
     /// The command probe finds the processes below a shell and what they use. The tree runs inside
@@ -57,7 +61,7 @@ import TestSupport
         let frame = ProbeParser.command(out, anchor: .posix(pid: root))
         #expect(frame.problem == nil)
         #expect(frame.shellPid == root)
-        #expect(ProbeParser.command(try run(ProbeScripts.command, ["pid", "999999"], seconds: 5), anchor: .posix(pid: 999_999)).problem == .noShell)
+        #expect(ProbeParser.command(try run(ProbeScripts.command, ["pid", "999999"], seconds: 30), anchor: .posix(pid: 999_999)).problem == .noShell)
     }
 
     /// Two terminals (shells in panes of a private tmux server, never the user's): one watcher says
@@ -73,13 +77,19 @@ import TestSupport
         env.removeValue(forKey: "TMUX")
         env["TMUX_TMPDIR"] = dir.path
         env["PATH"] = URL(fileURLWithPath: tmux).deletingLastPathComponent().path + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        defer { BoundedProcess.run(tmux, ["kill-server"], environment: env, timeout: 10) }
+        let serverPid = dir.appendingPathComponent("server.pid")
+        defer {
+            PrivateTmux.killServer(in: dir)
+            // Also when kill-server could not reach it: the server this test started never stays.
+            if let text = try? String(contentsOf: serverPid, encoding: .utf8),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 { kill(pid, SIGKILL) }
+        }
         let watch = dir.appendingPathComponent("watch.sh")
         let look = dir.appendingPathComponent("look.sh")
         try ProbeScripts.commandWatch.write(to: watch, atomically: true, encoding: .utf8)
         try ProbeScripts.command.write(to: look, atomically: true, encoding: .utf8)
         let driver = """
-        tmux new-session -d -s a /bin/sh; tmux new-session -d -s b /bin/sh
+        tmux new-session -d -s a /bin/sh; tmux display -p '#{pid}' > '\(serverPid.path)'; tmux new-session -d -s b /bin/sh
         sleep 0.5
         A=$(tmux display -p -t a '#{pane_pid}'); B=$(tmux display -p -t b '#{pane_pid}')
         sh '\(watch.path)' -i 0.5 pid "$A" pid "$B" > '\(dir.path)/w.out' 2>&1 & W=$!
@@ -108,7 +118,8 @@ import TestSupport
 
     /// The traffic stream names its source first, then sends records until it is stopped.
     @Test func processTrafficStreams() throws {
-        let out = try run(ProbeScripts.processTraffic, ["1"], seconds: 4)
+        // Long enough for two records also on a busy Mac (the first look starts the tools).
+        let out = try run(ProbeScripts.processTraffic, ["1"], seconds: 10)
         let records = out.components(separatedBy: "@@end\n").filter { !$0.isEmpty }
         #expect(records.first?.hasPrefix("@@source\n") == true, "output: \(out.prefix(300))")
         #expect(records.count >= 2)
@@ -121,6 +132,33 @@ import TestSupport
         _ = try run(ProbeScripts.containers, [], seconds: 1)
         _ = try run(ProbeScripts.gpuProcesses, [], seconds: 1)
         _ = try run(ProbeScripts.listening, [], seconds: 3)
+    }
+
+    /// A level is chosen on the server: "Errors" brings the last errors of the whole log, not the
+    /// errors among its last lines.
+    @Test func logLevelsAreChosenOnTheServer() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("tether-log-\(UUID().uuidString.prefix(6)).log")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let lines = ["boot ok", "disk error on sda", "a warning about fans"] + (1...50).map { "routine line \($0)" }
+        try Data(lines.joined(separator: "\n").appending("\n").utf8).write(to: file)
+
+        func read(_ level: LogLevel) throws -> [String] {
+            let (script, args) = ProbeScripts.logs(.file(file.path), lines: 10, level: level)
+            return try run(script, args, seconds: 30).split(separator: "\n").map(String.init)
+        }
+        #expect(try read(.all) == (41...50).map { "routine line \($0)" })
+        #expect(try read(.errors) == ["disk error on sda"])
+        #expect(try read(.warnings) == ["disk error on sda", "a warning about fans"])
+    }
+
+    /// Every source and level parses (read only: `log show` on a Mac takes seconds).
+    @Test func logScriptsParse() {
+        for source in LogSource.allCases + [.file("/nonexistent")] {
+            for level in LogLevel.allCases {
+                let r = BoundedProcess.run("/bin/sh", ["-n"], input: ProbeScripts.logs(source, lines: 5, level: level).script + "\n", timeout: 30)
+                #expect(r.status == 0 && r.errorOutput.isEmpty, "\(source.title) \(level): \(r.errorOutput)")
+            }
+        }
     }
 
     /// tmux sessions on a private server (never the user's) show their panes' full command lines and the
@@ -169,9 +207,10 @@ import TestSupport
         env["XDG_DATA_HOME"] = dir.appendingPathComponent("data").path
         env["PATH"] = URL(fileURLWithPath: tmux).deletingLastPathComponent().path + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         func tmuxRun(_ args: [String]) {
+            guard FileManager.default.fileExists(atPath: dir.path) else { return }
             BoundedProcess.run(tmux, args, environment: env, timeout: 10)
         }
-        defer { tmuxRun(["kill-server"]) }
+        defer { PrivateTmux.killServer(in: dir) }
         let bin = dir.appendingPathComponent("bin").path
         tmuxRun(["new-session", "-d", "-s", "probe", "-c", dir.path, "sleep 300"])
         tmuxRun(["new-session", "-d", "-s", "agents", "-c", dir.appendingPathComponent("app").path, "\(bin)/claude"])

@@ -10,6 +10,9 @@ import TetherCore
 ///     ESC ] 7770 ; mode=screen BEL         GNU screen follows
 ///     ESC ] 7770 ; mode=plain;pid=123 BEL  a plain login shell (with this pid) follows
 ///     ESC ] 7770 ; gone BEL                re-attach requested but the session no longer exists
+///     ESC ] 7770 ; unreachable;why=… BEL   re-attach requested but tmux or screen could not be
+///                                          asked (not found, another version, its socket): the
+///                                          session may well still be there
 public enum RemoteBootstrap {
     /// The private OSC code of the marker.
     public static let markerCode = 7770
@@ -43,20 +46,32 @@ public enum RemoteBootstrap {
             "if [ \"$M\" = auto ] || [ \"$M\" = tmux ]; then if command -v tmux >/dev/null 2>&1; then "
                 + "V=$(tmux -V 2>/dev/null | sed 's/^[^0-9]*//;s/[^0-9.].*$//'); MAJ=${V%%.*}; "
                 + "if [ \"${MAJ:-0}\" -ge 3 ] 2>/dev/null; then "
-                + "if [ \"$A\" = 1 ] && ! tmux has-session -t \"=$N\" 2>/dev/null; then mark gone; exit 0; fi; "
+                // Gone only when tmux says so: it answers without the session, or no tmux server
+                // runs at all. A tmux that cannot be asked (another version after an upgrade, its
+                // socket) does not mean the session ended.
+                + "if [ \"$A\" = 1 ] && ! tmux has-session -t \"=$N\" 2>/dev/null; then "
+                + "E=$(tmux list-sessions 2>&1 >/dev/null); S=$?; "
+                + "case \"$S:$E\" in 0:*|*'no server running'*|*'error connecting to'*'No such file'*) mark gone ;; "
+                + "*) mark \"unreachable;why=tmux: $(printf %s \"$E\" | tr ';\\n\\007\\033' '    ' | cut -c1-160)\" ;; esac; exit 0; fi; "
                 + "mark \"mode=tmux;v=$V\"; "
+                // Tether's own sessions are never ended by tmux when Tether lets go of them (a
+                // `destroy-unattached on` in the user's tmux.conf): set on that session only.
+                + "case \"$N\" in tether-*) tmux set-option -t \"=$N:\" destroy-unattached off >/dev/null 2>&1 ;; esac; "
                 // A new session gets its history limit before its window exists (tmux applies the
                 // limit when a pane is created): start with a placeholder window, set the option on
                 // this session only, open the real window, drop the placeholder.
                 + "if ! tmux has-session -t \"=$N\" 2>/dev/null && [ \"${L:-0}\" -gt 0 ] 2>/dev/null "
                 + "&& tmux new-session -d -s \"$N\" -n tether-init -x \"$W\" -y \"$H\" 2>/dev/null; then "
                 + "tmux set-option -t \"=$N:\" history-limit \"$L\" >/dev/null 2>&1; "
+                + "tmux set-option -t \"=$N:\" destroy-unattached off >/dev/null 2>&1; "
                 + "if [ -n \"$D\" ]; then tmux new-window -t \"=$N:\" -c \"$D\" 2>/dev/null; else tmux new-window -t \"=$N:\" 2>/dev/null; fi "
                 + "&& tmux kill-window -t \"=$N:tether-init\" 2>/dev/null; "
                 + "exec tmux -CC attach-session -t \"=$N\"; fi; "
                 + "if [ -n \"$D\" ]; then exec tmux -CC new-session -A -s \"$N\" -x \"$W\" -y \"$H\" -c \"$D\"; fi; "
                 + "exec tmux -CC new-session -A -s \"$N\" -x \"$W\" -y \"$H\"; "
                 + "fi; fi; fi",
+            // Re-attaching to a tmux session, but no tmux 3 here (any more): not the same as gone.
+            "if [ \"$M\" = tmux ] && [ \"$A\" = 1 ]; then mark \"unreachable;why=tmux 3 or later was not found\"; exit 0; fi",
             // GNU screen with the alternate screen disabled so local scrollback keeps history
             "if [ \"$M\" = auto ] || [ \"$M\" = screen ]; then if command -v screen >/dev/null 2>&1; then "
                 + "if [ \"$A\" = 1 ] && ! screen -ls 2>/dev/null | grep -q \"[.]$N[[:space:]]\"; then mark gone; exit 0; fi; "
@@ -69,6 +84,7 @@ public enum RemoteBootstrap {
                 + "mark mode=screen; exec screen -c \"$R\" -D -RR -S \"$N\"; fi; "
                 + "mark mode=screen; exec screen -D -RR -S \"$N\"; "
                 + "fi; fi",
+            "if [ \"$M\" = screen ] && [ \"$A\" = 1 ]; then mark \"unreachable;why=GNU screen was not found\"; exit 0; fi",
             // Plain shell: nothing survives a disconnect, so a re-attach always reports gone.
             "if [ \"$A\" = 1 ]; then mark gone; exit 0; fi",
             // `exec` keeps the process id: $$ is the shell's pid (to find what runs in it).
@@ -86,11 +102,14 @@ public enum RemoteBootstrap {
         case screen
         case plain
         case gone
+        /// tmux or screen could not be asked about the session (see the type's notes).
+        case unreachable(String)
         case unknown(String)
 
         init(payload: String) {
             if payload == "gone" { self = .gone; return }
             let fields = Self.fields(payload)
+            if payload.hasPrefix("unreachable") { self = .unreachable(fields["why"] ?? "unknown"); return }
             switch fields["mode"] {
             case "tmux": self = .tmux(version: fields["v"] ?? "")
             case "screen": self = .screen

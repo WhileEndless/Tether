@@ -250,6 +250,7 @@ public enum SessionPhase: Equatable, Sendable {
     case dead(reason: String)
 
     public var isOnline: Bool { if case .online = self { true } else { false } }
+    public var isConnecting: Bool { self == .connecting }
     public var isSuspended: Bool { self == .suspended }
     public var isDead: Bool { if case .dead = self { true } else { false } }
     public var acceptsInput: Bool { isOnline }

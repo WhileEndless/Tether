@@ -11,6 +11,8 @@ final class TmuxDriver {
         case capture(info: TmuxPaneInfo, fullHistory: Bool)
         /// Output printed while disconnected: the last `rows` of history + the screen.
         case catchUp(info: TmuxPaneInfo, anchor: HistoryCatchUp.Anchor, rows: Int)
+        /// The same look again with wrapped lines joined: what is added comes as the lines they were.
+        case catchUpJoined(info: TmuxPaneInfo, anchor: HistoryCatchUp.Anchor, rows: [[UInt8]], resume: HistoryCatchUp.Resume)
         case activity
         case foreground
     }
@@ -36,6 +38,11 @@ final class TmuxDriver {
     var refresh: ([UInt8]) -> Void = { _ in }
     /// Called once the pane is known and the screen restored.
     var onReady: () -> Void = {}
+    /// What a re-attach did, for the Connection Log ("Added 120 lines printed while away").
+    var note: (String) -> Void = { _ in }
+    /// Called just before the driver clears the screen to draw the pane again (a re-attach): the
+    /// clear is Tether's, not the program's, so what was on screen stays in the scrollback.
+    var willRedraw: () -> Void = {}
     /// Called on %exit.
     var onExit: (String?) -> Void = { _ in }
     /// Reports the foreground command and working directory of the pane (for automatic tab titles)
@@ -75,8 +82,9 @@ final class TmuxDriver {
 
     /// Whether the session was created by Tether (only then are its options adjusted).
     private let ownSession: Bool
-    /// When the oldest unanswered activity request was sent (for stall detection and latency).
-    private(set) var activitySentAt: Date?
+    /// When the oldest unanswered activity request was sent (for stall detection and latency), in
+    /// system uptime: time the Mac slept does not count.
+    private(set) var activitySentAt: TimeInterval?
 
     init(version: String, isReattach: Bool, terminalIsEmpty: Bool, historyLines: Int, ownSession: Bool) {
         self.ownSession = ownSession
@@ -199,7 +207,7 @@ final class TmuxDriver {
             let text = success ? lines.first.map { String(decoding: $0, as: UTF8.self) } : nil
             if !foregroundQueries.isEmpty { foregroundQueries.removeFirst().continuation?.resume(returning: text) }
         case .activity:
-            let rtt = activitySentAt.map { Date().timeIntervalSince($0) } ?? 0
+            let rtt = activitySentAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0
             activitySentAt = nil
             guard success, let line = lines.first else { return }
             let text = String(decoding: line, as: UTF8.self)
@@ -217,11 +225,14 @@ final class TmuxDriver {
             markReady()
         case .catchUp(let info, let anchor, let rows):
             let plain = lines.map(HistoryCatchUp.plainText)
-            if success, let start = HistoryCatchUp.resumeIndex(captured: plain, anchor: anchor.lines) {
-                let out = HistoryCatchUp.output(captured: lines, from: start, anchorRow: anchor.lastRow,
-                                                height: info.height, cursor: (info.cursorX, info.cursorY))
-                display(out.stream)
-                refresh(out.redraw)
+            if success, let resume = HistoryCatchUp.resume(captured: plain, anchor: anchor.lines) {
+                // Something to add: asked once more with wrapped lines joined (one more round trip).
+                if resume.index < lines.count {
+                    send(TmuxCommands.capturePane(pane: info.paneID, historyLines: max(rows, 1), join: true),
+                         expect: .catchUpJoined(info: info, anchor: anchor, rows: lines, resume: resume))
+                    return
+                }
+                addCaughtUp(info: info, anchor: anchor, rows: lines, joined: nil, resume: resume)
             } else if success, let more = Self.nextCatchUp(after: rows, available: min(info.historySize, catchUpLimit)) {
                 // More was printed than this look covered: look further back, in steps.
                 send(TmuxCommands.capturePane(pane: info.paneID, historyLines: more, join: false),
@@ -229,19 +240,44 @@ final class TmuxDriver {
                 return
             } else if success, !lines.isEmpty {
                 // The last thing seen locally is gone from the server's history (cleared, or older than
-                // it keeps): add all it has, marked, rather than lose it.
-                let out = HistoryCatchUp.output(captured: lines, from: 0, anchorRow: anchor.lastRow,
+                // it keeps): add all it has, marked, rather than lose any of it.
+                let out = HistoryCatchUp.output(captured: lines, from: 0, anchorRow: anchor.lastRow, cursorRow: anchor.cursorRow,
                                                 height: info.height, cursor: (info.cursorX, info.cursorY),
                                                 notice: "[Tether] Output from the server while disconnected (earlier lines may repeat):")
                 display(out.stream)
                 refresh(out.redraw)
+                note("Re-attached: the last line seen was no longer in tmux's history; added all \(lines.count) lines it kept")
             } else {
+                if !success { note("Re-attached, but tmux did not send what was printed while away") }
                 restoreScreen(info: info, lines: [], fullHistory: false)
             }
             restoring = false
             bufferedOutput.removeAll() // the capture already contains this output
             markReady()
+        case .catchUpJoined(let info, let anchor, let rows, let resume):
+            addCaughtUp(info: info, anchor: anchor, rows: rows, joined: success ? lines : nil, resume: resume)
+            restoring = false
+            bufferedOutput.removeAll() // the capture already contains this output
+            markReady()
         }
+    }
+
+    /// Adds what was printed while away (from `resume` on): as the lines tmux joined when they
+    /// line up with its rows, row by row otherwise; then the screen as tmux has it.
+    private func addCaughtUp(info: TmuxPaneInfo, anchor: HistoryCatchUp.Anchor, rows lines: [[UInt8]],
+                             joined: [[UInt8]]?, resume: HistoryCatchUp.Resume) {
+        let plain = lines.map(HistoryCatchUp.plainText)
+        let tail = joined.flatMap { HistoryCatchUp.joinedLines(rows: plain, joined: $0, from: resume.index) }
+        let out = HistoryCatchUp.output(captured: tail ?? lines, from: tail == nil ? resume.index : 0, anchorRow: anchor.lastRow, cursorRow: anchor.cursorRow,
+                                        height: info.height, cursor: (info.cursorX, info.cursorY),
+                                        replacingAnchorRow: resume.replacesLastRow, screen: lines)
+        display(out.stream)
+        refresh(out.redraw)
+        // The screen's empty rows below the output are not lines that were printed.
+        let used = (plain.lastIndex { !$0.allSatisfy(\.isWhitespace) } ?? -1) + 1
+        let added = max(used - resume.index, 0)
+        note(added == 0 ? "Re-attached: nothing was printed while away"
+             : "Re-attached: added \(added) line\(added == 1 ? "" : "s") printed while away")
     }
 
     private func flushBuffered() {
@@ -292,6 +328,7 @@ final class TmuxDriver {
                 if i < lines.count - 1 { out += [0x0d, 0x0a] }
             }
         } else {
+            willRedraw()
             out += [esc] + Array("[H".utf8) + [esc] + Array("[2J".utf8)
             let visible = lines.suffix(info.height)
             for (i, line) in visible.enumerated() {
@@ -327,9 +364,10 @@ final class TmuxDriver {
         return await withCheckedContinuation { cont in
             foregroundQueries.append((id, cont))
             send("display-message -p -t \(paneID) '\(format)'\n", expect: .foreground)
-            Task { @MainActor [weak self] in
+            // Held until it has answered: a driver gone meanwhile must not leave its asker waiting.
+            Task { @MainActor in
                 try? await Task.sleep(for: timeout)
-                self?.expireQuery(id)
+                self.expireQuery(id)
             }
         }
     }
@@ -352,7 +390,7 @@ final class TmuxDriver {
     /// Asks tmux what is running in the pane. Cheap: answered from tmux's own state.
     func requestActivity() {
         guard ready, !exited, let paneID, activitySentAt == nil else { return }
-        activitySentAt = Date()
+        activitySentAt = ProcessInfo.processInfo.systemUptime
         send("display-message -p -t \(paneID) '#{pane_current_command}\t#{pane_current_path}'\n", expect: .activity)
     }
 

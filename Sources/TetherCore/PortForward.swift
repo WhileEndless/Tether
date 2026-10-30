@@ -78,6 +78,7 @@ public struct PortForward: Codable, Identifiable, Hashable, Sendable {
 public enum LocalPorts {
     /// True if nothing on this Mac is listening on `port` at `address` (default loopback).
     public static func isFree(_ port: Int, address: String = "") -> Bool {
+        guard (1...65535).contains(port) else { return false }
         let host = address.isEmpty || address == "localhost" ? "127.0.0.1" : address
         let fd = socket(host.contains(":") ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
@@ -85,7 +86,7 @@ public enum LocalPorts {
         if host.contains(":") {
             var addr = sockaddr_in6()
             addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_port = in_port_t(UInt16(port).bigEndian)
+            addr.sin6_port = in_port_t(UInt16(clamping: port).bigEndian)
             inet_pton(AF_INET6, host, &addr.sin6_addr)
             return withUnsafePointer(to: &addr) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0 }
@@ -93,7 +94,7 @@ public enum LocalPorts {
         }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(UInt16(port).bigEndian)
+        addr.sin_port = in_port_t(UInt16(clamping: port).bigEndian)
         inet_pton(AF_INET, host == "*" || host == "0.0.0.0" ? "0.0.0.0" : host, &addr.sin_addr)
         return withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 }

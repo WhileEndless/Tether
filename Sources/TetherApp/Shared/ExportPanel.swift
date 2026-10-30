@@ -1,5 +1,6 @@
 import AppKit
 import MonitorKit
+import TetherCore
 
 /// Saves exported monitoring data (command history, connections, traffic, problems) to a file the
 /// user picks, with a format menu when there is a choice. The folder and format are remembered;
@@ -16,10 +17,10 @@ enum ExportPanel {
         panel.prompt = "Export"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        if let path = UserDefaults.standard.string(forKey: directoryKey) {
+        if let path = AppPaths.defaults.string(forKey: directoryKey) {
             panel.directoryURL = URL(fileURLWithPath: path, isDirectory: true)
         }
-        var format = MonitorExport.Format(rawValue: UserDefaults.standard.string(forKey: formatKey) ?? "") ?? formats[0]
+        var format = MonitorExport.Format(rawValue: AppPaths.defaults.string(forKey: formatKey) ?? "") ?? formats[0]
         if !formats.contains(format) { format = formats[0] }
         let popup = NSPopUpButton(frame: .zero, pullsDown: false)
         let target = FormatTarget(panel: panel, formats: formats, baseName: baseName)
@@ -38,8 +39,8 @@ enum ExportPanel {
             _ = target   // kept alive while the panel is open
             guard response == .OK, let url = panel.url else { return }
             let chosen = formats.count > 1 ? formats[max(0, popup.indexOfSelectedItem)] : format
-            UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: directoryKey)
-            UserDefaults.standard.set(chosen.rawValue, forKey: formatKey)
+            AppPaths.defaults.set(url.deletingLastPathComponent().path, forKey: directoryKey)
+            AppPaths.defaults.set(chosen.rawValue, forKey: formatKey)
             Task.detached(priority: .utility) {
                 do {
                     try render(chosen).write(to: url, options: [.atomic])
@@ -61,12 +62,12 @@ enum ExportPanel {
         panel.title = title
         panel.prompt = "Save"
         panel.canCreateDirectories = true
-        if let path = UserDefaults.standard.string(forKey: directoryKey) {
+        if let path = AppPaths.defaults.string(forKey: directoryKey) {
             panel.directoryURL = URL(fileURLWithPath: path, isDirectory: true)
         }
         panel.nameFieldStringValue = (MonitorExport.suggestedName(baseName, format: .csv) as NSString).deletingPathExtension + ".txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        UserDefaults.standard.set(url.deletingLastPathComponent().path, forKey: directoryKey)
+        AppPaths.defaults.set(url.deletingLastPathComponent().path, forKey: directoryKey)
         do { try Data(text.utf8).write(to: url, options: [.atomic]) } catch { NSAlert(error: error).runModal() }
     }
 

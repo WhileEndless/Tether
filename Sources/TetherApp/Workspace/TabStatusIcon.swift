@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import TetherCore
 import SessionKit
 import MonitorKit
@@ -8,7 +9,8 @@ import MonitorKit
 /// 0. a login that needs your password (shown when you show the tab);
 /// 1. a coding agent waiting for you (plan approval, a question, a permission);
 /// 2. a program asking for attention (notification, bell);
-/// 3. a coding agent: its symbol, moving while it works;
+/// 3. a coding agent: its symbol, moving while it works; a container tool (Docker, Compose,
+///    Podman) likewise, saying what it does;
 /// 4. a command that is working (output, CPU, network or disk): a moving mark;
 /// 5. a command that is only open (vim, less, a quiet `tail -f`): nothing, or a faint dot;
 /// 6. otherwise the connection's state.
@@ -29,6 +31,7 @@ struct TabStatusIcon: View {
         case waiting(AgentKind, String)
         case attention(String)
         case agent(AgentKind, working: Bool)
+        case tool(ToolKind, working: Bool, doing: String?)
         case working(String)
         case quiet(String)
         case phase
@@ -44,6 +47,9 @@ struct TabStatusIcon: View {
         if let kind = model.agentKind(of: session) {
             let working = session.agent.map { $0.activity == .working } ?? (activity.isWorking)
             return .agent(kind, working: working)
+        }
+        if let tool = model.containerTool(of: session) {
+            return .tool(tool.kind, working: activity.isWorking, doing: tool.doing)
         }
         switch activity {
         case .working(let why): return .working(why)
@@ -71,18 +77,41 @@ struct TabStatusIcon: View {
                     .font(.system(size: size))
                     .foregroundStyle(.orange)
                     .help(help)
+            // Moving marks are animated by Core Animation (`AnimatedSymbol`): SwiftUI's looping
+            // symbol effects redraw the window on every frame while an agent works.
             case .agent(let kind, let working):
-                Image(systemName: kind.symbol)
-                    .font(.system(size: size, weight: .semibold))
-                    .foregroundStyle(Color(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue))
-                    .symbolEffect(.pulse, isActive: working && animates)
-                    .help(working ? "\(kind.title) is working" : kind.title)
+                if working && animates {
+                    AnimatedSymbol(systemName: kind.symbol, size: size, weight: .semibold,
+                                   color: NSColor(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue, alpha: 1), motion: .pulse)
+                        .help("\(kind.title) is working")
+                } else {
+                    Image(systemName: kind.symbol)
+                        .font(.system(size: size, weight: .semibold))
+                        .foregroundStyle(Color(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue))
+                        .help(working ? "\(kind.title) is working" : kind.title)
+                }
+            case .tool(let kind, let working, let doing):
+                let help = kind.title + (doing.map { " — \($0)" } ?? "") + (working ? " (working)" : "")
+                if working && animates {
+                    AnimatedSymbol(systemName: kind.symbol, size: size, weight: .semibold,
+                                   color: NSColor(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue, alpha: 1), motion: .pulse)
+                        .help(help)
+                } else {
+                    Image(systemName: kind.symbol)
+                        .font(.system(size: size, weight: .semibold))
+                        .foregroundStyle(Color(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue))
+                        .help(help)
+                }
             case .working(let why):
-                Image(systemName: "circle.dotted")
-                    .font(.system(size: size, weight: .bold))
-                    .foregroundStyle(Color.accentColor)
-                    .symbolEffect(.variableColor.iterative, isActive: animates)
-                    .help("\(commandName) is working — \(why)")
+                if animates {
+                    AnimatedSymbol(systemName: "circle.dotted", size: size, weight: .bold, color: .controlAccentColor, motion: .spin)
+                        .help("\(commandName) is working — \(why)")
+                } else {
+                    Image(systemName: "circle.dotted")
+                        .font(.system(size: size, weight: .bold))
+                        .foregroundStyle(Color.accentColor)
+                        .help("\(commandName) is working — \(why)")
+                }
             case .quiet(let name):
                 Circle().fill(Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
                     .help("\(name) is open, not doing anything")

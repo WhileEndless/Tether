@@ -484,6 +484,7 @@ struct HostChildren: View {
 /// "3 leftover sessions on the server" with a button that ends them.
 private struct LeftoverSessionsRow: View {
     @Environment(AppModel.self) private var model
+    @Environment(WindowState.self) private var state
     @Environment(\.sidebarLook) private var look
     let count: Int
     let target: ConnectionTarget
@@ -499,17 +500,13 @@ private struct LeftoverSessionsRow: View {
             if cleaning {
                 Image(systemName: "hourglass").uiFont(.caption).foregroundStyle(.secondary)
             } else {
-                Button("Clean Up") {
+                Button("Clean Up…") {
                     cleaning = true
-                    let open = Set(model.sessions.sessions(for: target.key).map(\.descriptor.remoteSessionName))
-                    Task {
-                        _ = await model.monitor(for: target).cleanUpOrphans(keeping: open)
-                        cleaning = false
-                    }
+                    state.cleanUpLeftovers(on: target) { cleaning = false }
                 }
                 .buttonStyle(.borderless)
                 .uiFont(.caption)
-                .help("End the Tether sessions on this server that are not open in any tab (your own tmux sessions are not touched)")
+                .help("Open as tabs, or end, the Tether sessions on this server that are not open in any tab (asks first; your own tmux sessions are not touched)")
             }
         }
         .padding(.leading, look.childIndent + 4)
@@ -540,8 +537,8 @@ private struct FoldRow: View {
 @Observable
 final class SidebarFolding {
     static let shared = SidebarFolding()
-    var collapsed: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "sidebar.collapsedHosts") ?? []) {
-        didSet { UserDefaults.standard.set(Array(collapsed), forKey: "sidebar.collapsedHosts") }
+    var collapsed: Set<String> = Set(AppPaths.defaults.stringArray(forKey: "sidebar.collapsedHosts") ?? []) {
+        didSet { AppPaths.defaults.set(Array(collapsed), forKey: "sidebar.collapsedHosts") }
     }
     var expanded: Set<String> = []
 
@@ -852,7 +849,7 @@ private struct SidebarBottomBar: View {
 
             if let update = Updater.shared.available {
                 Button {
-                    NSWorkspace.shared.open(update.page)
+                    Updater.shared.showWindow()
                 } label: {
                     Text("Update")
                         .uiFont(.caption2, weight: .semibold)
@@ -862,7 +859,9 @@ private struct SidebarBottomBar: View {
                         .fixedSize()
                 }
                 .buttonStyle(.plain)
-                .help("Tether \(update.version) is available — open the release page")
+                .help(Updater.shared.isReady ? "Tether \(update.version) is ready — restart to install it"
+                      : Updater.shared.isPreparing ? "Tether \(update.version) is being prepared in the background"
+                      : "Tether \(update.version) is available")
             }
             Button {
                 openWindow(id: "about")
@@ -1063,7 +1062,10 @@ struct SessionRow: View {
                         .lineLimit(1)
                         .foregroundStyle(session.phase.isDead || elsewhere != nil || (inBackground && !look.extras) ? .secondary : .primary)
                     if let elsewhere { OtherWindowBadge(name: elsewhere) }
-                    if inBackground && !session.phase.isSuspended && look.extras {
+                    if session.endWhenConnected {
+                        Text("Ends when connected").uiFont(.caption2).foregroundStyle(.orange)
+                            .help("Tether ends this session on the server as soon as it can reach it. Open it in a tab, or choose Don't End, to keep it.")
+                    } else if inBackground && !session.phase.isSuspended && look.extras {
                         Text("background").uiFont(.caption2).foregroundStyle(.secondary)
                     }
                     if let c = session.descriptor.color.color, look.style != .minimal {
@@ -1207,6 +1209,9 @@ struct SessionContextMenu: View {
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
         Button(session.phase.isSuspended ? "Reconnect" : inBackground ? "Open in Tab" : "Show") { state.show(session) }
+        if session.endWhenConnected {
+            Button("Don't End") { model.sessions.keepRunning(session.id) }
+        }
         if let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID) {
             Button("Move from \(elsewhere) to This Window") {
                 let source = model.workspaces.workspace(containing: session.id)
@@ -1225,7 +1230,7 @@ struct SessionContextMenu: View {
         SessionSortMenu()
         Button("New Session to Same Host") { state.newSession(like: session) }
         if case .waiting = session.phase {
-            Button("Reconnect Now") { session.reconnectNow() }
+            Button("Reconnect Now") { AppModel.shared.sessions.retryNow(session) }
         }
         Divider()
         if !inBackground {

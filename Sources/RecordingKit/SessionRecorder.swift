@@ -76,31 +76,85 @@ public final class SessionRecorder: @unchecked Sendable {
         nextPart = (parts.last?.number ?? 0) + 1
         handle = h
         RecordingStore.markActive(url)
+        // What it held so far is indexed by reading it once, in the background; what comes now is
+        // added after it (the queue runs in order).
+        indexReady = false
+        queue.async { [self] in
+            let built = RecordingIndex.build(url, key: loaded) { [stopIndexing] in stopIndexing.withLock { $0 } }
+            indexLock.withLock {
+                _index = built
+                indexReady = true
+            }
+        }
     }
 
     private var flushScheduled = false
 
     /// Output is kept in memory and written in large, infrequent batches — when 512 KB have
-    /// accumulated or 15 s after the first unwritten byte — so a busy terminal (e.g. `tail -f`)
-    /// does not cause a stream of small writes that wear the SSD. Readers that need the file to be
-    /// current (search, scrolling into older history) call `flushNow()` first; closing flushes too.
-    /// At most 15 s of output is only in memory, and the terminal shows it anyway.
+    /// accumulated, or `batchInterval` after the first unwritten byte — so a busy terminal (e.g.
+    /// `tail -f`) does not cause a stream of small writes that wear the SSD. Readers that need
+    /// everything read what is still in memory with the file (`snapshot`) instead of writing early;
+    /// closing, a lost connection and sleep write at once. What is only in memory the terminal
+    /// shows anyway.
     public static let batchBytes = 512 * 1024
-    public static let batchInterval: TimeInterval = 15
+    /// For output nothing else keeps (a plain or local shell, a Windows host).
+    public static let batchInterval: TimeInterval = 30
+    /// For output the server keeps too (tmux, screen): it is in their history if Tether stops
+    /// before writing it, so it may wait longer.
+    public static let keptOnServerInterval: TimeInterval = 300
+    private var interval = SessionRecorder.batchInterval
+
+    /// How long output may wait in memory (see `batchInterval`, `keptOnServerInterval`).
+    public func setBatchInterval(_ seconds: TimeInterval) {
+        queue.async { [self] in interval = seconds }
+    }
 
     public func append(_ bytes: some Sequence<UInt8>) {
         let data = Data(bytes)
         queue.async { [self] in
+            indexLock.withLock { _index.add(data) }
             pending.append(data)
             if pending.count >= Self.batchBytes {
                 flushLocked()
             } else if !flushScheduled {
-                flushScheduled = true
-                queue.asyncAfter(deadline: .now() + Self.batchInterval) { [self] in
-                    flushScheduled = false
-                    flushLocked()
-                }
+                scheduleFlush(in: DispatchTime.now() < briskUntil ? min(interval, briskInterval) : interval)
             }
+        }
+    }
+
+    /// When the scheduled write is due (nil: none).
+    private var flushDue: DispatchTime?
+    private var flushGeneration = 0
+
+    private func scheduleFlush(in seconds: TimeInterval) {
+        flushScheduled = true
+        flushGeneration += 1
+        let generation = flushGeneration
+        let due = DispatchTime.now() + seconds
+        flushDue = due
+        queue.asyncAfter(deadline: due) { [self] in
+            guard generation == flushGeneration else { return }    // replaced by an earlier one
+            flushScheduled = false
+            flushDue = nil
+            flushLocked()
+        }
+    }
+
+    /// Until then, output waits at most `briskInterval` (see `writeSoon`).
+    private var briskUntil = DispatchTime(uptimeNanoseconds: 0)
+    private var briskInterval: TimeInterval = 5
+
+    /// For the next `window` seconds output waits at most `seconds` instead of the usual interval
+    /// (still one write for everything that came meanwhile): after a command in a shell nothing else
+    /// keeps (a plain or local shell, Windows), so a crash loses little of what it printed.
+    public func writeSoon(within seconds: TimeInterval, for window: TimeInterval = 60) {
+        queue.async { [self] in
+            briskInterval = seconds
+            briskUntil = .now() + window
+            // Nothing waits and nothing is due: the next output is written soon by itself (`append`).
+            guard !pending.isEmpty || flushScheduled else { return }
+            if let due = flushDue, due <= .now() + seconds { return }
+            scheduleFlush(in: seconds)
         }
     }
 
@@ -109,8 +163,62 @@ public final class SessionRecorder: @unchecked Sendable {
         append(Self.markerBytes(text))
     }
 
+    /// The user ran a command on the line being written: noted in the index and, invisibly, in the
+    /// recording (`RecordingIndex.markBytes`), with the time.
+    /// `column`: where typing started on the command's line (after the prompt), when known.
+    /// `up`: lines above the cursor's where the command is (one typed ahead, shown since).
+    public func markCommand(at when: Date = Date(), column: Int? = nil, up: Int = 0) {
+        // To the millisecond, as the recording keeps it (the time also names the command).
+        let time = Date(timeIntervalSince1970: (when.timeIntervalSince1970 * 1000).rounded() / 1000)
+        let bytes = RecordingIndex.markBytes(at: time, column: column, up: up)
+        queue.async { [self] in
+            indexLock.withLock {
+                _index.addMark(at: time, column: column, up: up)
+                _index.add(bytes)
+            }
+            pending.append(contentsOf: bytes)
+        }
+    }
+
+    /// Where lines and commands are in this recording, as written so far (or about to be).
+    /// While a continued recording is still being indexed: one that says it is not exact.
+    public var index: RecordingIndex {
+        indexLock.withLock {
+            guard indexReady else { var unknown = RecordingIndex(); unknown.lostOutput(); return unknown }
+            return _index
+        }
+    }
+    private let indexLock = NSLock()
+    /// Set when the recording closes while a continued recording is still being indexed: closing
+    /// (quitting, a tab closing) does not wait for that.
+    private let stopIndexing = Locked(false)
+    private var _index = RecordingIndex()
+    private var indexReady = true
+
     public func flush() {
         queue.async { [self] in flushLocked() }
+    }
+
+    /// Writes everything buffered, then runs `reader` in the background with how many bytes of
+    /// output the recording holds at that moment: for readers that need the file current without
+    /// waiting for the disk on their own thread (the main thread). Output appended after the call
+    /// is not in that length, so a reader can stop exactly there while the session goes on.
+    public func flush(then reader: @escaping @Sendable (Int) -> Void) {
+        queue.async { [self] in
+            flushLocked()
+            let length = RecordingParts.rotation.withLock { RecordingParts.parts(of: url).reduce(0) { $0 + $1.length } } + fileWritten
+            DispatchQueue.global(qos: .userInitiated).async { reader(length) }
+        }
+    }
+
+    /// Runs `reader` in the background with the recording as it is now — what is on disk and what
+    /// is still kept in memory — without writing anything early (`RecordingSnapshot`).
+    public func snapshot(then reader: @escaping @Sendable (RecordingSnapshot) -> Void) {
+        queue.async { [self] in
+            let written = RecordingParts.rotation.withLock { RecordingParts.parts(of: url).reduce(0) { $0 + $1.length } } + fileWritten
+            let snapshot = RecordingSnapshot(url: url, written: written, pending: pending)
+            DispatchQueue.global(qos: .userInitiated).async { reader(snapshot) }
+        }
     }
 
     /// Writes everything buffered before returning (for readers of the file).
@@ -157,7 +265,7 @@ public final class SessionRecorder: @unchecked Sendable {
         guard !pending.isEmpty else { return }
         if handle == nil, !closed, let failed = failedAt, Date().timeIntervalSince(failed) > 30 { retryLocked() }
         guard handle != nil else {
-            if failedAt != nil { lostBytes += pending.count }
+            if failedAt != nil { lostBytes += pending.count; indexLock.withLock { _index.lostOutput() } }
             pending.removeAll()
             return
         }
@@ -169,6 +277,7 @@ public final class SessionRecorder: @unchecked Sendable {
             handle = nil
             failedAt = Date()
             lostBytes += pending.count
+            indexLock.withLock { _index.lostOutput() }
             pending.removeAll()
             return
         }
@@ -178,7 +287,7 @@ public final class SessionRecorder: @unchecked Sendable {
         if partBytes > 0, fileWritten >= partBytes { startPartLocked() }
         if bytesSinceQuotaCheck >= quotaCheckInterval {
             bytesSinceQuotaCheck = 0
-            RecordingStore.requestQuotaEnforcement(in: directory)
+            RecordingStore.requestQuotaEnforcement(in: directory, minimumGap: 60)
         }
     }
 
@@ -281,6 +390,7 @@ public final class SessionRecorder: @unchecked Sendable {
         handle = h
         sealer = file.sealer
         nextFrame = 0
+        indexLock.withLock { _index.addPart(length: fileWritten) }
         fileWritten = 0
         nextPart += 1
         RecordingStore.requestQuotaEnforcement(in: directory)                             // compresses the new part
@@ -288,6 +398,7 @@ public final class SessionRecorder: @unchecked Sendable {
 
     /// Throws the recording away (a terminal closed without anything done in it).
     public func discard() {
+        stopIndexing.withLock { $0 = true }
         queue.sync {
             closed = true
             pending.removeAll()
@@ -299,6 +410,7 @@ public final class SessionRecorder: @unchecked Sendable {
     }
 
     public func close() {
+        stopIndexing.withLock { $0 = true }
         queue.sync {
             flushLocked()
             closed = true

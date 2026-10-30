@@ -3,6 +3,8 @@ import CryptoKit
 import LocalAuthentication
 import Observation
 import RecordingKit
+import TerminalUI
+import SSHTransport
 import TetherCore
 
 /// Optional lock for the whole app (Settings ▸ Security ▸ App Lock).
@@ -67,9 +69,13 @@ final class AppLock {
     func unlockWithSystem() async {
         guard isLocked, canUseSystemUnlock, !unlocking, !screenAway else { return }
         // With a Tether password, Touch ID needs the keychain copy of the very same key.
-        let key = mode == .password ? RecordingKeyStore.keychainCopyOfPasswordKey() : RecordingKeyStore.trustedStoredKey()
-        if mode == .password && key == nil { return }
         unlocking = true
+        // The keychain and the recordings' headers are read in the background.
+        let password = mode == .password
+        let key = await Task.detached(priority: .userInitiated) {
+            password ? RecordingKeyStore.keychainCopyOfPasswordKey() : RecordingKeyStore.trustedStoredKey()
+        }.value
+        if password && key == nil { unlocking = false; return }
         defer { unlocking = false }
         let ctx = LAContext()
         var error: NSError?
@@ -98,6 +104,7 @@ final class AppLock {
     }
 
     private func didUnlock(key: SymmetricKey?) {
+        ConnectionLog.shared.info("Tether was unlocked", .app)
         failures = 0
         retryAfter = nil
         installKey(key)
@@ -122,11 +129,13 @@ final class AppLock {
 
     func lock() {
         guard mode != .off, !isLocked else { return }
+        ConnectionLog.shared.info("Tether was locked", .app, detail: "Tabs keep running; their earlier output and remembered passwords are let go")
         isLocked = true
         RecordingCrypto.key = nil          // open recorders keep writing with their own copy
         SecretGate.shared.lock()
-        AppModel.shared.transientPasswords.removeAll()
-        AppModel.shared.recentPasswords.removeAll()
+        AppModel.shared.quickConnectPasswords.removeAll()
+        AppModel.shared.passwordCache.removeAll()
+        TerminalRegistry.shared.releaseEarlierOutput()
         AskPassPanel.shared.update(nil)
         // Sheets show the lock screen themselves (`appLockCover`), so Tether can be unlocked from
         // them too and nothing behind them gets the keyboard. Rename prompts are closed.

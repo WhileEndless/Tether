@@ -48,8 +48,8 @@ public struct TerminalTheme {
     static func fromProfile(_ p: TerminalAppProfile, fallback: TerminalTheme) -> TerminalTheme {
         let ansi = p.ansi.enumerated().map { i, c -> SwiftTerm.Color in
             guard let c else { return fallback.ansi[i] }
-            return SwiftTerm.Color(red: UInt16(c.redComponent * 65535), green: UInt16(c.greenComponent * 65535),
-                                   blue: UInt16(c.blueComponent * 65535))
+            func channel(_ v: CGFloat) -> UInt16 { UInt16((min(max(v, 0), 1) * 65535).rounded()) }
+            return SwiftTerm.Color(red: channel(c.redComponent), green: channel(c.greenComponent), blue: channel(c.blueComponent))
         }
         var background = p.background ?? fallback.background
         if background.alphaComponent >= 0.85 { background = background.withAlphaComponent(1) }

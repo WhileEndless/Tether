@@ -40,6 +40,36 @@ Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue |
 }
 """#
 
+    /// The file manager's search: the resolved folder, then the matches in the listing's format
+    /// with paths relative to it. Arguments: folder, mode, (POSIX pattern), pattern for -like,
+    /// hidden (1/0), limit. Hidden items (a name starting with a dot, or the Hidden attribute) and
+    /// what is inside hidden folders are left out unless asked; stops after the limit.
+    static let search = pathHelper + #"""
+$p = WinPath $A[0]
+try { $item = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch { [Console]::Error.WriteLine("Cannot open directory: $($A[0])"); exit 1 }
+$root = $item.FullName.TrimEnd('\', '/')
+Slash $item.FullName
+$mode = $A[1]; $pat = $A[3]; $hidden = $A[4] -eq '1'; $max = [int]$A[5] + 1
+function Visible($f) {
+  if ($hidden) { return $true }
+  $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/')
+  if (($rel -split '[\\/]') | Where-Object { $_ -like '.*' }) { return $false }
+  return -not ($f.Attributes -band [IO.FileAttributes]::Hidden)
+}
+Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+  (Visible $_) -and $(if ($mode -eq 'content') {
+    (-not $_.PSIsContainer) -and $_.Length -lt 20MB -and (Select-String -LiteralPath $_.FullName -SimpleMatch -Pattern $pat -Quiet -ErrorAction SilentlyContinue)
+  } else { $_.Name -like $pat })
+} | Select-Object -First $max | ForEach-Object {
+  $kind = if ($_.LinkType) { 'l' } elseif ($_.PSIsContainer) { 'd' } else { 'f' }
+  $bits = if ($_.PSIsContainer) { '755' } elseif ($_.IsReadOnly) { '444' } else { '644' }
+  $size = if ($_.PSIsContainer) { 0 } else { $_.Length }
+  $target = if ($_.LinkType) { ($_.Target | Select-Object -First 1) -replace '\\', '/' } else { '' }
+  $rel = $_.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+  "$kind`t$bits`t-`t-`t$size`t$(Epoch $_.LastWriteTime)`t$target`t$rel"
+}
+"""#
+
     /// First line: the resolved folder. Then one free name per wanted name (`name-1.ext`, …).
     static let uniqueNames = pathHelper + #"""
 $d = WinPath $A[0]
@@ -47,10 +77,9 @@ try { New-Item -ItemType Directory -Force -Path $d -ErrorAction Stop | Out-Null 
 $d = (Get-Item -LiteralPath $d -Force).FullName
 Slash $d
 $taken = @{}
-foreach ($n in ($A | Select-Object -Skip 1)) {
-  $base = $n; $ext = ''
-  $dot = $n.LastIndexOf('.')
-  if ($dot -gt 0) { $base = $n.Substring(0, $dot); $ext = $n.Substring($dot) }
+# name, the part before the number, the extension after it — for each wanted name.
+for ($k = 1; $k + 2 -le $A.Count - 1; $k += 3) {
+  $n = $A[$k]; $base = $A[$k + 1]; $ext = $A[$k + 2]
   $c = $n; $i = 1
   while ((Test-Path -LiteralPath (Join-Path $d $c)) -or $taken.ContainsKey($c.ToLower())) { $c = "$base-$i$ext"; $i++ }
   $taken[$c.ToLower()] = 1
@@ -82,6 +111,33 @@ foreach ($p in ($A | Select-Object -Skip 2)) {
   if (Test-Path -LiteralPath $dst) { $n; continue }
   if ($A[0] -eq 'Move-Item') { Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop }
   else { Copy-Item -LiteralPath $src -Destination $dst -Recurse -ErrorAction Stop }
+}
+"""#
+
+    /// `$A[0]` = 1 to move, `$A[1]` = folder, rest = paths. Free names (`name-1.ext`), never into
+    /// itself, printed one per line (as the POSIX `pasteScript`).
+    static let paste = pathHelper + #"""
+$move = $A[0] -eq '1'
+$d = WinPath $A[1]
+if (-not (Test-Path -LiteralPath $d -PathType Container)) { [Console]::Error.WriteLine("Cannot write to $($A[1])"); exit 1 }
+$dFull = (Get-Item -LiteralPath $d -Force).FullName.TrimEnd('\') + '\'
+$taken = @{}
+foreach ($p in ($A | Select-Object -Skip 2)) {
+  $src = WinPath $p
+  if (-not (Test-Path -LiteralPath $src)) { [Console]::Error.WriteLine("$p is no longer there"); exit 1 }
+  $item = Get-Item -LiteralPath $src -Force
+  $n = $item.Name
+  if ($move -and ($item.FullName | Split-Path -Parent).TrimEnd('\') + '\' -eq $dFull) { $n; continue }
+  if ($dFull.StartsWith($item.FullName.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { [Console]::Error.WriteLine("$n cannot be put into itself"); exit 1 }
+  $base = $n; $ext = ''
+  if ($n.LastIndexOf('.') -gt 0) { $base = $n.Substring(0, $n.LastIndexOf('.')); $ext = $n.Substring($n.LastIndexOf('.')) }
+  $c = $n; $i = 1
+  while ((Test-Path -LiteralPath (Join-Path $d $c)) -or $taken.ContainsKey($c.ToLower())) { $c = "$base-$i$ext"; $i++ }
+  $taken[$c.ToLower()] = $true
+  $dst = Join-Path $d $c
+  if ($move) { Move-Item -LiteralPath $src -Destination $dst -ErrorAction Stop }
+  else { Copy-Item -LiteralPath $src -Destination $dst -Recurse -ErrorAction Stop }
+  $c
 }
 """#
 

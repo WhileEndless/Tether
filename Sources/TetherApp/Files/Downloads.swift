@@ -37,38 +37,23 @@ extension AppModel {
 
     /// Downloads remote items into a local folder without replacing anything there (Finder-style
     /// "name 2" names). Many files travel as one packed stream (see Settings ▸ Transfers).
-    /// `completion` gets the local items that arrived and how many failed.
+    /// `completion` gets the local items that arrived and how many failed (not called when the
+    /// count before the download was cancelled: nothing was sent).
     func downloadRemote(_ items: [RemoteFile], from target: ConnectionTarget, to local: URL,
                         completion: @escaping ([URL], Int) -> Void) {
-        guard !items.isEmpty else { return }
-        let names = LocalFiles.uniqueNames(in: local, for: items.map(\.name))
-        let parents = Set(items.map { ($0.path as NSString).deletingLastPathComponent })
-        let fs = RemoteFileSystem(executor: executor(for: target))
-        let transfers = self.transfers
-        Task {
-            // Only folders need counting; plain files are counted as they are.
-            var size = TransferSize(files: items.count, bytes: items.reduce(0) { $0 + $1.size })
-            if items.contains(where: \.isDirectory), transfers.policy.archiveMode != .never {
-                size = (try? await fs.measure(items.map(\.path))) ?? size
-            }
-            let finish: ([TransferItem]) -> Void = { made in
-                let ok = made.filter { $0.state == .completed }
-                let urls = ok.flatMap { $0.entries.map { URL(fileURLWithPath: $0.to) } }
-                completion(urls, made.count - ok.count)
-            }
-            if parents.count == 1, let parent = parents.first {
-                transfers.downloadGroup(items.map(\.name), from: parent, to: local, as: names, target: target,
-                                        fileCount: size.files, totalBytes: size.bytes, completion: finish)
-            } else {
-                var made: [TransferItem] = []
-                var remaining = items.count
-                for (f, name) in zip(items, names) {
-                    made.append(transfers.download(f.path, to: local.appendingPathComponent(name), target: target) { _ in
-                        remaining -= 1
-                        if remaining == 0 { finish(made) }
-                    })
-                }
-            }
+        downloadRemoteItems(items, from: target, to: local) { outcome in
+            guard let outcome else { return }
+            completion(Array(outcome.arrived.values), outcome.failed)
         }
+    }
+
+    typealias DownloadOutcome = TransferManager.DownloadOutcome
+
+    /// The one way several remote items are downloaded (the Download command, ⌘C, Download All,
+    /// a drag to Finder): see `TransferManager.downloadItems`.
+    func downloadRemoteItems(_ items: [RemoteFile], from target: ConnectionTarget, to local: URL,
+                             completion: @escaping (DownloadOutcome?) -> Void) {
+        transfers.downloadItems(items, from: target, to: local, fs: RemoteFileSystem(executor: executor(for: target)),
+                                completion: completion)
     }
 }

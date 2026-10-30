@@ -59,6 +59,34 @@ import Testing
         recorder.close()
     }
 
+    /// The last command alone: from its place in the recording (its mark) to the moment of saving,
+    /// as text (its line and what it printed) and raw — also across the recording's parts, and
+    /// with what came after the save left out.
+    @Test func theLastCommandIsSavedFromItsPlace() throws {
+        let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let recorder = SessionRecorder(targetKey: "host", sessionID: UUID(), directory: dir, key: key)!
+        recorder.partBytes = 4_096        // several parts before the command
+        for i in 1...600 { recorder.append(Array("old \(i)\r\n".utf8)) }
+        recorder.append(Array("$ ls".utf8))
+        recorder.markCommand(at: Date())
+        recorder.append(Array("\r\nfile-a\r\nfile-b\r\n$ ".utf8))
+        let length = recorder.flushedLength()
+        recorder.append(Array("later\r\n".utf8))             // after the save
+        recorder.flushNow()
+        let index = recorder.index
+        let mark = try #require(index.marks.last)
+        let base = index.partLengths.isEmpty ? 0 : index.removedLength(firstPart: RecordingParts.parts(of: recorder.url).first?.number)
+        let out = dir.appendingPathComponent("last.txt")
+        try SessionExport.writeText(recording: recorder.url, from: mark.offset - base, length: length, dropLast: 0, lines: [], to: out, key: key)
+        let text = try String(contentsOf: out, encoding: .utf8).split(separator: "\n").map(String.init)
+        #expect(text == ["$ ls", "file-a", "file-b", "$"], "\(text)")
+        let raw = dir.appendingPathComponent("last.log")
+        try SessionExport.writeRaw(recording: recorder.url, from: mark.offset - base, length: length, to: raw, key: key)
+        let rawText = String(decoding: try Data(contentsOf: raw), as: UTF8.self)
+        #expect(rawText.hasPrefix("$ ls") && rawText.contains("file-b") && !rawText.contains("later") && !rawText.contains("old "), "\(rawText)")
+        recorder.close()
+    }
+
     /// The length counts output, not file bytes, and carries over when a recording is reopened.
     @Test func recorderLengthCountsOutputAcrossReopen() throws {
         let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }

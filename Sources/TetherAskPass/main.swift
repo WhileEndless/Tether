@@ -27,7 +27,10 @@ let connected = withUnsafePointer(to: &addr) {
 }
 guard connected == 0 else { exit(1) }
 
-var request = try! JSONSerialization.data(withJSONObject: ["token": token, "prompt": prompt])
+// ssh says what kind of question it is: "confirm" (yes/no) or "none" (a notice, no answer read).
+var fields = ["token": token, "prompt": prompt]
+if let kind = env["SSH_ASKPASS_PROMPT"], !kind.isEmpty { fields["kind"] = kind }
+var request = try! JSONSerialization.data(withJSONObject: fields)
 request.append(0x0a)
 _ = request.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
 

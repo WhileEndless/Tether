@@ -41,7 +41,12 @@ public final class CommandSampler {
         }
     }
 
-    public private(set) var status: Status = .waiting
+    public private(set) var status: Status = .waiting {
+        didSet { if status != .idle { idleSeenAt = nil } }
+    }
+    /// When the shell was last seen waiting at its prompt (the latest look, or the watcher's news);
+    /// nil while something runs or it is not known.
+    @ObservationIgnored public private(set) var idleSeenAt: Date?
     public private(set) var frame: CommandFrame?
     /// Readings of the current command (newest last), for the live graphs.
     public private(set) var samples: [CommandSample] = []
@@ -245,6 +250,7 @@ public final class CommandSampler {
         case .busy(let pid, let commandLine):
             endShortCommand(at: date)
             watchedBusy = true
+            idleSeenAt = nil
             if let record, record.isRunning, record.pid == pid { break }
             // Another program took over: the one recorded ended now (more exact than its last look).
             finish(.finished, at: date)
@@ -253,6 +259,7 @@ public final class CommandSampler {
             endShortCommand(at: date)
             finish(.finished, at: date)
             watchedBusy = false
+            if online { idleSeenAt = date }
             // The watcher is sure: no look is needed to show that nothing runs.
             if online, status == .running || status == .waiting {
                 status = .idle
@@ -302,6 +309,7 @@ public final class CommandSampler {
         misses = 0
         guard let leader = new.leader else {
             status = .idle
+            idleSeenAt = new.takenAt
             idleForeground = foreground
             if !resumeChecked { resume(with: nil, at: new.takenAt) }
             finish(.finished)

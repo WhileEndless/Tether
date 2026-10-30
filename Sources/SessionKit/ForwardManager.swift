@@ -7,8 +7,9 @@ import SSHTransport
 ///
 /// - Forwards belong to the host, not to a tab: several sessions to the same host share them.
 /// - Ports are checked before starting; conflicts name the culprit and suggest a free port.
-/// - A tiny keep-alive channel holds the master open while forwards are active and tells us when
-///   the connection dies; active forwards are restored when a session to the host reconnects.
+/// - The shared connection stays open by itself (`SharedConnections`); it is checked every 30 s on
+///   this Mac (nothing is sent to the server), and active forwards are restored when a session to
+///   the host reconnects.
 @MainActor
 @Observable
 public final class ForwardManager {
@@ -24,25 +25,44 @@ public final class ForwardManager {
     public private(set) var status: [UUID: Status] = [:]
     /// Which host each running forward belongs to.
     @ObservationIgnored private var owners: [UUID: (target: ConnectionTarget, forward: PortForward)] = [:]
-    @ObservationIgnored private var keepAlive: [String: RemoteStream] = [:]
-    /// Network devices: the shared connection is checked every 30 s instead (nothing runs there).
+    /// Hosts with active forwards: their shared connection is checked every 30 s.
     @ObservationIgnored private var deviceWatch: [String: Task<Void, Never>] = [:]
+    /// Which sign-in of its host's connection each forward was made on (`SharedConnections.generation`).
+    @ObservationIgnored private var madeOn: [UUID: Int] = [:]
 
-    private func watchDeviceConnection(_ target: ConnectionTarget) {
+    /// Notices when the shared connection carrying the host's forwards has ended — or was replaced by
+    /// a new one (closed as dead after waking, then signed in again): forwards live in the connection
+    /// that made them, so they are made again on the new one. Only Tether's own state and the
+    /// socket are asked: a channel that printed something every few seconds made the server give
+    /// up on the connection while the Mac slept (nothing acknowledged what it sent).
+    private func watchConnection(_ target: ConnectionTarget) {
         guard deviceWatch[target.key] == nil else { return }
         let executor = RemoteExecutor(target: target, options: optionsProvider())
+        let options = optionsProvider()
         deviceWatch[target.key] = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
-                guard !Task.isCancelled, !(await executor.isMasterAlive()) else { continue }
+                guard !Task.isCancelled else { return }
+                let alive = await executor.isMasterAlive()
+                let generation = await SharedConnections.shared.generation(of: target, options: options)
                 guard let self else { return }
-                self.deviceWatch[target.key] = nil
-                for (id, owner) in self.owners where owner.target == target {
+                // Not known right now (ssh could not work the connection out): nothing is decided.
+                if generation == 0 { continue }
+                let mine = self.owners.filter { $0.value.target == target }
+                let replaced = mine.contains { self.madeOn[$0.key] != generation }
+                guard !alive || replaced else { continue }
+                ConnectionLog.shared.notice(alive ? "Port forwards are made again on the new connection" : "Port forwards stopped with their connection",
+                                            .forward, host: target.key)
+                for (id, owner) in mine {
                     self.owners[id] = nil
-                    self.pendingRestore.insert(id)
-                    self.status[id] = .failed("Connection lost — will restore on reconnect")
+                    self.madeOn[id] = nil
+                    self.status[id] = alive ? .inactive : .failed("Connection lost — will restore on reconnect")
+                    if alive { Task { await self.start(owner.forward, on: target) } } else { self.pendingRestore.insert(id) }
                 }
-                return
+                if !alive || self.owners.values.allSatisfy({ $0.target != target }) {
+                    self.deviceWatch[target.key] = nil
+                    return
+                }
             }
         }
     }
@@ -75,49 +95,55 @@ public final class ForwardManager {
             status[forward.id] = .failed(msg)
             return msg
         }
-        // Make sure a master connection exists (this authenticates if needed). A network device
-        // runs no script: its terminal's shared connection is used as it is.
-        let executor = RemoteExecutor(target: target, options: options)
-        if PlatformCache.shared.isDevice(target.key) {
-            guard await executor.isMasterAlive() else {
-                let msg = "Open a terminal to \(target.displayName) first: forwards to a network device use its connection."
-                status[forward.id] = .failed(msg)
-                return msg
-            }
-        } else {
-            let probe = await executor.run(script: ":", timeout: 30, purpose: "forward")
-            guard probe.succeeded else {
-                let msg = Self.clean(probe.errorOutput, fallback: "Could not connect to \(target.displayName).")
-                status[forward.id] = .failed(msg)
-                return msg
-            }
+        // The host's shared connection (signing in once if it is not there; a network device signs
+        // in the same way, without running anything).
+        let ready: SSHOptions
+        switch await RemoteExecutor(target: target, options: options).prepared(purpose: "forward") {
+        case .ready(let executor):
+            ready = executor.options
+        case .refused(let result):
+            let msg = Self.clean(result.errorOutput, fallback: "Could not connect to \(target.displayName).")
+            status[forward.id] = .failed(msg)
+            return msg
         }
-        let args = options.commonOptions() + ["-O", "forward", forward.kind.flag, forward.specification]
-            + SSHOptions.destinationArguments(for: target)
+        // Stopped while the connection was being prepared: not started after all.
+        guard status[forward.id] == .starting else { return nil }
+        let generation = await SharedConnections.shared.generation(of: target, options: options)
+        let args = ready.commonOptions() + ["-O", "forward", forward.kind.flag, forward.specification] + ready.destination(target)
         let r = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 20)
         guard r.status == 0 else {
             let msg = Self.explain(r.errorOutput + r.output, forward)
             status[forward.id] = .failed(msg)
+            ConnectionLog.shared.problem("A port forward could not be made", .forward, host: target.key, detail: msg)
             return msg
         }
         owners[forward.id] = (target, forward)
+        ConnectionLog.shared.info("Port forward made", .forward, host: target.key, detail: forward.kind.flag + " " + forward.specification)
+        madeOn[forward.id] = generation
+        guard status[forward.id] == .starting else {
+            // Stopped while it was being made: undone at once.
+            Task { await self.stop(forward) }
+            return nil
+        }
         status[forward.id] = .active
-        ensureKeepAlive(for: target)
+        watchConnection(target)
         return nil
     }
 
     public func stop(_ forward: PortForward) async {
+        madeOn[forward.id] = nil
         guard let owner = owners.removeValue(forKey: forward.id) else {
             status[forward.id] = .inactive
             return
         }
         let options = optionsProvider()
-        let args = options.commonOptions() + ["-O", "cancel", forward.kind.flag, owner.forward.specification]
-            + SSHOptions.destinationArguments(for: owner.target)
-        _ = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 15)
+        // Only an open connection has the forward to cancel: never a sign-in for this.
+        if let ready = await SharedConnections.shared.readyOptions(owner.target, options: options) {
+            let args = ready.commonOptions() + ["-O", "cancel", forward.kind.flag, owner.forward.specification] + ready.destination(owner.target)
+            _ = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 15)
+        }
         status[forward.id] = .inactive
         if activeCount(for: owner.target) == 0 {
-            keepAlive.removeValue(forKey: owner.target.key)?.stop()
             deviceWatch.removeValue(forKey: owner.target.key)?.cancel()
         }
     }
@@ -165,32 +191,5 @@ public final class ForwardManager {
     static func clean(_ text: String, fallback: String) -> String {
         let lines = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         return lines.isEmpty ? fallback : lines.suffix(2).joined(separator: " ")
-    }
-
-    // MARK: Keep-alive
-
-    /// Holds the master open while forwards are active and notices when it dies.
-    private func ensureKeepAlive(for target: ConnectionTarget) {
-        if PlatformCache.shared.isDevice(target.key) { watchDeviceConnection(target); return }
-        guard keepAlive[target.key] == nil else { return }
-        let stream = RemoteStream(separator: "\n")
-        stream.onEnd = { [weak self] _, _ in
-            guard let self else { return }
-            self.keepAlive[target.key] = nil
-            for (id, owner) in self.owners where owner.target == target {
-                self.owners[id] = nil
-                self.pendingRestore.insert(id)
-                self.status[id] = .failed("Connection lost — will restore on reconnect")
-            }
-        }
-        keepAlive[target.key] = stream
-        let executor = RemoteExecutor(target: target, options: optionsProvider())
-        Task {
-            let platform = await executor.resolvedPlatform()
-            stream.start(executor: executor,
-                         script: RemoteScript("while sleep 30; do echo; done",
-                                              windows: "while ($true) { Start-Sleep -Seconds 30; '' }"),
-                         platform: platform, arguments: [], purpose: "forward-keepalive")
-        }
     }
 }

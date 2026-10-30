@@ -2,7 +2,8 @@ import AppKit
 import TetherCore
 
 /// Brings windows back as they were: which windows were open (front to back), each one's frame
-/// and screen, and whether it was in full screen. Each window's tabs and selected tab are in its
+/// and screen, whether it was in full screen, and its side panels (shown or not, their widths, the
+/// host panel's tab). Each window's tabs and selected tab are in its
 /// workspace. This does not depend on macOS window restoration, which is off whenever the system
 /// setting "Close windows when quitting an application" is on.
 @MainActor
@@ -11,6 +12,35 @@ enum WindowLayout {
         var workspaceID: UUID
         var frame: CGRect
         var fullScreen: Bool
+        /// nil: saved by a version without it (the window opens with the panels last used).
+        var panels: Panels?
+    }
+
+    /// A window's sidebar and host panel.
+    struct Panels: Codable, Equatable {
+        var sidebar: Bool
+        /// nil: not measured yet (the column's own width).
+        var sidebarWidth: Double?
+        var inspector: Bool
+        var inspectorWidth: Double
+        /// `InspectorTab.rawValue`.
+        var inspectorTab: String?
+    }
+
+    /// Each open window's panels as they are now.
+    private static var panels: [UUID: Panels] = [:]
+
+    /// The panels a window had when it was saved (nil: a new window).
+    static func savedPanels(for id: UUID) -> Panels? {
+        loadIfNeeded()
+        return panels[id] ?? pending.first { $0.workspaceID == id }?.panels
+    }
+
+    /// A window's panels changed: saved with its layout.
+    static func update(_ p: Panels, for id: UUID) {
+        guard panels[id] != p else { return }
+        panels[id] = p
+        scheduleSave()
     }
 
     private static let store = JSONStore<[Entry]>(filename: "window-layout.json")
@@ -27,7 +57,7 @@ enum WindowLayout {
 
     private static func entry(_ id: UUID, _ w: NSWindow) -> Entry {
         let full = w.styleMask.contains(.fullScreen)
-        return Entry(workspaceID: id, frame: full ? (lastNormalFrame[id] ?? w.frame) : w.frame, fullScreen: full)
+        return Entry(workspaceID: id, frame: full ? (lastNormalFrame[id] ?? w.frame) : w.frame, fullScreen: full, panels: panels[id])
     }
 
     /// Frames before entering full screen (to restore the window's normal size later).
@@ -38,13 +68,13 @@ enum WindowLayout {
     static func saveOpenWindows() {
         let open = openWindows()
         guard !open.isEmpty else { return }
-        store.saveSoon(open.map { entry($0.0, $0.1) })
+        store.saveSoon(open.map { entry($0.0, $0.1) }, within: DeferredWrites.relaxedDelay)
     }
 
     /// The last window is closing: remember it, so quitting from the menu bar brings it back.
     static func lastWindowClosing(_ id: UUID, _ window: NSWindow) {
         let e = entry(id, window)
-        store.saveSoon([e])
+        store.saveSoon([e], within: DeferredWrites.relaxedDelay)
         // The next window that opens without a workspace gets this one back.
         loaded = true
         pending = [e]
@@ -53,6 +83,7 @@ enum WindowLayout {
 
     private static var firstHandedOut = false
     private static var watched: Set<ObjectIdentifier> = []
+    private static var observers: [ObjectIdentifier: [NSObjectProtocol]] = [:]
 
     /// The workspace for the window SwiftUI opens at launch: the frontmost saved one (once).
     static func firstWorkspaceAtLaunch() -> UUID {
@@ -66,7 +97,7 @@ enum WindowLayout {
     static func place(_ id: UUID, frame: CGRect) {
         loadIfNeeded()
         pending.removeAll { $0.workspaceID == id }
-        pending.append(Entry(workspaceID: id, frame: frame, fullScreen: false))
+        pending.append(Entry(workspaceID: id, frame: frame, fullScreen: false, panels: panels[id]))
         firstHandedOut = true   // not the launch window
     }
 
@@ -105,6 +136,28 @@ enum WindowLayout {
         }
     }
 
+    /// Gives a window's sidebar its saved width. SwiftUI's column width is only a suggestion that
+    /// AppKit's own per-window memory overrides (kept by scene number, so windows reopening in
+    /// another order swapped widths); that memory is turned off and the divider is set directly,
+    /// once laid out and again after AppKit's own first pass.
+    static func applySidebarWidth(_ width: Double, in window: NSWindow) {
+        func split(_ v: NSView) -> NSSplitView? {
+            if let s = v as? NSSplitView, s.isVertical, s.arrangedSubviews.count >= 2 { return s }
+            for sub in v.subviews { if let s = split(sub) { return s } }
+            return nil
+        }
+        for delay in [0.0, 0.3] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard let content = window.contentView, let s = split(content) else { return }
+                s.autosaveName = nil
+                // Hidden (collapsed): it gets the width when shown again from AppKit's last value.
+                guard let side = s.arrangedSubviews.first, !s.isSubviewCollapsed(side), side.frame.width > 0,
+                      abs(side.frame.width - width) > 1 else { return }
+                s.setPosition(width, ofDividerAt: 0)
+            }
+        }
+    }
+
     private static func loadIfNeeded() {
         guard !loaded else { return }
         loaded = true
@@ -117,18 +170,27 @@ enum WindowLayout {
     /// Keeps the saved layout current as windows move, resize and enter or leave full screen,
     /// so it is right even after a crash. Normal frames are kept for full-screen windows.
     static func watch(_ window: NSWindow, workspace id: UUID) {
-        guard watched.insert(ObjectIdentifier(window)).inserted else { return }
+        let key = ObjectIdentifier(window)
+        guard watched.insert(key).inserted else { return }
         let center = NotificationCenter.default
-        center.addObserver(forName: NSWindow.willEnterFullScreenNotification, object: window, queue: .main) { n in
+        // A closed window's observers go, and its identity is free again: a new window can reuse
+        // the address, and must be watched.
+        observers[key, default: []].append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                watched.remove(key)
+                for t in observers.removeValue(forKey: key) ?? [] { center.removeObserver(t) }
+            }
+        })
+        observers[key, default: []].append(center.addObserver(forName: NSWindow.willEnterFullScreenNotification, object: window, queue: .main) { n in
             MainActor.assumeIsolated {
                 if let w = n.object as? NSWindow { lastNormalFrame[id] = w.frame }
             }
-        }
+        })
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
                      NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
-            center.addObserver(forName: name, object: window, queue: .main) { _ in
+            observers[key, default: []].append(center.addObserver(forName: name, object: window, queue: .main) { _ in
                 MainActor.assumeIsolated { scheduleSave() }
-            }
+            })
         }
         scheduleSave()
     }

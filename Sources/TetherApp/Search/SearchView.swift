@@ -2,6 +2,7 @@ import SwiftUI
 import TetherCore
 import SessionKit
 import SearchKit
+import RecordingKit
 import TerminalUI
 
 /// ⇧⌘F: search every open terminal, the archive and old recordings.
@@ -314,17 +315,48 @@ struct SearchView: View {
                                                             anchorRow: base + match.line)
             }
         case .recording(let url, let archiveID):
-            let total = max(Double(source.lines?.count ?? 0), 1)
-            let fraction = source.lines == nil ? estimatedFraction(url: url, line: match.line) : Double(match.line) / total
-            openWindow(id: "transcript", value: TranscriptRequest(archiveID: archiveID, path: archiveID == nil ? url.path : nil,
-                                                                 revealText: match.text, revealFraction: fraction))
+            // Earlier output of an open terminal: shown in that terminal, which browses its
+            // recording from there (and its find bar steps through the matches).
+            if source.id.hasPrefix("earlier-"), let id = UUID(uuidString: String(source.id.dropFirst("earlier-".count))),
+               let offset = match.offset, let session = model.sessions.session(id),
+               TerminalRegistry.shared.existingView(for: id)?.showsAlternateScreen != true {
+                if !model.workspaces.focus(id) {
+                    let ws = UUID()
+                    model.workspaces.add(session.id, to: ws)
+                    openWindow(id: "workspace", value: ws)
+                }
+                let q = search.query
+                // The terminal shows it in its history view, with its find bar on the match (the find
+                // picks it once it has searched the recording: `earlierOffset`).
+                guard TerminalRegistry.shared.existingView(for: id)?.hasHistoryOnDisk == true else {
+                    openTranscript(transcriptRequest(url: url, archiveID: archiveID, match: match), match: match, url: url)
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    model.terminalFind[id] = TerminalFind(term: q.pattern, regex: q.isRegex, caseSensitive: q.caseSensitive,
+                                                          wholeWord: q.wholeWord, earlierOffset: offset)
+                }
+                return
+            }
+            openTranscript(transcriptRequest(url: url, archiveID: archiveID, match: match), match: match, url: url)
         }
     }
 
-    /// Rough position of a line in a recording, from the line count of the file.
-    private func estimatedFraction(url: URL, line: Int) -> Double {
-        guard let lines = try? SearchEngine.readLines(url), !lines.isEmpty else { return 0 }
-        return Double(line) / Double(lines.count)
+    private func transcriptRequest(url: URL, archiveID: UUID?, match: SearchMatch) -> TranscriptRequest {
+        TranscriptRequest(archiveID: archiveID, path: archiveID == nil ? url.path : nil, revealText: match.text, revealFraction: 0)
+    }
+
+    /// The transcript window at the match: where it is, as a share of the output, is worked out in
+    /// the background (never by reading the recording here).
+    private func openTranscript(_ request: TranscriptRequest, match: SearchMatch, url: URL) {
+        Task {
+            var r = request
+            if let offset = match.offset {
+                let length = await Task.detached { RecordingReader.length(of: url) }.value
+                r.revealFraction = length > 0 ? min(Double(offset) / Double(length), 1) : 0
+            }
+            openWindow(id: "transcript", value: r)
+        }
     }
 }
 

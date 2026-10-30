@@ -11,6 +11,9 @@ struct TerminalFind: Hashable {
     var wholeWord = false
     /// Scroll-invariant row to start at (a match picked in the search window).
     var anchorRow: Int?
+    /// About where in the recording the match to start at is (a match in earlier output picked in
+    /// the search window): shown in the history view.
+    var earlierOffset: Int?
     /// Changed each time ⌘F is pressed, so the field takes the keyboard again.
     var focusToken = UUID()
 
@@ -56,12 +59,13 @@ struct TerminalFindBar: View {
             }
             counter
             Divider().frame(height: 14)
+            // While earlier output is searched, a step waits for the first match there.
             Button { step(forward: false) } label: { Image(systemName: "chevron.up") }
                 .help("Previous match (⇧⌘G or ⇧↩)")
-                .disabled(status.total == 0)
+                .disabled(status.total == 0 && !status.searchingRecording)
             Button { step(forward: true) } label: { Image(systemName: "chevron.down") }
                 .help("Next match (⌘G or ↩)")
-                .disabled(status.total == 0)
+                .disabled(status.total == 0 && !status.searchingRecording)
             Button { close() } label: { Image(systemName: "xmark") }
                 .help("Close (esc)")
         }
@@ -69,25 +73,37 @@ struct TerminalFindBar: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .glassBackground()
+        // Matches under the bar are scrolled into sight (it floats over the terminal's top rows).
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { view?.findBarHeight = $0 + 10 }
         // Closes by itself once it has not been used for a while (Settings ▸ Terminal).
         .autoDismiss(after: model.settings.floatingBars.findBarHideAfter, activity: [AnyHashable(find), AnyHashable(steps)]) {
             close(focusTerminal: fieldFocused)
         }
         .onAppear {
             view?.onFindStatus = { status = $0 }
-            view?.setFind(find.query, anchorRow: find.anchorRow)
-            if find.anchorRow == nil { fieldFocused = true }
+            view?.setFind(find.query, anchorRow: find.anchorRow, earlierOffset: find.earlierOffset)
+            if find.anchorRow == nil, find.earlierOffset == nil { fieldFocused = true }
         }
         .onChange(of: find.query) { _, query in scheduleSearch(query) }
         .onDisappear { pendingSearch?.cancel() }
         .onChange(of: find.focusToken) { _, _ in fieldFocused = true }
+        // Another match picked in the search window while the bar is open.
+        .onChange(of: find.anchorRow) { _, row in if let row { view?.setFind(find.query, anchorRow: row) } }
+        .onChange(of: find.earlierOffset) { _, offset in if let offset { view?.setFind(find.query, earlierOffset: offset) } }
         .onChange(of: model.terminalFindStep[session.id]) { _, _ in
             // Driven by Edit ▸ Find Next / Previous (⌘G, ⇧⌘G).
             if let forward = model.terminalFindStep[session.id]?.forward { step(forward: forward) }
         }
     }
 
+    /// " 42 %" while the recording is searched (once that has started reading).
+    private var percent: String {
+        status.recordingProgress.map { " \(Int(($0 * 100).rounded())) %" } ?? ""
+    }
+
     /// "3 of 14", "14 matches" before one is chosen, "No matches", or why the pattern is wrong.
+    /// While earlier output is still searched: what was found so far ("3 of 14+", "14+ found"),
+    /// with a small spinner and how far the search is.
     private var counter: some View {
         let text: String
         let color: Color
@@ -95,6 +111,14 @@ struct TerminalFindBar: View {
             (text, color) = ("", .secondary)
         } else if status.invalidPattern {
             (text, color) = ("Invalid pattern", .red)
+        } else if status.searchingRecording {
+            let found = status.total > 0 ? "\(status.total.formatted())+" : ""
+            let far = status.recordingProgress.map { " · \(Int(($0 * 100).rounded())) %" } ?? ""
+            if status.current > 0 {
+                (text, color) = ("\(status.current.formatted()) of \(found.isEmpty ? "…" : found)" + far, .primary)
+            } else {
+                (text, color) = ((found.isEmpty ? "Searching" : "\(found) found") + far, .secondary)
+            }
         } else if status.total == 0 {
             (text, color) = ("No matches", .orange)
         } else {
@@ -102,13 +126,29 @@ struct TerminalFindBar: View {
             (text, color) = status.current == 0 ? ("\(total) match\(status.total == 1 ? "" : "es")", .secondary)
                 : ("\(status.current.formatted()) of \(total)", .primary)
         }
-        return Text(text)
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(color == .primary ? .secondary : color)
-            .contentTransition(.numericText())
-            .animation(.snappy(duration: 0.2), value: status)
-            .lineLimit(1)
-            .fixedSize()
+        return HStack(spacing: 4) {
+            if status.searchingRecording && !find.term.isEmpty && !status.invalidPattern {
+                ProgressView().controlSize(.mini)
+                    .help("Searching earlier output" + percent)
+                    .accessibilityLabel("Searching earlier output" + percent)
+            }
+            if status.recordingUnreadable && !status.searchingRecording {
+                Image(systemName: "lock.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help("Part of the earlier output could not be searched: it is encrypted and Tether is locked, or it was recorded with another key")
+                    .accessibilityLabel("Part of the earlier output could not be searched")
+            }
+            if !text.isEmpty {
+                Text(text)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(color == .primary ? .secondary : color)
+                    .contentTransition(.numericText())
+            }
+        }
+        .animation(.snappy(duration: 0.2), value: status)
+        .lineLimit(1)
+        .fixedSize()
     }
 
     private func option(_ key: WritableKeyPath<TerminalFind, Bool>) -> Binding<Bool> {
@@ -120,6 +160,7 @@ struct TerminalFindBar: View {
         guard var f = model.terminalFind[session.id] else { return }
         change(&f)
         f.anchorRow = nil
+        f.earlierOffset = nil
         model.terminalFind[session.id] = f
     }
 
@@ -139,13 +180,15 @@ struct TerminalFindBar: View {
 
     private func step(forward: Bool) {
         guard let view, !find.term.isEmpty else { return }
-        // ↩ before the delay is over: search now (that already goes to the first match).
+        // ↩ before the delay is over: search now (that already goes to the first match) — unless
+        // the term shown is that one already (typed and taken back): then on to the next.
         if let pending = pendingSearch {
             pending.cancel()
             pendingSearch = nil
-            view.setFind(find.query)
-            steps += 1
-            return
+            if view.setFind(find.query) {
+                steps += 1
+                return
+            }
         }
         FindPasteboard.set(find.term)
         view.findStep(forward: forward)
@@ -153,6 +196,7 @@ struct TerminalFindBar: View {
     }
 
     private func close(focusTerminal: Bool = true) {
+        view?.findBarHeight = 0
         view?.setFind(nil)
         view?.onFindStatus = nil
         model.terminalFind[session.id] = nil

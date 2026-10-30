@@ -116,8 +116,8 @@ public enum RecordingCrypto {
     static let hpkeInfo = Data("tether-locked-v1".utf8)
 
     static func privateKey(for key: SymmetricKey) -> Curve25519.KeyAgreement.PrivateKey {
-        let raw = subkey(key, "locked").withUnsafeBytes { Data($0) }
-        return try! Curve25519.KeyAgreement.PrivateKey(rawRepresentation: raw)   // any 32 bytes are a valid key
+        // Straight from the key's own storage: no copy of the secret is left on the heap.
+        try! Curve25519.KeyAgreement.PrivateKey(rawRepresentation: subkey(key, "locked"))   // any 32 bytes are a valid key
     }
 
     /// New recordings are written encrypted (when a key is loaded).
@@ -133,7 +133,11 @@ public enum RecordingCrypto {
     }
 
     public static func keyID(_ key: SymmetricKey) -> Data {
-        key.withUnsafeBytes { Data(SHA256.hash(data: Data($0)).prefix(8)) }
+        key.withUnsafeBytes { raw in      // hashed in place (a copy of the key would stay in freed memory)
+            var hash = SHA256()
+            hash.update(bufferPointer: raw)
+            return Data(hash.finalize().prefix(8))
+        }
     }
 
     /// What seals and opens the frames of one file. Frames and the header signature use separate
@@ -388,9 +392,19 @@ struct FrameIndex {
         start = UInt64(max(RecordingCrypto.headerLength(of: handle), RecordingCrypto.headerSize))
         let size = try handle.seekToEnd()
         var pos = start
+        // Read in blocks: a quiet session writes a small frame every 15 s, and a long recording
+        // has tens of thousands of them (one read each would make every reader slow).
+        var block = Data()
+        var blockStart: UInt64 = 0
         while pos + 8 <= size {
-            try handle.seek(toOffset: pos)
-            guard let lenData = try handle.read(upToCount: 4), lenData.count == 4 else { break }
+            if pos < blockStart || pos + 4 > blockStart + UInt64(block.count) {
+                try handle.seek(toOffset: pos)
+                guard let read = try handle.read(upToCount: 1 << 20), read.count >= 4 else { break }
+                block = read
+                blockStart = pos
+            }
+            let at = block.startIndex + Int(pos - blockStart)
+            let lenData = block[at..<(at + 4)]
             let len = Int(lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian)
             guard len >= RecordingCrypto.overhead, pos + 8 + UInt64(len) <= size else { break }
             boxes.append((pos + 4, len))
@@ -442,6 +456,13 @@ public enum RecordingReader {
     /// Successive chunks of the recording's text (decrypted and decompressed). Return false to stop.
     public static func forEachChunk(of url: URL, key: SymmetricKey? = RecordingCrypto.key,
                                     _ body: (Data) throws -> Bool) throws {
+        try forEachChunk(of: url, key: key, partDone: { _ in }, body)
+    }
+
+    /// The same, saying when each part has been read through (its number; parts removed meanwhile
+    /// are skipped).
+    static func forEachChunk(of url: URL, key: SymmetricKey?, partDone: (Int) -> Void,
+                             _ body: (Data) throws -> Bool) throws {
         // The parts and the file being written are taken at one moment: no new part can start in
         // between (`RecordingParts.rotation`). The open file keeps its contents even when it is
         // moved aside as a part later, so nothing is skipped or read twice.
@@ -455,6 +476,7 @@ public enum RecordingReader {
                     if try !body(chunk) { stopped = true; return false }
                     return true
                 }
+                if !stopped { partDone(part.number) }
             } catch CocoaError.fileReadNoSuchFile {
                 continue      // removed meanwhile (the storage limit shortened this session)
             }
@@ -488,13 +510,28 @@ public enum RecordingReader {
     /// Reads only the end of the file (backwards) unless it is compressed, and only as many parts as
     /// those lines need.
     public static func tail(of url: URL, lines: Int, key loaded: SymmetricKey? = RecordingCrypto.key) -> [UInt8]? {
-        // No new part starts while the end is read (quick: at most `tailMaxBytes`).
-        RecordingParts.rotation.withLock { tailOfParts(url, lines: lines, key: loaded) }
+        consistently(url) { tailOfParts(url, parts: $0, lines: lines, key: loaded) }
     }
 
-    private static func tailOfParts(_ url: URL, lines: Int, key loaded: SymmetricKey?) -> [UInt8]? {
+    /// Reads with the list of parts and the file being written belonging together. The lock that
+    /// keeps a new part from starting is shared by every recording (and the recorders wait for it),
+    /// so it is held only to take the list: the reading is checked afterwards, and done again in the
+    /// rare case a part started meanwhile.
+    private static func consistently<T>(_ url: URL, _ read: ([RecordingParts.Part]) -> T) -> T {
+        for _ in 0..<3 {
+            let parts = RecordingParts.rotation.withLock { RecordingParts.parts(of: url) }
+            let result = read(parts)
+            // The whole list: a part added at the end (rotation) and the oldest removed (the storage
+            // limit shortening a long recording) both shift every position after it.
+            let after = RecordingParts.rotation.withLock { RecordingParts.parts(of: url).map(\.number) }
+            if after == parts.map(\.number) { return result }
+        }
+        return RecordingParts.rotation.withLock { read(RecordingParts.parts(of: url)) }
+    }
+
+    private static func tailOfParts(_ url: URL, parts all: [RecordingParts.Part], lines: Int, key loaded: SymmetricKey?) -> [UInt8]? {
         let last = tail(ofFile: url, lines: lines, key: loaded)
-        var parts = RecordingParts.parts(of: url)
+        var parts = all
         guard !parts.isEmpty else { return last }
         var collected = Data(last ?? [])
         var newlines = collected.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
@@ -554,14 +591,18 @@ public enum RecordingReader {
             return plainTail(handle: handle, lines: lines)
         }
         guard let frames = try? FrameIndex(handle: handle).boxes else { return nil }
-        var collected = Data()
+        var pieces: [Data] = []       // last first, joined once (prepending each would copy it all again)
+        var count = 0
         var newlines = 0
         for (index, box) in frames.enumerated().reversed() {
             guard let plain = try? FrameIndex.decrypt(box, index: index, handle: handle, sealer: sealer) else { break }
-            collected = plain + collected
+            pieces.append(plain)
+            count += plain.count
             newlines += plain.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
-            if newlines > lines || collected.count >= tailMaxBytes { break }
+            if newlines > lines || count >= tailMaxBytes { break }
         }
+        var collected = Data(capacity: count)
+        for piece in pieces.reversed() { collected.append(piece) }
         return Array(cutToLastLines(capped(collected), lines))
     }
 
@@ -616,24 +657,140 @@ public enum RecordingReader {
     /// holding that position is read; the parts' names say how long each one is.
     public static func slice(of url: URL, around fraction: Double, maxBytes: Int = 16 * 1024 * 1024,
                              key loaded: SymmetricKey? = RecordingCrypto.key) -> (Data, Double) {
-        RecordingParts.rotation.withLock { sliceOfParts(url, around: fraction, maxBytes: maxBytes, key: loaded) }
+        consistently(url) { sliceOfParts(url, parts: $0, around: fraction, maxBytes: maxBytes, key: loaded) }
     }
 
-    private static func sliceOfParts(_ url: URL, around fraction: Double, maxBytes: Int, key loaded: SymmetricKey?) -> (Data, Double) {
-        let parts = RecordingParts.parts(of: url)
+    private static func sliceOfParts(_ url: URL, parts: [RecordingParts.Part], around fraction: Double, maxBytes: Int,
+                                     key loaded: SymmetricKey?) -> (Data, Double) {
         guard !parts.isEmpty else { return slice(ofFile: url, around: fraction, maxBytes: maxBytes, key: loaded) }
+        let total = parts.reduce(0) { $0 + $1.length } + length(ofFile: url, key: loaded)
+        // The window may span several parts (a part just started holds little): it is filled from
+        // each file it overlaps, so `maxBytes` of output are shown wherever the position is.
+        let center = Double(total) * min(max(fraction, 0), 1)
+        let start = max(0, min(Int(center) - maxBytes / 2, total - maxBytes))
+        let end = min(total, start + maxBytes)
+        return lineAligned(range(url, parts: parts, from: start, to: end, key: loaded), start: start, center: center)
+    }
+
+    // MARK: Positions
+
+    /// Bytes of output the recording holds (its parts and the file being written).
+    public static func length(of url: URL, key loaded: SymmetricKey? = RecordingCrypto.key) -> Int {
+        consistently(url) { parts in parts.reduce(0) { $0 + $1.length } + length(ofFile: url, key: loaded) }
+    }
+
+    /// The output from byte `from` up to `to` (positions in the whole recording, parts included).
+    public static func bytes(of url: URL, from: Int, to: Int, key loaded: SymmetricKey? = RecordingCrypto.key) -> Data {
+        guard to > from else { return Data() }
+        return consistently(url) { range(url, parts: $0, from: from, to: to, key: loaded) }
+    }
+
+    /// Up to `count` lines of output ending at byte `end`, from the start of a line (or of the
+    /// recording), and where they start. At most `maxBytes` are read.
+    public static func lines(of url: URL, endingAt end: Int, count: Int, maxBytes: Int = tailMaxBytes,
+                             key loaded: SymmetricKey? = RecordingCrypto.key) -> (start: Int, data: Data) {
+        lines(endingAt: end, count: count, maxBytes: maxBytes) { bytes(of: url, from: $0, to: $1, key: loaded) }
+    }
+
+    /// The same over any source of bytes (`read(from, to)`).
+    public static func lines(endingAt end: Int, count: Int, maxBytes: Int = tailMaxBytes,
+                             read: (Int, Int) -> Data) -> (start: Int, data: Data) {
+        guard end > 0, count > 0 else { return (end, Data()) }
+        var guess = min(max(64 << 10, count * 128), maxBytes)
+        while true {
+            let lo = max(0, end - guess)
+            let data = read(lo, end)
+            let newlines = data.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
+            if newlines > count || lo == 0 || guess >= maxBytes {
+                var kept = cutToLastLines(data, count)
+                // Read from the middle of a line: start at the next one.
+                if kept.count == data.count, lo > 0, let nl = kept.firstIndex(of: 0x0a) {
+                    kept = kept.subdata(in: (nl + 1)..<kept.endIndex)
+                }
+                return (end - kept.count, kept)
+            }
+            guess = min(guess * 4, maxBytes)
+        }
+    }
+
+    /// Up to `count` lines of output starting at byte `start` (the start of a line), ending after a
+    /// line break or at `total` (the end of the recording), and where they end.
+    public static func lines(of url: URL, startingAt start: Int, count: Int, total: Int, maxBytes: Int = tailMaxBytes,
+                             key loaded: SymmetricKey? = RecordingCrypto.key) -> (end: Int, data: Data) {
+        lines(startingAt: start, count: count, total: total, maxBytes: maxBytes) { bytes(of: url, from: $0, to: $1, key: loaded) }
+    }
+
+    /// The same over any source of bytes (`read(from, to)`).
+    public static func lines(startingAt start: Int, count: Int, total: Int, maxBytes: Int = tailMaxBytes,
+                             read: (Int, Int) -> Data) -> (end: Int, data: Data) {
+        guard start < total, count > 0 else { return (start, Data()) }
+        var guess = min(max(64 << 10, count * 128), maxBytes)
+        while true {
+            let hi = min(total, start + guess)
+            let data = read(start, hi)
+            var seen = 0
+            for i in data.indices where data[i] == 0x0a {
+                seen += 1
+                if seen == count { return (start + (i - data.startIndex) + 1, data.subdata(in: data.startIndex..<(i + 1))) }
+            }
+            if hi >= total { return (start + data.count, data) }
+            if guess >= maxBytes {
+                // Too little line structure: up to the last line break read (or all of it).
+                if let nl = data.lastIndex(of: 0x0a) { return (start + (nl - data.startIndex) + 1, data.subdata(in: data.startIndex..<(nl + 1))) }
+                return (start + data.count, data)
+            }
+            guess = min(guess * 4, maxBytes)
+        }
+    }
+
+    /// Bytes `from..<to` of a recording made of `parts` and the file at `url`.
+    private static func range(_ url: URL, parts: [RecordingParts.Part], from: Int, to: Int, key loaded: SymmetricKey?) -> Data {
         let lengths = parts.map(\.length) + [length(ofFile: url, key: loaded)]
         let files = parts.map { RecordingParts.current($0.url) } + [url]
-        let total = lengths.reduce(0, +)
-        var target = Double(total) * min(max(fraction, 0), 1)
-        for (i, len) in lengths.enumerated() {
-            if target <= Double(len) || i == lengths.count - 1 {
-                return slice(ofFile: files[i], around: len > 0 ? min(target / Double(len), 1) : 1, maxBytes: maxBytes, key: loaded,
-                             length: i < parts.count ? len : nil)
-            }
-            target -= Double(len)
+        var data = Data()
+        var fileStart = 0
+        for (file, len) in zip(files, lengths) {
+            defer { fileStart += len }
+            guard fileStart + len > from, fileStart < to else { continue }
+            data += range(ofFile: file, from: max(from - fileStart, 0), to: min(to - fileStart, len), key: loaded)
         }
-        return (Data(), 0)
+        return data
+    }
+
+    /// Bytes `from..<to` of one file's output: plain files are read where they are, encrypted ones
+    /// decrypt only the frames that hold them, compressed ones are read up to there.
+    private static func range(ofFile url: URL, from lo: Int, to hi: Int, key loaded: SymmetricKey?) -> Data {
+        guard hi > lo else { return Data() }
+        if RecordingCompression.isCompressed(url) {
+            var data = Data()
+            var pos = 0
+            try? forEachChunk(ofFile: url, key: loaded) { chunk in
+                defer { pos += chunk.count }
+                let a = max(lo - pos, 0), b = min(hi - pos, chunk.count)
+                if a < b { data += chunk.subdata(in: (chunk.startIndex + a)..<(chunk.startIndex + b)) }
+                return pos + chunk.count < hi
+            }
+            return data
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        if let sealer = try? RecordingCrypto.sealer(for: url, loaded: loaded) {
+            guard let frames = try? FrameIndex(handle: handle).boxes else { return Data() }
+            var data = Data()
+            var pos = 0
+            for (i, box) in frames.enumerated() {
+                let len = box.length - RecordingCrypto.overhead
+                defer { pos += len }
+                guard pos + len > lo else { continue }
+                guard pos < hi, let plain = try? FrameIndex.decrypt(box, index: i, handle: handle, sealer: sealer) else { break }
+                let a = max(lo - pos, 0), b = min(hi - pos, plain.count)
+                if a < b { data += plain.subdata(in: (plain.startIndex + a)..<(plain.startIndex + b)) }
+            }
+            return data
+        }
+        if RecordingCrypto.isEncrypted(url) { return Data() }   // locked or another key
+        guard (try? handle.seek(toOffset: UInt64(lo))) != nil else { return Data() }
+        return (try? handle.read(upToCount: hi - lo)) ?? Data()
     }
 
     /// Bytes of output in one file (reads through it only when it is compressed).

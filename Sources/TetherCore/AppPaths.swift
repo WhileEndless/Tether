@@ -142,6 +142,12 @@ public enum AppPaths {
     /// A TETHER_* environment override for tests and the demo. Debug builds only: in a release build
     /// nothing set from outside (e.g. with `launchctl setenv`) can point Tether at other settings, ssh
     /// configuration or data folders.
+    /// The app's preferences: a separate suite for tests, self-tests and the demo
+    /// (TETHER_DEFAULTS_SUITE), otherwise the app's own defaults. Everything Tether keeps in
+    /// preferences goes through this (SwiftUI's `@AppStorage` too, via `defaultAppStorage`).
+    public static let defaults: UserDefaults = debugOverride("TETHER_DEFAULTS_SUITE")
+        .flatMap(UserDefaults.init(suiteName:)) ?? .standard
+
     public static func debugOverride(_ name: String) -> String? {
         #if DEBUG
         return ProcessInfo.processInfo.environment[name]

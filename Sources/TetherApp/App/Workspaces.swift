@@ -259,6 +259,7 @@ final class WorkspaceStore {
     }
 
     private func save() {
-        store.saveSoon(Array(all.values))
+        // Which tabs a window has and which is in front: cheap to lose, often changed.
+        store.saveSoon(Array(all.values), within: DeferredWrites.relaxedDelay)
     }
 }

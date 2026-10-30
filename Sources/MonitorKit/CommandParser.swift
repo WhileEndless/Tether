@@ -125,7 +125,7 @@ extension ProbeParser {
             let f = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
             guard f.count >= 9, let pid = Int(f[0]), let ppid = Int(f[1]) else { return nil }
             var p = CommandProcess(pid: pid, ppid: ppid, group: Int(f[2]), terminalGroup: Int(f[3]), state: f[4])
-            p.cpuSeconds = Double(f[5]).map { $0 / hz }
+            p.cpuSeconds = Double(f[5]).flatMap { $0.isFinite ? $0 / hz : nil }
             p.threads = Int(f[6])
             if let boot, let ticks = Double(f[7]) {
                 p.hostStarted = boot + ticks / hz
@@ -165,7 +165,7 @@ extension ProbeParser {
             let f = line.split(separator: "\t", maxSplits: 9, omittingEmptySubsequences: false).map(String.init)
             guard f.count >= 10, let pid = Int(f[0]), let ppid = Int(f[1]) else { return nil }
             var p = CommandProcess(pid: pid, ppid: ppid, user: f[8].isEmpty ? "-" : f[8])
-            p.cpuSeconds = Double(f[2])
+            p.cpuSeconds = Double(f[2]).flatMap { $0.isFinite ? $0 : nil }
             p.rssBytes = Int64(f[3])
             p.threads = Int(f[4])
             p.hostStarted = Double(f[5])

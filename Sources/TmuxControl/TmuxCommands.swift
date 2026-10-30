@@ -82,11 +82,12 @@ public struct TmuxPaneInfo: Equatable, Sendable {
         guard p.count >= 6, p[0].hasPrefix("%") else { return nil }
         paneID = p[0]
         alternateScreen = p[1] == "1"
-        cursorX = Int(p[2]) ?? 0
-        cursorY = Int(p[3]) ?? 0
-        width = Int(p[4]) ?? 80
-        height = Int(p[5]) ?? 24
-        historySize = p.count > 6 ? Int(p[6]) ?? 0 : 0
+        // Values from the server: never negative (they size ranges and arrays).
+        cursorX = max(Int(p[2]) ?? 0, 0)
+        cursorY = max(Int(p[3]) ?? 0, 0)
+        width = max(Int(p[4]) ?? 80, 1)
+        height = max(Int(p[5]) ?? 24, 1)
+        historySize = max(p.count > 6 ? Int(p[6]) ?? 0 : 0, 0)
         modes = TmuxPaneModes(p.count > 7 ? p[7] : "")
     }
 }

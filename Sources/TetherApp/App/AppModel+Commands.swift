@@ -61,6 +61,16 @@ extension AppModel {
         commandSampler(for: session).update(online: session.phase.isOnline, foreground: session.foregroundName)
     }
 
+    /// When the terminal's shell was last seen waiting at its prompt: from tmux (it says what is in
+    /// front every 2 s) or from the command watcher. nil while a program runs or when it cannot be
+    /// told (GNU screen sessions, Windows hosts, watching turned off).
+    func shellSeenAtPrompt(_ session: TerminalSession) -> Date? {
+        // tmux knows best (and a program it names in front is not to be second-guessed).
+        if session.persistence == .tmux { return session.shellSeenAt }
+        guard let sampler = commandSamplers[session.id], sampler.status == .idle else { return nil }
+        return sampler.idleSeenAt
+    }
+
     /// Private sessions leave no history.
     private func keepsCommandHistory(_ session: TerminalSession) -> Bool {
         isEnabled(.commandHistory, for: session.descriptor.target) && !session.descriptor.isPrivate

@@ -7,7 +7,7 @@ import SSHTransport
 /// Packed (tar stream) transfers with real tar on both ends. "ssh" is a tiny shim that runs the
 /// remote command with the local shell, so no server is needed.
 @MainActor
-@Suite(.serialized) struct ArchiveTransferTests {
+@Suite(.serialized) final class ArchiveTransferTests {
     let root: URL
     let shim: URL
     let target = ConnectionTarget.adhoc(user: "user", host: "example.invalid", port: nil, jump: nil)
@@ -21,12 +21,17 @@ import SSHTransport
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shim.path)
     }
 
-    private func manager(parallel: Int = 3, mode: TransferArchiveMode = .auto, compress: Bool = false) -> TransferManager {
+    deinit {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func manager(parallel: Int = 3, mode: TransferArchiveMode = .auto, compression: TransferCompression = .off) -> TransferManager {
         var options = SSHOptions()
         options.sshBinary = shim.path
         options.useControlMaster = false
         return TransferManager(options: { options }, policy: {
-            TransferPolicy(parallel: parallel, archiveMode: mode, archiveThreshold: 5, compress: compress)
+            TransferPolicy(parallel: parallel, archiveMode: mode, archiveThreshold: 5, compression: compression,
+                           adaptToSlowHosts: false)
         })
     }
 
@@ -89,13 +94,55 @@ import SSHTransport
         let src = root.appendingPathComponent("csrc"), dest = root.appendingPathComponent("cdest")
         for i in 0..<10 { try write("f\(i).log", String(repeating: "line \(i)\n", count: 500), in: src) }
         let files = (0..<10).map { src.appendingPathComponent("f\($0).log") }
-        let m = manager(mode: .always, compress: true)
+        let m = manager(mode: .always, compression: .auto)
         let items = await wait { done in
             m.uploadGroup(files, names: files.map(\.lastPathComponent), to: dest.path, target: target,
                           fileCount: 10, totalBytes: nil, completion: done)
         }
         #expect(items.first?.state == .completed)
         #expect(contents(of: dest).count == 10)
+    }
+
+    /// Every way of compressing the stream this Mac has works both ways, byte for byte, and progress
+    /// counts the files' own bytes (not the compressed ones).
+    @Test func everyCompressionWorksBothWays() async throws {
+        let methods = TransferCompression.methods.filter { m in m.program.flatMap { ArchiveJob.localPath($0) } != nil }
+        #expect(methods.contains(.gzip), "gzip comes with macOS")
+        for method in methods {
+            let src = root.appendingPathComponent("z-\(method)"), up = root.appendingPathComponent("up-\(method)")
+            let back = root.appendingPathComponent("back-\(method)")
+            let text = (0..<4_000).map { "log line \($0) for \(method)" }.joined(separator: "\n")
+            try write("data/big.log", text, in: src)
+            for i in 0..<6 { try write("data/small-\(i).txt", "small \(i)", in: src) }
+            let files = [src.appendingPathComponent("data")]
+            let bytes = Int64(text.utf8.count + 6 * 7)
+            let m = manager(mode: .always, compression: method)
+            let sent = await wait { done in
+                m.uploadGroup(files, names: ["data"], to: up.path, target: target, fileCount: 7, totalBytes: bytes, completion: done)
+            }
+            #expect(sent.first?.state == .completed, "\(method) up: \(String(describing: sent.first?.state))")
+            #expect(sent.first?.compression == method)
+            #expect(read("data/big.log", in: up) == text, "\(method) up")
+            #expect((sent.first?.bytesDone ?? 0) > Int64(text.utf8.count), "counted before compression")
+            try FileManager.default.createDirectory(at: back, withIntermediateDirectories: true)
+            let got = await wait { done in
+                m.downloadGroup(["data"], from: up.path, to: back, as: ["data"], target: target, fileCount: 7, totalBytes: bytes, completion: done)
+            }
+            #expect(got.first?.state == .completed, "\(method) down: \(String(describing: got.first?.state))")
+            #expect(got.first?.compression == method)
+            #expect(read("data/big.log", in: back) == text, "\(method) down")
+            #expect(read("data/small-5.txt", in: back) == "small 5")
+        }
+    }
+
+    @Test func compressionIsOneBothEndsHave() {
+        let both: Set<String> = ["gzip", "xz"]
+        #expect(TransferCompression.auto.resolved(local: ["zstd", "gzip", "xz"], remote: both) == .gzip)
+        #expect(TransferCompression.auto.resolved(local: ["zstd", "lz4", "gzip"], remote: ["zstd", "gzip"]) == .zstd)
+        #expect(TransferCompression.xz.resolved(local: both, remote: both) == .xz)
+        #expect(TransferCompression.zstd.resolved(local: ["zstd", "gzip"], remote: ["gzip"]) == .gzip, "falls back to one both have")
+        #expect(TransferCompression.auto.resolved(local: ["gzip"], remote: []) == nil)
+        #expect(TransferCompression.off.resolved(local: both, remote: both) == nil)
     }
 
     @Test func failedUploadLeavesNothingBehind() async throws {
@@ -165,7 +212,7 @@ import SSHTransport
         #expect(TransferPolicy(archiveMode: .auto, archiveThreshold: 20).packs(fileCount: 19) == false)
         #expect(TransferPolicy(archiveMode: .auto, archiveThreshold: 20).packs(fileCount: 20) == true)
         #expect(TransferPolicy(archiveMode: .always).packs(fileCount: 2) == true)
-        #expect(TransferPolicy(archiveMode: .always).packs(fileCount: 1) == false)
+        #expect(TransferPolicy(archiveMode: .always).packs(fileCount: 1), "always: one file too (sent compressed)")
         #expect(TransferPolicy(archiveMode: .never).packs(fileCount: 5_000) == false)
     }
 

@@ -20,11 +20,27 @@ final class AskPassPanel {
         shownID = prompt.id
         let view = AskPassPromptView(prompt: prompt).environment(AppModel.shared)
         let panel = self.panel ?? makePanel()
-        panel.contentViewController = NSHostingController(rootView: view)
-        panel.center()
+        let host = NSHostingController(rootView: view)
+        panel.contentViewController = host
+        // At its own size first (SwiftUI works it out from the content), then placed: centred
+        // over the Tether window in front — where the user is looking — or on the screen.
+        panel.setContentSize(host.view.fittingSize)
+        place(panel)
         NSApp.activate()
         panel.makeKeyAndOrderFront(nil)
         self.panel = panel
+    }
+
+    private func place(_ panel: NSPanel) {
+        let over = (NSApp.keyWindow ?? NSApp.mainWindow).flatMap { $0 === panel || !$0.isVisible ? nil : $0 }
+            ?? NSApp.orderedWindows.first { $0 !== panel && $0.isVisible && $0.canBecomeMain }
+        guard let over, let screen = over.screen ?? NSScreen.main else { panel.center(); return }
+        let size = panel.frame.size
+        var origin = NSPoint(x: over.frame.midX - size.width / 2, y: over.frame.midY - size.height / 2 + over.frame.height / 10)
+        let visible = screen.visibleFrame
+        origin.x = min(max(origin.x, visible.minX), visible.maxX - size.width)
+        origin.y = min(max(origin.y, visible.minY), visible.maxY - size.height)
+        panel.setFrameOrigin(origin)
     }
 
     private func makePanel() -> NSPanel {

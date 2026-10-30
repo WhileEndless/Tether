@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 import TetherCore
 import SessionKit
 
@@ -38,6 +39,7 @@ struct TetherApp: App {
         // window's tab bar, or use Window ▸ Merge All Windows.
         WindowGroup("Tether", id: "workspace", for: UUID.self) { $workspaceID in
             WorkspaceRoot(workspaceID: $workspaceID)
+                .defaultAppStorage(AppPaths.defaults)   // tests and the demo use their own suite
                 .tetherAppearance()
                 .appLockCover()
                 .environment(model)
@@ -49,6 +51,7 @@ struct TetherApp: App {
         WindowGroup("Transcript", id: "transcript", for: TranscriptRequest.self) { $request in
             if let request {
                 TranscriptWindow(request: request)
+                .defaultAppStorage(AppPaths.defaults)
                     .tetherAppearance()
                     .appLockCover()
                     .environment(model)
@@ -60,6 +63,7 @@ struct TetherApp: App {
         WindowGroup("Files", id: "files", for: FilesRequest.self) { $request in
             if let request {
                 FilesWindow(request: request)
+                .defaultAppStorage(AppPaths.defaults)
                     .tetherAppearance()
                     .appLockCover()
                     .environment(model)
@@ -71,6 +75,7 @@ struct TetherApp: App {
 
         Window("Search", id: "search") {
             SearchView()
+                .defaultAppStorage(AppPaths.defaults)
                 .tetherAppearance()
                 .appLockCover()
                 .environment(model)
@@ -81,13 +86,34 @@ struct TetherApp: App {
 
         Window("Keyboard Shortcuts", id: "shortcuts") {
             ShortcutsView()
+                .defaultAppStorage(AppPaths.defaults)
                 .frame(minWidth: 460, minHeight: 360)
                 .standaloneWindow()
         }
         .defaultSize(width: 560, height: 680)
 
+        Window("Connection Log", id: "connection-log") {
+            ConnectionLogView()
+                .defaultAppStorage(AppPaths.defaults)
+                .frame(minWidth: 520, minHeight: 320)
+                .standaloneWindow()
+        }
+        .defaultSize(width: 680, height: 520)
+
+        Window("Software Update", id: "update") {
+            UpdateWindow()
+                .defaultAppStorage(AppPaths.defaults)
+                .tetherAppearance()
+                .appLockCover()
+                .environment(model)
+                .frame(minWidth: 480, minHeight: 360)
+                .standaloneWindow()
+        }
+        .defaultSize(width: 600, height: 560)
+
         Window("About Tether", id: "about") {
             AboutView()
+                .defaultAppStorage(AppPaths.defaults)
                 .standaloneWindow()
         }
         .windowResizability(.contentSize)
@@ -95,6 +121,7 @@ struct TetherApp: App {
 
         Window("Set Up Tether", id: "setup") {
             AppearanceSetupView()
+                .defaultAppStorage(AppPaths.defaults)
                 .tetherAppearance(scalesInterface: false)
                 .appLockCover()
                 .environment(model)
@@ -105,6 +132,7 @@ struct TetherApp: App {
 
         Settings {
             SettingsView()
+                .defaultAppStorage(AppPaths.defaults)
                 .tetherAppearance(scalesInterface: false)
                 .appLockCover()
                 .environment(model)
@@ -115,6 +143,7 @@ struct TetherApp: App {
                      isInserted: Binding(get: { model.settings.keepRunningInMenuBar },
                                          set: { model.settings.keepRunningInMenuBar = $0 })) {
             MenuBarContent()
+                .defaultAppStorage(AppPaths.defaults)
                 .environment(model)
         }
     }
@@ -123,6 +152,7 @@ struct TetherApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        if !AppPaths.isRunningTests { HangWatch.shared.start() }
         MainActor.assumeIsolated {
             AppModel.shared.launch()
             Notifier.shared.install()
@@ -197,20 +227,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        MainActor.assumeIsolated {
+        Self.endIfQuittingHangs()
+        return MainActor.assumeIsolated {
             WindowLayout.saveOpenWindows()
             AppModel.shared.isTerminating = true
+            return .terminateNow
         }
-        return .terminateNow
+    }
+
+    /// Quitting never hangs: if Tether has not ended 10 s after it was asked to (something on the
+    /// main thread waiting for good), it ends itself. tmux and screen sessions, on servers and on
+    /// this Mac, keep running either way; what was saved before is kept.
+    nonisolated static func endIfQuittingHangs() {
+        let thread = Thread {
+            // Slow: where it waits is kept (Console names the file), then it goes on waiting.
+            Thread.sleep(forTimeInterval: 3)
+            HangWatch.shared.sample(reason: "taking more than 3 s to quit", force: true)
+            Thread.sleep(forTimeInterval: 4)
+            Logger(subsystem: "io.github.whileendless.tether", category: "app")
+                .error("Quitting took more than 10 s; Tether ended itself")
+            // What is waiting to be written goes first (off the main thread, which is stuck), for
+            // 2 s at most.
+            let written = DispatchSemaphore(value: 0)
+            Thread.detachNewThread { DeferredWrites.shared.flush(); written.signal() }
+            _ = written.wait(timeout: .now() + 2)
+            _exit(0)
+        }
+        thread.name = "quit watchdog"
+        thread.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
-            AppModel.shared.fileTabs.saveDirectories()
-            AppModel.shared.sessions.prepareForTermination()
-            AppModel.shared.stopCommandHubs()
-            AppModel.shared.commandHistory.flush()
-            DeferredWrites.shared.flush()
+            // Each step is timed: a slow one is noted (Console), so a quit that takes long says why.
+            let log = Logger(subsystem: "io.github.whileendless.tether", category: "app")
+            func step(_ name: String, _ work: () -> Void) {
+                let began = ProcessInfo.processInfo.systemUptime
+                work()
+                let took = ProcessInfo.processInfo.systemUptime - began
+                if took > 0.5 { log.error("Quitting: \(name, privacy: .public) took \(took, format: .fixed(precision: 1)) s") }
+            }
+            // What is waiting to be written (open tabs, windows) first: whatever happens next, the
+            // next launch brings them back.
+            step("saving state first") { DeferredWrites.shared.flush() }
+            // An update built meanwhile is installed once this Tether has ended; one still being
+            // built is stopped (it starts again next time).
+            step("stopping the update") { Updater.shared.stop() }
+            step("starting the update's install") { Updater.shared.installOnQuit() }
+            step("saving file tabs") { AppModel.shared.fileTabs.saveDirectories() }
+            step("ending the sessions") { AppModel.shared.sessions.prepareForTermination() }
+            step("stopping command watchers") { AppModel.shared.stopCommandHubs() }
+            step("saving the command history") { AppModel.shared.commandHistory.flush() }
+            step("saving state") { DeferredWrites.shared.flush() }
         }
     }
 }
@@ -218,8 +286,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Gives a fresh window its own workspace id (stored by SwiftUI, so windows restore with their tabs).
 struct WorkspaceRoot: View {
     @Binding var workspaceID: UUID?
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        content
+            // Check for Updates, a found update, What's New after updating: the update window.
+            .onChange(of: Updater.shared.windowRequest) { _, _ in openWindow(id: "update") }
+    }
+
+    @ViewBuilder private var content: some View {
         if let workspaceID {
             WorkspaceWindow(workspaceID: workspaceID).id(workspaceID)
         } else {

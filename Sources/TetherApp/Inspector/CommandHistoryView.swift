@@ -126,7 +126,8 @@ struct CommandRecordRow: View {
             Text(r.commandLine).uiFont(.caption, design: .monospaced).foregroundStyle(.secondary).lineLimit(expanded ? 6 : 1)
                 .textSelection(.enabled)
             HStack(spacing: 10) {
-                Text(r.started.formatted(date: .abbreviated, time: .shortened))
+                Text(Self.timeRange(r)).monospacedDigit().foregroundStyle(.tertiary)
+                    .help(endText)
                 if r.short == true {
                     Text("short — ended before it was measured").help("Seen by the watcher: command line and duration only")
                 }
@@ -140,6 +141,17 @@ struct CommandRecordRow: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(expanded ? 0.7 : 0.4)))
+    }
+
+    /// When it ran, start → end, to the second: "27 Oct 10:02:14 → 10:05:40" (the end's date only
+    /// when it is another day), "→ running" while it runs.
+    static func timeRange(_ r: CommandRecord) -> String {
+        let start = r.started.formatted(date: .abbreviated, time: .standard)
+        if r.isRunning { return start + " → running" }
+        let end = r.ended ?? r.lastSeen
+        let sameDay = Calendar.current.isDate(end, inSameDayAs: r.started)
+        let endText = end.formatted(date: sameDay ? .omitted : .abbreviated, time: .standard)
+        return start + (r.status == .endedWhileDisconnected ? " → after " : " → ") + endText
     }
 
     @ViewBuilder private var duration: some View {

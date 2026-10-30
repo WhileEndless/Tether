@@ -41,10 +41,29 @@ public enum ProcessRunner {
         }
     }
 
+    /// - Parameter stopOnCancel: cancelling the calling task ends the process (a search the user
+    ///   stopped); otherwise it runs to its end or its timeout.
     public static func run(_ executable: String, arguments: [String], environment: [String: String]? = nil,
-                           input: Data? = nil, timeout: TimeInterval = 30) async -> ProcessResult {
+                           input: Data? = nil, timeout: TimeInterval = 30, stopOnCancel: Bool = false) async -> ProcessResult {
+        let process = Process()
+        let box = ProcessBox(process)
+        return await withTaskCancellationHandler {
+            await run(process, executable, arguments: arguments, environment: environment, input: input, timeout: timeout,
+                      stopOnCancel: stopOnCancel)
+        } onCancel: {
+            if stopOnCancel { box.stop() }
+        }
+    }
+
+    private final class ProcessBox: @unchecked Sendable {
+        let process: Process
+        init(_ process: Process) { self.process = process }
+        func stop() { if process.isRunning { process.terminate() } }
+    }
+
+    private static func run(_ process: Process, _ executable: String, arguments: [String], environment: [String: String]?,
+                            input: Data?, timeout: TimeInterval, stopOnCancel: Bool) async -> ProcessResult {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcessResult, Never>) in
-            let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
             process.environment = ChildEnvironment.base.merging(environment ?? [:]) { $1 }
@@ -81,6 +100,8 @@ public enum ProcessRunner {
             do {
                 try process.run()
                 if let environment { AskPassBridge.shared.bindToken(environment, pid: process.processIdentifier) }
+                // Cancelled before it started: the handler found nothing running to stop.
+                if stopOnCancel, Task.isCancelled { process.terminate() }
             } catch {
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
@@ -96,9 +117,18 @@ public enum ProcessRunner {
             }
             if timeout > 0 {
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                    if process.isRunning {
-                        c.lock.lock(); c.timedOut = true; c.lock.unlock()
-                        process.terminate()
+                    guard process.isRunning else { return }
+                    c.lock.lock(); c.timedOut = true; c.lock.unlock()
+                    process.terminate()
+                    // A process that ignores SIGTERM (stopped, or trapping it) must not keep its caller
+                    // waiting: killed, and the caller answered, whatever happens to it.
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                        let pid = process.processIdentifier
+                        if process.isRunning, pid > 1 { kill(pid, SIGKILL) }
+                        guard c.markFinished() else { return }
+                        outPipe.fileHandleForReading.readabilityHandler = nil
+                        errPipe.fileHandleForReading.readabilityHandler = nil
+                        cont.resume(returning: c.result(status: -9))
                     }
                 }
             }

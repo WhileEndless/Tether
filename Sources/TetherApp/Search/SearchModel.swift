@@ -129,21 +129,39 @@ final class SearchModel {
             phase = .finished
             return
         }
-        let sources = collectSources()
-        searchedSources = sources.count
+        let collected = collectSources()
+        searchedSources = collected.sources.count
         progressIndex = 0
         progressTitle = ""
         phase = .running
         let q = query
         task = Task {
             do {
+                // The disk is reached only from here: recordings of open sessions are written out
+                // and other recordings are looked up in the background, never while typing.
+                // What the recorders still keep in memory is searched with what is on disk: nothing
+                // is written early for a search.
+                var sources = collected.sources
+                for session in collected.flush {
+                    guard let snap = await session.currentRecording() else { continue }
+                    for i in sources.indices where sources[i].id == "earlier-\(session.id)" { sources[i].pendingOutput = snap.pending }
+                }
+                try Task.checkCancellation()
+                let (more, skipped) = await Task.detached(priority: .userInitiated) { collected.recordings() }.value
+                try Task.checkCancellation()
+                skippedCompressed += skipped
+                sources += more
+                searchedSources = sources.count
                 for try await event in SearchEngine.events(q, in: sources) {
                     switch event {
                     case .searching(let index, _, let source):
                         progressIndex = index
                         progressTitle = "\(source.host) · \(source.title)"
                     case .found(let progress):
-                        groups.append(SearchResultGroup(source: progress.source, matches: progress.matches))
+                        // A terminal's text was only needed to search it (the results keep the matches).
+                        var source = progress.source
+                        source.lines = nil
+                        groups.append(SearchResultGroup(source: source, matches: progress.matches))
                     }
                 }
                 progressIndex = searchedSources
@@ -162,18 +180,57 @@ final class SearchModel {
         if busy { phase = .stopped }
     }
 
-    /// Gathers sources on the main thread (live terminal text must be read here).
-    private func collectSources() -> [SearchSource] {
-        let model = AppModel.shared
+    /// What a search looks through: open terminals' text (read here, on the main thread), and
+    /// recordings, whose files are looked up in the background (`recordings()`).
+    struct Collected: Sendable {
         var sources: [SearchSource] = []
+        /// Sessions whose recording is searched: written out first.
+        var flush: [TerminalSession] = []
+        struct Archived: Sendable { var id: UUID; var path: String; var title, host: String; var date: Date? }
+        var archived: [Archived] = []
         var usedRecordings = Set<String>()
-        skippedCompressed = 0
-        /// Current file of a recording (it may have been compressed), honouring the compressed filter.
-        func recording(_ path: String) -> URL? {
-            guard let url = RecordingStore.resolve(path) else { return nil }
-            if RecordingCompression.isCompressed(url) && !filters.includeCompressed { skippedCompressed += 1; return nil }
-            return url
+        var otherRecordings = false
+        var includeCompressed = false
+        var host: String?
+        var interval: (from: Date, to: Date)?
+
+        /// Archived sessions' recordings and other recordings, with how many compressed ones were
+        /// skipped. Touches the disk: called in the background.
+        func recordings() -> ([SearchSource], Int) {
+            var sources: [SearchSource] = []
+            var skipped = 0
+            var used = usedRecordings
+            for a in archived {
+                guard let url = RecordingStore.resolve(a.path) else { continue }
+                if RecordingCompression.isCompressed(url) && !includeCompressed { skipped += 1; continue }
+                sources.append(SearchSource(id: "archive-\(a.id)", kind: .recording(url: url, archiveID: a.id),
+                                            title: a.title, host: a.host, date: a.date, status: "Ended"))
+            }
+            if otherRecordings {
+                for r in RecordingStore.all() where !used.contains(r.url.path) {
+                    used.insert(r.url.path)
+                    if r.isCompressed && !includeCompressed { skipped += 1; continue }
+                    if let host, RecordingStore.sanitize(host) != r.targetKey { continue }
+                    if let interval, r.modified < interval.from { continue }
+                    sources.append(SearchSource(id: "rec-\(r.url.path)", kind: .recording(url: r.url, archiveID: nil),
+                                                title: "Recording \(r.modified.formatted(date: .abbreviated, time: .shortened))",
+                                                host: r.targetKey, date: r.modified, status: "Recording"))
+                }
+            }
+            return (sources, skipped)
         }
+    }
+
+    /// Gathers sources on the main thread (live terminal text must be read here; text of terminals
+    /// that did not change since the last search is kept by the view).
+    private func collectSources() -> Collected {
+        let model = AppModel.shared
+        var c = Collected()
+        c.otherRecordings = filters.otherRecordings && filters.session == nil
+        c.includeCompressed = filters.includeCompressed
+        c.host = filters.host
+        c.interval = filters.interval
+        skippedCompressed = 0
 
         if filters.openSessions {
             for s in model.sessions.sessions {
@@ -182,19 +239,22 @@ final class SearchModel {
                 if !filters.overlaps(start: s.startedAt, end: s.endedAt) { continue }
                 let status = statusLabel(s)
                 if !statusMatches(status) { continue }
-                if let path = s.recordingURL?.path { usedRecordings.insert(path) }
+                if let path = s.recordingURL?.path { c.usedRecordings.insert(path) }
                 guard let view = TerminalRegistry.shared.existingView(for: s.id) else { continue }
                 // A full-screen program (vim, less) is up: memory holds only its screen, so the
                 // session's text all comes from the recording (without the program's screens).
-                if view.showsAlternateScreen, let url = s.flushedRecordingURL() {
-                    sources.append(SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
-                                                title: s.displayTitle, host: s.descriptor.target.displayName,
-                                                date: s.startedAt, status: status))
+                if view.showsAlternateScreen, let url = s.recordingURL {
+                    c.flush.append(s)
+                    c.sources.append(SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
+                                                  title: s.displayTitle, host: s.descriptor.target.displayName,
+                                                  date: s.startedAt, status: status))
                     continue
                 }
                 let (base, lines, _) = view.scrollbackText()
                 // Older output no longer in memory is searched in the session's recording.
-                if base > 0, let url = s.flushedRecordingURL() {
+                // Also lines a hidden tab let go of (they leave memory without being counted as trimmed).
+                if base > 0 || view.hasOlderOutput, let url = s.recordingURL {
+                    c.flush.append(s)
                     var earlier = SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
                                                title: "\(s.displayTitle) — earlier output", host: s.descriptor.target.displayName,
                                                date: s.startedAt, status: status)
@@ -202,36 +262,24 @@ final class SearchModel {
                     let memory = view.logicalText().lines
                     earlier.skipTrailingLines = memory.count
                     earlier.memoryHead = Array(memory.prefix(64))
-                    sources.append(earlier)
+                    c.sources.append(earlier)
                 }
-                sources.append(SearchSource(id: "live-\(s.id)", kind: .live(sessionID: s.id, lineBase: base),
-                                            title: s.displayTitle, host: s.descriptor.target.displayName,
-                                            date: s.startedAt, status: status, lines: lines))
+                c.sources.append(SearchSource(id: "live-\(s.id)", kind: .live(sessionID: s.id, lineBase: base),
+                                              title: s.displayTitle, host: s.descriptor.target.displayName,
+                                              date: s.startedAt, status: status, lines: lines))
             }
         }
         if filters.archive && filters.session == nil && (filters.status == .any || filters.status == .ended) {
             for a in model.sessions.archive {
                 if let host = filters.host, a.target.key != host { continue }
                 if !filters.overlaps(start: a.startedAt, end: a.endedAt) { continue }
-                guard let path = a.recordingPath, !usedRecordings.contains(path) else { continue }
-                usedRecordings.insert(path)
-                usedRecordings.insert(path + "." + RecordingCompression.compressedExtension)
-                guard let url = recording(path) else { continue }
-                sources.append(SearchSource(id: "archive-\(a.id)", kind: .recording(url: url, archiveID: a.id),
-                                            title: a.title, host: a.target.displayName, date: a.endedAt, status: "Ended"))
+                guard let path = a.recordingPath, !c.usedRecordings.contains(path) else { continue }
+                c.usedRecordings.insert(path)
+                c.usedRecordings.insert(path + "." + RecordingCompression.compressedExtension)
+                c.archived.append(.init(id: a.id, path: path, title: a.title, host: a.target.displayName, date: a.endedAt))
             }
         }
-        if filters.otherRecordings && filters.session == nil {
-            for r in RecordingStore.all() where !usedRecordings.contains(r.url.path) {
-                if r.isCompressed && !filters.includeCompressed { skippedCompressed += 1; continue }
-                if let host = filters.host, RecordingStore.sanitize(host) != r.targetKey { continue }
-                if !filters.overlaps(start: nil, end: r.modified) { continue }
-                sources.append(SearchSource(id: "rec-\(r.url.path)", kind: .recording(url: r.url, archiveID: nil),
-                                            title: "Recording \(r.modified.formatted(date: .abbreviated, time: .shortened))",
-                                            host: r.targetKey, date: r.modified, status: "Recording"))
-            }
-        }
-        return sources
+        return c
     }
 
     private func statusLabel(_ s: TerminalSession) -> String {
@@ -300,7 +348,12 @@ final class SearchModel {
         panel.canCreateDirectories = true
         panel.prompt = "Export Here"
         guard panel.runModal() == .OK, let dir = panel.url else { return }
-        let sources = groups.map(\.source)
+        // Open terminals' text is read now, as it is.
+        let sources = groups.map { group in
+            var source = group.source
+            if case .live(let id, _) = source.kind { source.lines = TerminalRegistry.shared.existingView(for: id)?.scrollbackText().lines ?? [] }
+            return source
+        }
         Task.detached {
             // Existing files are never replaced: a taken name becomes "name 2.txt".
             let names = sources.map { String((($0.host + " - " + $0.title).replacingOccurrences(of: "/", with: "-")).prefix(120)) + ".txt" }

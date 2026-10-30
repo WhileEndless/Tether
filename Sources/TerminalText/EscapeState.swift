@@ -9,7 +9,21 @@ public struct EscapeState: Sendable {
     /// Inside an escape sequence at the end of what was fed.
     public var isInside: Bool { state != .text }
 
+    /// Every chunk of every recorded terminal goes through here: a concrete buffer, not a generic
+    /// sequence (which, called from another module, walked byte by byte through witness tables).
+    public mutating func feed(_ bytes: [UInt8]) {
+        bytes.withUnsafeBufferPointer { feed(buffer: $0) }
+    }
+
+    public mutating func feed(_ bytes: ArraySlice<UInt8>) {
+        bytes.withUnsafeBufferPointer { feed(buffer: $0) }
+    }
+
     public mutating func feed(_ bytes: some Sequence<UInt8>) {
+        feed(Array(bytes))
+    }
+
+    private mutating func feed(buffer bytes: UnsafeBufferPointer<UInt8>) {
         for b in bytes {
             switch state {
             case .text:

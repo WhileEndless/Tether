@@ -39,6 +39,8 @@ public final class RemoteMonitor {
     /// Sockets the server listens on (for the ports overview and quick forwarding).
     public private(set) var listeningPorts: [ListeningSocket] = []
     public private(set) var logText = ""
+    /// Why the last log could not be read; nil when it was.
+    public private(set) var logError: String?
     public private(set) var error: String?
     public private(set) var isStreaming = false
     /// Latency of short commands over the shared connection (for hosts without a tmux session).
@@ -61,6 +63,7 @@ public final class RemoteMonitor {
     @ObservationIgnored private var interest = 0
     @ObservationIgnored private var interval: TimeInterval = 3
     @ObservationIgnored private var restartTask: Task<Void, Never>?
+    @ObservationIgnored private var pace = RetryPace()
     @ObservationIgnored private var lastFrameAt: Date?
     /// Demo data loaded: never contact the host.
     @ObservationIgnored private var frozen = false
@@ -80,25 +83,55 @@ public final class RemoteMonitor {
 
     // MARK: Interest
 
-    /// A view starts showing this host's data.
-    public func retain(interval: TimeInterval) {
+    /// A view starts showing this host's data. `detail`: the host panel (all of it, at the
+    /// interval set); without one, only the status bar above the terminal shows the host, and a
+    /// look every few seconds is enough (`stripInterval`).
+    public func retain(interval: TimeInterval, detail: Bool = true) {
         interest += 1
-        self.interval = max(interval, 1)
-        if stream == nil && !frozen && !paused && allows(.monitoring) { startStream() }
+        if detail { detailInterest += 1 }
+        requested = max(interval, 1)
+        if stream == nil && !frozen && !paused && allows(.monitoring) { startStream() } else { intervalMayHaveChanged() }
+    }
+
+    /// The status bar alone looks at least this far apart.
+    public static let stripInterval: TimeInterval = 5
+    @ObservationIgnored private var detailInterest = 0
+    @ObservationIgnored private var requested: TimeInterval = 3
+
+    /// What the stream runs at for who is watching now.
+    var wantedInterval: TimeInterval { detailInterest > 0 ? requested : max(requested, Self.stripInterval) }
+
+    /// The panel opened or closed while streaming: the stream starts again at the pace now wanted.
+    private func intervalMayHaveChanged() {
+        guard stream != nil, wantedInterval != interval else { return }
+        stopStream()
+        if interest > 0 && !frozen && !paused && allows(.monitoring) { startStream() }
     }
 
     /// While paused (no window of the app is visible), nothing is streamed; the last data stays.
     public var paused = false {
         didSet {
             guard paused != oldValue else { return }
+            traffic.paused = paused
             if paused { stopStream() } else if interest > 0 && stream == nil && !frozen && allows(.monitoring) { startStream() }
         }
     }
 
     /// A view stops showing it. The stream ends shortly after the last one goes away.
-    public func release() {
+    public func release(detail: Bool = true) {
         interest = max(interest - 1, 0)
-        guard interest == 0 else { return }
+        if detail { detailInterest = max(detailInterest - 1, 0) }
+        guard interest == 0 else {
+            // The panel went: the status bar goes on at its own pace, a moment later (switching
+            // panel tabs gives it back right away).
+            if detail, detailInterest == 0 {
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(5))
+                    self?.intervalMayHaveChanged()
+                }
+            }
+            return
+        }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
             guard let self, self.interest == 0 else { return }
@@ -120,10 +153,12 @@ public final class RemoteMonitor {
             if status != 0 && status != 15, !err.isEmpty {
                 self.error = err.split(separator: "\n").suffix(2).joined(separator: "\n")
             }
-            // Keep data flowing while someone is watching (e.g. after a reconnect).
+            // Keep data flowing while someone is watching (e.g. after a reconnect); a server that
+            // keeps not answering is asked less often (`serverAnswered` asks again at once).
             if self.interest > 0 {
+                let wait = self.pace.next(first: 5)
                 self.restartTask = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(5))
+                    try? await Task.sleep(for: .seconds(wait))
                     guard let self, self.interest > 0, self.stream == nil else { return }
                     self.startStream()
                 }
@@ -131,6 +166,7 @@ public final class RemoteMonitor {
         }
         stream = s
         isStreaming = true
+        interval = wantedInterval
         let executor = self.executor
         let interval = self.interval
         Task { [weak self] in
@@ -149,6 +185,16 @@ public final class RemoteMonitor {
         }
     }
 
+    /// A terminal to this host connected: a stream waiting to try again starts now.
+    public func serverAnswered() {
+        pace.reset()
+        traffic.serverAnswered()
+        guard stream == nil, interest > 0, restartTask != nil else { return }
+        restartTask?.cancel()
+        restartTask = nil
+        startStream()
+    }
+
     private func stopStream() {
         restartTask?.cancel()
         stream?.stop()
@@ -160,6 +206,7 @@ public final class RemoteMonitor {
         let snap = ProbeParser.system(frame, previous: snapshot)
         snapshot = snap
         error = nil
+        pace.reset()
         let gpu = snap.gpus.compactMap(\.utilization).max()
         let net = snap.networkRates
         history.append(Sample(date: snap.timestamp, cpu: snap.cpuUsage ?? 0, memory: snap.memFraction, gpu: gpu,
@@ -171,6 +218,7 @@ public final class RemoteMonitor {
     /// One-off refresh (e.g. the Retry button).
     public func refresh(firstSample: Bool = false) async {
         guard !frozen, allows(.monitoring) else { return }
+        pace.reset()
         do {
             let start = Date()
             let text = try await executor.output(RemoteScript(ProbeScripts.system, windows: WindowsProbeScripts.system), arguments: ["1"], timeout: 20, purpose: "monitor")
@@ -184,8 +232,10 @@ public final class RemoteMonitor {
 
     // MARK: On-demand data
 
+    // Panels that refresh over and over skip their rounds while no window is visible (`paused`);
+    // one-time loads (and the agent status behind notifications) always run.
     public func refreshProcesses() async {
-        guard !frozen, allows(.processesPanel) else { return }
+        guard !frozen, !paused, allows(.processesPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.processes, windows: WindowsProbeScripts.processes), timeout: 20, purpose: "monitor") {
             processes = ProbeParser.processes(text)
         }
@@ -200,14 +250,14 @@ public final class RemoteMonitor {
     }
 
     public func refreshGPUProcesses() async {
-        guard !frozen, allows(.gpuPanel) else { return }
+        guard !frozen, !paused, allows(.gpuPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.gpuProcesses, windows: WindowsProbeScripts.gpuProcesses), timeout: 20, purpose: "monitor") {
             gpuProcesses = ProbeParser.gpuProcesses(text)
         }
     }
 
     public func refreshConnections() async {
-        guard !frozen, allows(.networkPanel) else { return }
+        guard !frozen, !paused, allows(.networkPanel) else { return }
         if let text = try? await executor.output(RemoteScript(ProbeScripts.connections, windows: WindowsProbeScripts.connections), timeout: 20, purpose: "monitor") {
             let parsed = ProbeParser.connections(text)
             logins = parsed.logins
@@ -283,16 +333,18 @@ public final class RemoteMonitor {
         }
     }
 
-    public func loadLogs(_ source: LogSource, lines: Int) async {
+    public func loadLogs(_ source: LogSource, lines: Int, level: LogLevel = .all) async {
         guard !frozen, allows(.logsPanel) else { return }
-        let (script, args) = ProbeScripts.logs(source, lines: lines)
-        let windowsArgs = [WindowsProbeScripts.logName(source), String(max(lines, 10))]
+        let (script, args) = ProbeScripts.logs(source, lines: lines, level: level)
+        let windowsArgs = [WindowsProbeScripts.logName(source), String(max(lines, 10)), level.rawValue]
         do {
             let platform = await executor.resolvedPlatform()
             logText = try await executor.output(RemoteScript(script, windows: WindowsProbeScripts.logs),
                                                 arguments: platform.isWindows ? windowsArgs : args, timeout: 30, purpose: "logs")
+            logError = nil
         } catch {
             logText = ""
+            logError = error.localizedDescription
             self.error = error.localizedDescription
         }
     }

@@ -127,6 +127,20 @@ public enum KeySetup {
         }
     }
 
+    /// The `IgnoreUnknown` value to write before `UseKeychain`: Apple's ssh knows that option,
+    /// other builds (Homebrew's OpenSSH) stop at it with "Bad configuration option" unless it is
+    /// listed there. Adds it to what the block already lists (a comma-separated pattern list).
+    public static func ignoreUnknownAddingUseKeychain(_ existing: String?) -> String {
+        let patterns = (existing ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let covered = patterns.contains { pattern in
+            guard !pattern.hasPrefix("!") else { return false }
+            let regex = "^" + NSRegularExpression.escapedPattern(for: pattern)
+                .replacingOccurrences(of: "\\*", with: ".*").replacingOccurrences(of: "\\?", with: ".") + "$"
+            return "usekeychain".range(of: regex, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+        return (covered ? patterns : patterns + ["UseKeychain"]).joined(separator: ",")
+    }
+
     /// Adds, changes or removes a key's passphrase (`ssh-keygen -p`; an empty `new` removes it).
     /// The passphrases go through askpass. The key file is copied first and put back if anything
     /// fails, so a key is never left half-changed.

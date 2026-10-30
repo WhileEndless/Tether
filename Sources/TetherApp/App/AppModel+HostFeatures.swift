@@ -120,7 +120,13 @@ extension AppModel {
                     let t = s.descriptor.target
                     if self.isEnabled(.agentStatus, for: t) { hosts[t.key] = t }
                 }
-                for t in hosts.values { await self.monitor(for: t).refreshRemoteSessions(maxAge: interval - 1) }
+                // Each host on its own: one that does not answer (up to the look's time limit, or a
+                // sign-in's) never delays the others' news. A look still running for a host is not
+                // started twice (`refreshRemoteSessions` returns at once then).
+                for t in hosts.values {
+                    let monitor = self.monitor(for: t)
+                    Task { @MainActor in await monitor.refreshRemoteSessions(maxAge: interval - 1) }
+                }
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
@@ -141,6 +147,16 @@ extension AppModel {
     }
 
     /// The agent a session's tab shows (its symbol), if any.
+    /// The container tool in the terminal's foreground, and what it is doing (from its command line
+    /// when the command watcher has it).
+    func containerTool(of s: TerminalSession) -> (kind: ToolKind, doing: String?)? {
+        guard settings.showToolIcons else { return nil }
+        let line = commandSamplers[s.id]?.frame?.leader?.commandLine
+        guard let program = s.foregroundName ?? line.flatMap({ $0.split(separator: " ").first.map(String.init) }),
+              let kind = ToolKind(program: program, commandLine: line) else { return nil }
+        return (kind, ToolKind.doing(line))
+    }
+
     func agentKind(of s: TerminalSession) -> AgentKind? {
         guard settings.showAgentIcons else { return nil }
         return s.agent?.kind ?? s.foregroundName.flatMap { AgentKind(program: $0) }

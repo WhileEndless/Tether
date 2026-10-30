@@ -68,6 +68,8 @@ public final class ProcessTraffic {
 
     @ObservationIgnored private let executor: RemoteExecutor
     @ObservationIgnored private var stream: RemoteStream?
+    @ObservationIgnored private var pace = RetryPace()
+    @ObservationIgnored private var restartTask: Task<Void, Never>?
     @ObservationIgnored private var interest = 0
     @ObservationIgnored private var interval: TimeInterval = 2
     @ObservationIgnored private var lastFlows: (date: Date, sample: FlowSample)?
@@ -87,7 +89,15 @@ public final class ProcessTraffic {
     public func retain(interval: TimeInterval = 2) {
         interest += 1
         self.interval = max(interval, 1)
-        if stream == nil && !frozen { start() }
+        if stream == nil && !frozen && !paused { start() }
+    }
+
+    /// While paused (no window visible, or the Mac is going to sleep), nothing is streamed.
+    public var paused = false {
+        didSet {
+            guard paused != oldValue else { return }
+            if paused { stream?.stop(); stream = nil } else if interest > 0 && stream == nil && !frozen { start() }
+        }
     }
 
     public func release() {
@@ -120,9 +130,12 @@ public final class ProcessTraffic {
                 self.diagnostics.add("The traffic stream stopped (exit \(status)): " + DiagnosticLog.tail(err), source: "network")
             }
             if self.interest > 0 {
-                Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(10))
-                    guard let self, self.interest > 0, self.stream == nil else { return }
+                let wait = self.pace.next(first: 10)
+                self.restartTask?.cancel()
+                self.restartTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard let self, !Task.isCancelled, self.interest > 0, self.stream == nil, !self.paused else { return }
+                    self.restartTask = nil
                     self.start()
                 }
             }
@@ -140,7 +153,17 @@ public final class ProcessTraffic {
         }
     }
 
+    /// A terminal to this host connected: a stream waiting to try again starts now.
+    func serverAnswered() {
+        pace.reset()
+        guard stream == nil, interest > 0, !paused, !frozen, let task = restartTask else { return }
+        task.cancel()
+        restartTask = nil
+        start()
+    }
+
     func ingest(_ record: String, at date: Date = Date()) {
+        pace.reset()
         let s = ProbeParser.sections(record)
         if let name = s["source"]?.first {
             switch name {

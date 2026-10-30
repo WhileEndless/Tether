@@ -51,8 +51,8 @@ struct HostStatusStrip: View {
         .frame(height: 24)
         .frame(maxWidth: .infinity)
         .background(.bar)
-        .onAppear { monitor.retain(interval: model.settings.monitorRefreshInterval) }
-        .onDisappear { monitor.release() }
+        .onAppear { monitor.retain(interval: model.settings.monitorRefreshInterval, detail: false) }
+        .onDisappear { monitor.release(detail: false) }
         .task(id: session.phase.isOnline) {
             // Learn about other tmux sessions on the server once we are connected, then keep the
             // list (and what runs in each session) fresh while the window is visible.

@@ -211,7 +211,7 @@ struct ConnectionProgressCard: View {
             state.connect(session.descriptor.target, isPrivate: session.descriptor.isPrivate)
             model.sessions.close(session.id, killRemote: false)
         }
-        else { session.reconnectNow() }
+        else { model.sessions.retryNow(session) }       // at once, also when an attempt hangs
     }
 
     private var details: some View {

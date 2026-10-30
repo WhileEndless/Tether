@@ -43,7 +43,12 @@ struct TetherCommands: Commands {
         CommandGroup(replacing: .help) {
             Button("Keyboard Shortcuts") { openWindow(id: "shortcuts") }
                 .shortcut(.shortcuts)
+            Button("Connection Log") { openWindow(id: "connection-log") }
             Divider()
+            Button(Updater.shared.isReady ? "Restart to Update…" : "Check for Updates…") {
+                openWindow(id: "update")
+                if Updater.shared.isReady { Updater.shared.restartToUpdate() } else { Updater.shared.check(userAsked: true) }
+            }
             Link("Tether on GitHub", destination: AppInfo.repository)
             Link("Release Notes", destination: AppInfo.releases)
             Link("Report an Issue…", destination: AppInfo.issues)
@@ -90,8 +95,9 @@ struct TetherCommands: Commands {
                 .shortcut(.addHost)
             Button("Edit SSH Config File…") { window?.showConfigEditor = true }
                 .shortcut(.editConfig)
-        }
-        CommandGroup(after: .saveItem) {
+            // Here, not after `.saveItem`: a window-based app has no such place, and what is put
+            // after it is never shown (⌘S and ⇧⌘W then did nothing).
+            Divider()
             Button("Save Session…") { if let active { SessionSave.run(active) } }
                 .shortcut(.saveSession)
                 .disabled(active == nil)
@@ -106,7 +112,7 @@ struct TetherCommands: Commands {
             // ⌘R reconnects while the session is not connected; while it is, ⌘R is mouse reporting.
             Button("Reconnect Now") {
                 guard let active else { return }
-                if active.phase.isDead { active.retryAfterFailure() } else { active.reconnectNow() }
+                AppModel.shared.sessions.retryNow(active)
             }
             .shortcut(.reconnect, when: canReconnect)
             .disabled(!canReconnect)
@@ -169,7 +175,9 @@ struct TetherCommands: Commands {
             Button("Merge All Windows") { if let window { model.workspaces.mergeAll(into: window.workspaceID) } }
                 .shortcut(.mergeWindows)
             Divider()
-            Button("Transfers") { window?.showTransfers.toggle() }
+            Button("Transfers") {
+                if let window { window.showTransfers.toggle() } else { NotificationCenter.default.post(name: .toggleTransfers, object: nil) }
+            }
                 .shortcut(.transfers)
             Button("Search") { openWindow(id: "search") }
             Divider()
@@ -251,6 +259,10 @@ struct TetherCommands: Commands {
     }
 
     private func sendFind(_ action: NSTextFinder.Action) {
+        // A file manager's list (or a Files tab): its search field.
+        // (A terminal with the keyboard keeps its own find bar, also when no window state is known.)
+        if action == .showFindInterface, let key = NSApp.keyWindow,
+           FileListKeys.KeyView.find(in: key, terminalShown: active != nil || key.firstResponder is TetherTerminalView) { return }
         // Terminals use Tether's find bar (match count, highlighted matches); other views
         // (transcripts) keep their own.
         if let id = active?.id, let view = TerminalRegistry.shared.existingView(for: id) {
@@ -272,6 +284,7 @@ struct TetherCommands: Commands {
                 if let selected { find.term = selected } else if find.term.isEmpty { find.term = FindPasteboard.get() ?? "" }
             }
             find.anchorRow = nil
+            find.earlierOffset = nil
             find.focusToken = UUID()
             model.terminalFind[id] = find
             return

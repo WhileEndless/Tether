@@ -29,11 +29,22 @@ public final class ScreenText {
     static let redrawSlack = 5
 
     private let terminal: Terminal
+    /// A full-screen program's screen is up (its output is not part of the text).
+    public var inAlternateScreen: Bool { terminal.isCurrentBufferAlternate }
     private let delegate = Sink()
     /// Next row (scroll-invariant) not taken yet.
     private var next = 0
     /// Rows in the buffer at the last count (to count quickly).
     private var known = 0
+    /// Rows taken so far (the next line returned starts at this row, about: wrapped rows join).
+    public var rowsTaken: Int { next }
+    /// Rows the output has reached so far (the cursor has been on): the screen's rows exist from
+    /// the start, but are reached as output comes down to them.
+    public var rowsReached: Int {
+        reached = max(reached, cursorRow + 1)
+        return reached
+    }
+    private var reached = 0
     /// A logical line still growing (its next row may be a wrapped continuation).
     private var open: String?
     /// Bytes held back until the next line break, so no escape sequence or marker is cut in two.
@@ -49,6 +60,7 @@ public final class ScreenText {
     /// The terminal was resized while a full-screen program was up: where the normal screen's
     /// output continues is found again when the program ends.
     private var resizedInAlternate = false
+    private var images = ImageSequenceFilter()
 
     public init(cols: Int = ScreenText.defaultCols, rows: Int = ScreenText.defaultRows) {
         var options = TerminalOptions.default
@@ -56,12 +68,14 @@ public final class ScreenText {
         options.rows = rows
         options.scrollback = 4_000
         terminal = Terminal(delegate: delegate, options: options)
+        terminal.registerOscHandler(code: 7771) { _ in }     // Tether's markers (size, commands)
         known = terminal.rows
     }
 
     /// Feeds output; returns the lines finished by it.
     public func feed(_ bytes: some Sequence<UInt8>) -> [String] {
-        carry.append(contentsOf: bytes)
+        let chunk = Array(bytes)
+        carry.append(contentsOf: images.filter(chunk[...]))
         // Up to the last line break (or everything, past 1 MB without one).
         guard let cut = carry.lastIndex(of: 0x0a).map({ $0 + 1 }) ?? (carry.count > 1 << 20 ? carry.count : nil) else { return [] }
         let ready = carry[0..<cut]
@@ -71,6 +85,7 @@ public final class ScreenText {
 
     /// The rest: what is still on the screen (without trailing empty lines).
     public func finish() -> [String] {
+        carry.append(contentsOf: images.flush())
         var out = carry.isEmpty ? [] : process(carry[...])
         carry.removeAll()
         // A full-screen program still up: the normal screen's rows were taken when it started.
@@ -150,7 +165,12 @@ public final class ScreenText {
                 }
                 continue
             }
-            if ScrollbackRule.keepsScreen(code, terminal: t) {
+            let inPiece = rest[rest.startIndex..<range.lowerBound]
+            let before = range.lowerBound - bytes.startIndex < ScrollbackRule.tailLength
+                ? (ruleTail + bytes[bytes.startIndex..<range.lowerBound])[...] : inPiece
+            // Text of a recording keeps what every clear took off the screen (repeats appear once):
+            // what was recorded can always be found.
+            if ScrollbackRule.keepsScreen(code, terminal: t, before: before, keepRedraws: true) {
                 ScrollbackRule.keepScreen(t) { t.feed(buffer: $0) }
                 out += take()
                 if let open { out += accept(open) }
@@ -163,8 +183,13 @@ public final class ScreenText {
             rest = rest[range.upperBound...]
         }
         if !rest.isEmpty { t.feed(buffer: rest) }
+        ruleTail.append(contentsOf: bytes.suffix(ScrollbackRule.tailLength))
+        if ruleTail.count > ScrollbackRule.tailLength { ruleTail.removeFirst(ruleTail.count - ScrollbackRule.tailLength) }
         return out + take()
     }
+
+    /// The end of what was fed before (a home sequence and an erase cut apart are seen together).
+    private var ruleTail: [UInt8] = []
 
     /// `ESC[?1049h`, `ESC[?1047h`, `ESC[?47h`: a full-screen program starts (`…l`: it ends).
     static let alternateEnter = UInt8(ascii: "a")

@@ -15,7 +15,8 @@ public struct TitleSequenceFilter: Sendable {
 
     /// Filters a chunk. Returns the bytes to display and the last complete title, if any.
     public mutating func filter(_ input: [UInt8]) -> (output: [UInt8], title: String?) {
-        if state == .normal, !input.contains(0x1b) { return (input, nil) }
+        // Most chunks hold escape sequences but no `ESC k`: passed through without being copied.
+        if state == .normal, !Self.mayHoldTitle(input) { return (input, nil) }
         var out: [UInt8] = []
         out.reserveCapacity(input.count)
         var found: String?
@@ -43,6 +44,20 @@ public struct TitleSequenceFilter: Sendable {
             }
         }
         return (out, found)
+    }
+
+    /// Holds `ESC k`, or ends with ESC (the rest may come in the next chunk).
+    static func mayHoldTitle(_ input: [UInt8]) -> Bool {
+        input.withUnsafeBufferPointer { b in
+            guard let last = b.last else { return false }
+            if last == 0x1b { return true }
+            var i = 0
+            while i + 1 < b.count {
+                if b[i] == 0x1b, b[i + 1] == 0x6b { return true }
+                i += 1
+            }
+            return false
+        }
     }
 
     private mutating func finish() -> String {

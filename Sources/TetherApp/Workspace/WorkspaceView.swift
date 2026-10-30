@@ -1,8 +1,10 @@
 import SwiftUI
+import MonitorKit
 import TetherCore
 import SessionKit
 import TerminalUI
 import SSHTransport
+import FileTransferKit
 
 /// The window's content: its terminal, or the welcome screen when the window has no session.
 struct WorkspaceView: View {
@@ -30,12 +32,18 @@ struct SessionPane: View {
     @Environment(\.openWindow) private var openWindow
     let session: TerminalSession
     @State private var olderHistoryOnDisk = false
+    /// Scrolled back further than the terminal holds at once (it moves through the recording).
+    @State private var browsingHistory = false
+    /// Whole commands selected further back than memory (copied from the recording).
+    @State private var commandSelection: String?
     @State private var dismissedPrompt: PasswordPrompt?
 
     /// The full progress card for first connections, re-attaching after relaunch and failures;
     /// quick reconnects of an established session use the small banner instead.
     private var showsProgressCard: Bool {
         guard let p = session.progress else { return false }
+        // The server asks something in the terminal before its shell starts: show the terminal.
+        if session.serverWaitsInTerminal, p.failure == nil { return false }
         switch session.phase {
         case .connecting: return true
         case .waiting: return p.failure != nil || !session.wasOnline || p.includesRestore
@@ -65,12 +73,39 @@ struct SessionPane: View {
                     SessionBanner(session: session)
                         .padding(.top, 10)
                 }
-                if olderHistoryOnDisk, let url = session.flushedRecordingURL() {
+                // The recording is flushed when the button is used, not while drawing (a flush waits
+                // for the recorder's queue).
+                if let commandSelection {
+                    GlassPill {
+                        HStack(spacing: 10) {
+                            Image(systemName: "text.badge.checkmark").foregroundStyle(.secondary)
+                            Text(commandSelection).monospacedDigit()
+                            if !commandSelection.hasPrefix("Cop") {
+                                Button("Copy") { TerminalRegistry.shared.existingView(for: session.id)?.copyCommandSelection() }
+                                    .glassButtonStyle()
+                            }
+                        }
+                    }
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                } else if browsingHistory {
+                    GlassPill {
+                        HStack(spacing: 10) {
+                            Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
+                            Text("Earlier output, from the recording")
+                            Button("Back to Live") { TerminalRegistry.shared.existingView(for: session.id)?.returnToLive() }
+                                .glassButtonStyle()
+                        }
+                    }
+                    .padding(.top, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                } else if olderHistoryOnDisk, session.recordingURL != nil {
                     GlassPill {
                         HStack(spacing: 10) {
                             Image(systemName: "clock.arrow.circlepath").foregroundStyle(.secondary)
                             Text("Earlier output is saved on disk")
                             Button("Open Full History") {
+                                guard let url = session.flushedRecordingURL() else { return }
                                 openWindow(id: "transcript", value: TranscriptRequest(path: url.path, revealFraction: 1))
                             }
                             .glassButtonStyle()
@@ -104,6 +139,8 @@ struct SessionPane: View {
             .onDisappear { SecureInput.set(false, for: session.id) }
             .animation(.snappy, value: model.uploadBatches[session.id]?.id)
             .animation(.snappy, value: olderHistoryOnDisk)
+            .animation(.snappy, value: browsingHistory)
+            .animation(.snappy, value: commandSelection)
             .animation(.smooth(duration: 0.25), value: session.progress == nil)
             SessionFooter(session: session)
         }
@@ -113,13 +150,35 @@ struct SessionPane: View {
             if session.attention != nil { Notifier.shared.seen(session) }
             let view = TerminalRegistry.shared.view(for: session)
             view.onReachedHistoryLimit = { at in olderHistoryOnDisk = at }
-            // Scrolling past what is in memory reads earlier output back from the recording.
-            view.historySource = session.recordingURL == nil ? nil : { [weak session] in session?.flushedRecordingURL() }
-            view.onFiles = { [weak state] urls in
-                guard let state else { return }
+            view.onBrowsingHistory = { browsingHistory = $0 }
+            view.onCommandSelection = { text in
+                commandSelection = text
+                // "Copied …" stays a moment.
+                if let text, text.hasPrefix("Copied") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if commandSelection == text { commandSelection = nil } }
+                }
+            }
+            browsingHistory = view.isBrowsingHistory
+            view.onFiles = { [weak state, weak session] urls in
+                guard let state, let session else { return }
                 AppModel.shared.handleFiles(urls, for: session, in: state)
             }
-            view.onClick = { [weak state] in state?.follow(session) }
+            view.onRemoteFiles = { [weak state, weak session] in
+                guard let state, let session else { return false }
+                return AppModel.shared.pasteRemoteClip(into: session, in: state)
+            }
+            view.onRemoteDrop = { [weak state, weak session] data in
+                guard let state, let session,
+                      let clip = RemoteClipboard.merge(data.compactMap(RemoteClipboard.decode)) else { return false }
+                return AppModel.shared.pasteRemoteClip(into: session, in: state, dropped: clip)
+            }
+            view.onClick = { [weak state, weak session] in
+                if let session { state?.follow(session) }
+            }
+            view.shellSeenAt = { [weak session] in
+                guard let session, session.phase.isOnline else { return nil }
+                return AppModel.shared.shellSeenAtPrompt(session)
+            }
         }
     }
 }
@@ -128,21 +187,68 @@ struct SessionPane: View {
 struct SessionBanner: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
+    @Environment(\.openWindow) private var openWindow
     let session: TerminalSession
 
     var body: some View {
         Group {
             switch session.phase {
             case .online:
-                EmptyView()
-            case .connecting:
+                // Typed while away and waited long: sent only when the user says so.
+                if session.heldInputNeedsConfirmation {
+                    GlassPill {
+                        HStack(spacing: 10) {
+                            Image(systemName: "keyboard").foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Send what you typed while away?").fontWeight(.semibold)
+                                Text("\(session.heldInput.count) characters, typed while the connection was lost")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Button("Send") { session.sendHeldInput() }
+                                .prominentGlassButtonStyle()
+                            Button("Discard") { session.discardHeldInput() }
+                                .glassButtonStyle()
+                        }
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                } else if let drop = session.recentRecovery {
+                    // Small and brief: the session is back, nothing to do. Why it dropped is in the
+                    // tooltip and the Connection Log (a click opens it).
+                    Button { openWindow(id: "connection-log") } label: {
+                        Label("Reconnected", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("The connection was lost at \(drop.date.formatted(date: .omitted, time: .standard)): \(drop.reason). Click for the Connection Log.")
+                    .transition(.opacity)
+                }
+            case .connecting where session.serverWaitsInTerminal:
                 GlassPill {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Connecting to \(session.descriptor.target.displayName)…")
+                    HStack(spacing: 10) {
+                        Image(systemName: "keyboard").foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Waiting for the server").fontWeight(.semibold)
+                            Text("If it asks something, answer in the terminal — the session starts when its shell does")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
+            case .connecting where slowConnect:
+                // Only when connecting takes a while: a quick one shows nothing.
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Connecting to \(session.descriptor.target.displayName)…")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(.regularMaterial, in: Capsule())
+                .transition(.opacity)
+            case .connecting:
+                EmptyView()
             case .waiting(let attempt, let next):
                 GlassPill {
                     HStack(spacing: 10) {
@@ -155,6 +261,8 @@ struct SessionBanner: View {
                                     Text("Attempt \(attempt) · retrying \(next, style: .relative)")
                                 } else if session.retryPausedReason != nil || session.waitsForUser {
                                     Text("Attempt \(attempt) · waiting for you")
+                                } else if model.settings.autoReconnect {
+                                    Text("Attempt \(attempt) · stopped trying — Reconnect Now tries again")
                                 } else {
                                     Text("Attempt \(attempt) · automatic retry is off")
                                 }
@@ -165,8 +273,12 @@ struct SessionBanner: View {
                                     .lineLimit(session.retryPausedReason != nil ? 2 : 1)
                                     .help(err)
                             }
+                            if !session.heldInput.isEmpty {
+                                Text("\(session.heldInput.count) characters typed — sent when the session is back (Ctrl-C drops them)")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            }
                         }
-                        Button("Reconnect Now") { session.reconnectNow() }
+                        Button("Reconnect Now") { model.sessions.retryNow(session) }
                             .glassButtonStyle()
                         Button("Close") { state.closeTab(session) }
                             .glassButtonStyle()
@@ -205,7 +317,16 @@ struct SessionBanner: View {
             }
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: session.phase)
+        .animation(.easeInOut(duration: 0.2), value: slowConnect)
+        .task(id: session.phase.isConnecting) {
+            slowConnect = false
+            guard session.phase.isConnecting else { return }
+            try? await Task.sleep(for: .seconds(1.5))
+            if !Task.isCancelled, session.phase.isConnecting { slowConnect = true }
+        }
     }
+
+    @State private var slowConnect = false
 }
 
 struct SessionFooter: View {
@@ -233,6 +354,12 @@ struct SessionFooter: View {
                 Image(systemName: persistenceIcon)
             }
             .help(persistenceHelp)
+            if suggestsTmux {
+                Button("Keep Shells Running…") { showTmuxSuggestion = true }
+                    .buttonStyle(.link)
+                    .help("This system has no tmux or screen: see how to install tmux so shells survive a dropped connection")
+                    .popover(isPresented: $showTmuxSuggestion, arrowEdge: .top) { TmuxSuggestion(session: session) }
+            }
             // Only an icon: whether output is kept on this Mac (the tooltip says where to change it).
             if session.descriptor.isPrivate {
                 Image(systemName: "eye.slash").foregroundStyle(.secondary)
@@ -279,6 +406,17 @@ struct SessionFooter: View {
         return short.count > 24 ? short.prefix(23) + "…" : short
     }
 
+    @State private var showTmuxSuggestion = false
+
+    /// A plain shell only because the system has no tmux or screen (not Windows, not a device, not
+    /// a host set to plain shells), and not turned off for this host.
+    private var suggestsTmux: Bool {
+        session.persistence == .plain && session.phase.isOnline && !session.platform.isWindows
+            && session.descriptor.persistence != .off
+            && !PlatformCache.shared.isDevice(session.descriptor.target.key)
+            && !model.settings.noTmuxSuggestion.contains(session.descriptor.target.key)
+    }
+
     private var persistenceText: String {
         switch session.persistence {
         case .tmux: "Persistent (tmux)"
@@ -323,5 +461,68 @@ struct FilesPane: View {
         FileBrowserView(target: tab.target, standalone: true, initialPath: tab.path,
                         openTerminal: { dir in state.connect(tab.target, directory: dir) },
                         external: model.fileTabs.browser(for: tab))
+    }
+}
+
+/// How to get tmux on a system that has neither tmux nor screen: the command for its package
+/// manager, typed into the terminal for the user to run (Tether installs nothing itself).
+private struct TmuxSuggestion: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let session: TerminalSession
+    @State private var suggestion: MultiplexerInstall.Suggestion?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Keep shells running").font(.headline)
+            Text(session.descriptor.target.isLocal
+                 ? "This Mac has no tmux, so this shell ends when its tab is closed or Tether quits. With tmux installed, new tabs keep running and come back after a relaunch."
+                 : "This server has no tmux or screen, so this shell ends when the connection drops, the Mac sleeps long or the tab is closed. With tmux installed there, new tabs keep running and Tether re-attaches to them.")
+                .fixedSize(horizontal: false, vertical: true)
+            if let suggestion {
+                if let command = suggestion.command {
+                    Text(command)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                }
+                Text(suggestion.note + (suggestion.command != nil ? " This tab stays as it is; open a new tab once tmux is there." : ""))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    if let command = suggestion.command {
+                        Button("Type in Terminal") {
+                            // Typed, not run: the user reads it and presses Return.
+                            session.send(Array(command.utf8)[...])
+                            dismiss()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(command, forType: .string)
+                        }
+                    }
+                    Spacer()
+                    Button("Don't Suggest for This Host") {
+                        model.settings.noTmuxSuggestion.append(session.descriptor.target.key)
+                        dismiss()
+                    }
+                    .buttonStyle(.link)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for the system's package manager…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 420)
+        .task {
+            let r = await model.monitor(for: session.descriptor.target).executor.run(MultiplexerInstall.probe, timeout: 15, purpose: "sessions")
+            suggestion = MultiplexerInstall.suggestion(from: r.output)
+        }
     }
 }

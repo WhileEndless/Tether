@@ -342,6 +342,7 @@ struct ListeningCard: View {
 
 struct RemoteSessionsPanel: View {
     @Environment(AppModel.self) private var model
+    @Environment(WindowState.self) private var state
     let monitor: RemoteMonitor
     let target: ConnectionTarget
 
@@ -363,10 +364,10 @@ struct RemoteSessionsPanel: View {
                     Spacer()
                     let leftovers = leftoverCount
                     if leftovers > 0 {
-                        Button("Clean Up \(leftovers) Leftover") {
-                            Task { _ = await monitor.cleanUpOrphans(keeping: openNames) }
+                        Button("Clean Up \(leftovers) Leftover…") {
+                            state.cleanUpLeftovers(on: target)
                         }
-                        .help("Kill detached Tether sessions that are not open in the app")
+                        .help("Open as tabs, or end, the detached Tether sessions that are not open in the app (asks first)")
                     }
                 }
             } footer: {

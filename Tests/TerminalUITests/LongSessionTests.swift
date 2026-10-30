@@ -60,7 +60,7 @@ import RecordingKit
         #expect(scrollTime < 2)
     }
 
-    @Test func scrollingPastMemoryLoadsEarlierOutputInPlace() throws {
+    @Test func scrollingPastMemoryLoadsEarlierOutputInPlace() async throws {
         _ = NSApplication.shared
         var settings = AppSettings()
         settings.scrollbackLines = 2_000
@@ -77,11 +77,11 @@ import RecordingKit
             view.feed(bytes[...])
             recorder.append(bytes)
         }
-        view.historySource = { recorder.flushNow(); return recorder.url }
+        view.historyReader = { reader in recorder.snapshot(then: reader); return true }
         view.historyChunkLines = 3_000
 
         func topLine() -> String {
-            let t = view.getTerminal()
+            let t = view.displayedTerminal.getTerminal()
             return t.getLine(row: 0)?.translateToString(trimRight: true).trimmingCharacters(in: .whitespaces) ?? ""
         }
         view.scrollTo(row: 0)
@@ -90,14 +90,23 @@ import RecordingKit
         // Select a line that is on screen, then load earlier output.
         view.selection.setSelection(start: Position(col: 0, row: 5), end: Position(col: 9, row: 5))
         let selected = view.getSelection()
-        #expect(view.loadOlderHistory())
+        let loaded = await withCheckedContinuation { done in
+            view.onHistoryLoaded = { view.onHistoryLoaded = nil; done.resume(returning: $0) }
+            if !view.loadOlderHistory() { done.resume(returning: false) }
+        }
+        #expect(loaded)
+        #expect(view.isBrowsingHistory)
         #expect(topLine() == before, "the line at the top of the view does not move")
-        #expect(view.getSelection() == selected, "the selection stays on the same text")
-        // Earlier lines are now in the buffer, and scrolling up continues into them.
-        view.scrollTo(row: 0)
+        #expect(view.getSelection() == selected, "the live terminal underneath is untouched")
+        // Earlier lines are shown now, and scrolling up continues into them.
+        view.displayedTerminal.scrollTo(row: 0)
         let earlier = Int(topLine().split(separator: " ").last ?? "") ?? 0
         let previous = Int(before.split(separator: " ").last ?? "") ?? 0
         #expect(earlier > 0 && earlier <= previous - 2_500)
+        // Typing: the live terminal again, as it was.
+        view.returnToLive()
+        #expect(!view.isBrowsingHistory)
+        #expect(view.getSelection() == selected)
         recorder.close()
     }
 }

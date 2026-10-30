@@ -260,6 +260,8 @@ enum DemoFiles {
         """
         #!/bin/sh
         D=\(d.shellQuoted)
+        # TETHER_DEMO_SSHLOG: every call's arguments, to see what the app asks.
+        [ -n "$TETHER_DEMO_SSHLOG" ] && printf '%s\n' "$*" >> "$D/ssh.log"
         for a; do case "$a" in -O) exit 1;; esac; done
         host=; take=0
         for a; do if [ $take = 1 ]; then host=$a; take=2; fi; [ "$a" = "--" ] && [ $take = 0 ] && take=1; done
@@ -279,6 +281,8 @@ enum DemoFiles {
             unset TMUX
             eval "exec $last"
             ;;
+          # The shell check a host never seen gets (a POSIX shell answers it like this).
+          "echo "*) eval "$last" ;;
           *) exit 0 ;;
         esac
         """
@@ -289,6 +293,11 @@ enum DemoFiles {
         #!/bin/sh
         f=\(d.shellQuoted)/screens/"$TETHER_DEMO_HOST".txt
         [ -f "$f" ] && cat "$f"
+        # TETHER_DEMO_SPIN: one tab redraws a status line as coding agents do (to measure drawing).
+        if [ -n "$TETHER_DEMO_SPIN" ] && [ "$TETHER_DEMO_HOST" = web-01 ]; then
+          n=0
+          while :; do printf '\033[?25l\r\033[2K* Working %s tokens\033[?25h' "$n"; n=$((n+1)); sleep 0.033; done
+        fi
         while IFS= read -r line; do :; done
         """
     }

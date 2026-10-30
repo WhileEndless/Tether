@@ -8,8 +8,9 @@ struct TransfersView: View {
         let items = model.transfers.items
         let running = items.filter { $0.state == .running }.count
         let queued = items.filter { $0.state == .queued }.count
-        if running + queued == 0 { return items.isEmpty ? "" : "All done" }
-        return "\(running) running" + (queued > 0 ? " · \(queued) queued" : "")
+        let preparing = model.transfers.preparations.count
+        if running + queued + preparing == 0 { return items.isEmpty ? "" : "All done" }
+        return "\(running) running" + (queued > 0 ? " · \(queued) queued" : "") + (preparing > 0 ? " · \(preparing) preparing" : "")
             + " · \(model.transfers.policy.parallel) at a time"
     }
 
@@ -27,7 +28,7 @@ struct TransfersView: View {
             }
             .padding(12)
             Divider()
-            if model.transfers.items.isEmpty {
+            if model.transfers.items.isEmpty && model.transfers.preparations.isEmpty {
                 EmptyStateView(symbol: "arrow.up.arrow.down", title: "No Transfers",
                                message: "Drop files on a terminal or the file manager to upload them.")
                     .frame(height: 180)
@@ -49,6 +50,12 @@ struct TransfersView: View {
 
     private var rows: some View {
         VStack(spacing: 0) {
+            ForEach(model.transfers.preparations) { prep in
+                PreparationRow(prep: prep)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                Divider().padding(.leading, 46)
+            }
             ForEach(model.transfers.items) { item in
                 TransferRow(item: item)
                     .padding(.horizontal, 12)
@@ -86,6 +93,9 @@ struct TransferRow: View {
                 }
                 route
                 status
+                if let note = item.note {
+                    Text(note).font(.caption).foregroundStyle(.orange).lineLimit(2)
+                }
                 if item.entries.count > 1 {
                     DisclosureGroup(isExpanded: $expanded) {
                         EntryList(entries: item.entries)
@@ -106,6 +116,7 @@ struct TransferRow: View {
             }
             Divider()
             if item.isFinished {
+                if item.canRetry { Button("Retry") { model.transfers.retry(item) } }
                 Button("Remove from List") { withAnimation { model.transfers.remove(item) } }
             } else {
                 Button("Cancel") { model.transfers.cancel(item) }
@@ -138,16 +149,27 @@ struct TransferRow: View {
         switch item.state {
         case .queued:
             Text("Queued — waiting for a free slot").font(.caption).foregroundStyle(.secondary)
+        case .running where item.isStopping:
+            ProgressView(value: item.progress)
+            Text("Stopping…").font(.caption).foregroundStyle(.secondary)
         case .running:
-            ProgressView(value: item.progress).animation(.smooth, value: item.progress)
-            Text(runningText).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+            if let question = item.question {
+                QuestionView(item: item, question: question)
+            } else {
+                ProgressView(value: item.progress).animation(.smooth, value: item.progress)
+                if let stage = item.stageText {
+                    Text(stage).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                if item.stage == nil || item.stage == .streaming || item.bytesDone > 0 {
+                    Text(runningText).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
         case .completed:
             Text(completedText).font(.caption).foregroundStyle(.green)
         case .failed(let msg):
             Text(msg).font(.caption).foregroundStyle(.red).lineLimit(3).textSelection(.enabled)
         case .cancelled:
-            Text(item.method == .archive ? "Cancelled — nothing was left at the destination"
-                                         : "Cancelled — a partly copied file may remain at the destination")
+            Text("Cancelled — what it had copied so far was removed")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -155,7 +177,7 @@ struct TransferRow: View {
     private var runningText: String {
         var parts: [String] = []
         if item.method == .archive {
-            parts.append(item.totalBytes.map { "\(item.bytesDone.byteString) of \($0.byteString)" } ?? item.bytesDone.byteString)
+            parts.append("Sent " + (item.totalBytes.map { "\(item.bytesDone.byteString) of \($0.byteString)" } ?? item.bytesDone.byteString))
         } else {
             parts.append("\(Int(item.progress * 100))%")
             if !item.transferred.isEmpty { parts.append(item.transferred) }
@@ -186,6 +208,12 @@ struct TransferRow: View {
     private var actions: some View {
         if item.isFinished {
             HStack(spacing: 6) {
+                if item.canRetry {
+                    Button { model.transfers.retry(item) } label: {
+                        Label("Retry", systemImage: "arrow.clockwise").labelStyle(.titleAndIcon).font(.caption)
+                    }
+                    .help("Send it again from the start (nothing is overwritten)")
+                }
                 if item.state == .completed, !localURLs.isEmpty, item.direction == .download {
                     Button { NSWorkspace.shared.activateFileViewerSelecting(localURLs) } label: {
                         Image(systemName: "magnifyingglass")
@@ -264,5 +292,51 @@ private struct EntryList: View {
         }
         .textSelection(.enabled)
         .padding(.top, 2)
+    }
+}
+
+/// Work before a transfer starts (checking names, counting files), with what it found so far.
+private struct PreparationRow: View {
+    @Environment(AppModel.self) private var model
+    let prep: TransferPreparation
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: prep.direction == .upload ? "arrow.up.circle" : "arrow.down.circle")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(prep.title).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(prep.statusText).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 4)
+            Button { model.transfers.cancel(prep) } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .help("Cancel — nothing has been sent yet")
+        }
+    }
+}
+
+/// "<host> is slow to compress (2 cores, load 3.4)." with the two ways on, and whether to keep
+/// the answer for the host.
+struct QuestionView: View {
+    @Environment(AppModel.self) private var model
+    let item: TransferItem
+    let question: CompressionQuestion
+    @State private var remember = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(question.text).font(.caption).foregroundStyle(.orange)
+            HStack(spacing: 8) {
+                Button("Send Without Compressing") { model.transfers.answer(item, compress: false, remember: remember) }
+                Button("Compress Anyway (\(question.method.rawValue))") { model.transfers.answer(item, compress: true, remember: remember) }
+                Toggle("Remember for this host", isOn: $remember).toggleStyle(.checkbox)
+            }
+            .controlSize(.small)
+        }
     }
 }

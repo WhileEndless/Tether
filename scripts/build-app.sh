@@ -25,8 +25,10 @@ cd "$ROOT"
 MAP=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=." -Xswiftc -debug-prefix-map -Xswiftc "$ROOT=."
      -Xcc "-ffile-prefix-map=$ROOT=." -Xcc "-fdebug-prefix-map=$ROOT=.")
 build() {   # build <extra swift build arguments…>; prints the folder with the products
-    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product Tether >&2
-    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product tether-askpass >&2
+    # Inside "$(build)" bash does not stop at a failed command by itself (set -e does not reach
+    # there): a build that fails must not package the app built before.
+    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product Tether >&2 || return 1
+    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product tether-askpass >&2 || return 1
     swift build -c "$CONFIG" "${MAP[@]}" "$@" --show-bin-path
 }
 if [ "${UNIVERSAL:-}" = 1 ]; then
@@ -82,6 +84,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSSupportsAutomaticTermination</key><false/>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.tether.remote-files</string>
+            <key>UTTypeDescription</key><string>Tether Remote Files</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
@@ -94,9 +104,21 @@ if [ "$CONFIG" = release ]; then
     fi
 fi
 
-# Ad-hoc signature so macOS runs it locally. Sign with your own identity for distribution.
+# Signing identity: TETHER_SIGN_IDENTITY, else a "Tether Local Signing" certificate if one exists
+# (make signing-identity creates it), else ad-hoc. With a fixed certificate macOS recognises every
+# build as the same app, so permissions (Documents, Downloads …) and the keychain's "Always Allow"
+# stay granted across updates; an ad-hoc signature is a new app to macOS with every build.
 # Hardened runtime: macOS ignores DYLD_* variables for the app, so no library can be injected into
 # Tether (which holds the keychain access, the recording key and the askpass socket).
-codesign --force --options runtime --sign - "$APP/Contents/MacOS/tether-askpass"
-codesign --force --options runtime --sign - "$APP"
-echo "Built $APP"
+IDENTITY="${TETHER_SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ] && security find-identity -p codesigning 2>/dev/null | grep -q '"Tether Local Signing"'; then
+    IDENTITY="Tether Local Signing"
+fi
+IDENTITY="${IDENTITY:--}"
+codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/MacOS/tether-askpass"
+codesign --force --options runtime --sign "$IDENTITY" "$APP"
+if [ "$IDENTITY" = "-" ]; then
+    echo "Built $APP (ad-hoc signature; run 'make signing-identity' once to keep macOS permissions across builds)"
+else
+    echo "Built $APP (signed with \"$IDENTITY\")"
+fi

@@ -177,7 +177,7 @@ struct KeySetupView: View {
     }
 
     private func hasSavedPassphrase(_ key: KeySetup.LocalKey?) -> Bool {
-        key.map { PasswordVault.hasPassword(for: CredentialKey.passphrase(keyPath: $0.privateKeyURL.path)) } ?? false
+        key.map { PasswordVault.hasPassword(for: CredentialKey.passphraseItem(keyPath: $0.privateKeyURL.path)) } ?? false
     }
 
     private func begin(_ text: String) -> Int {
@@ -255,10 +255,15 @@ struct KeySetupView: View {
                 try doc.setOption("IdentitiesOnly", value: "yes", forHost: request.alias)
                 if agentWorks {
                     try doc.setOption("AddKeysToAgent", value: "yes", forHost: request.alias)
+                    // IgnoreUnknown has to come before UseKeychain: an ssh other than Apple's (such
+                    // as Homebrew's in Terminal) would otherwise refuse the whole config.
+                    let ignored = doc.host(named: request.alias)?.value("IgnoreUnknown")
+                    try doc.setOption("UseKeychain", value: nil, forHost: request.alias)
+                    try doc.setOption("IgnoreUnknown", value: KeySetup.ignoreUnknownAddingUseKeychain(ignored), forHost: request.alias)
                     try doc.setOption("UseKeychain", value: "yes", forHost: request.alias)
                 }
             }
-            end(i4, ok: true, "Config updated: IdentityFile ~/.ssh/\(key.name)\(agentWorks ? ", AddKeysToAgent, UseKeychain" : "")")
+            end(i4, ok: true, "Config updated: IdentityFile ~/.ssh/\(key.name)\(agentWorks ? ", AddKeysToAgent, UseKeychain (IgnoreUnknown for other ssh builds)" : "")")
             model.updateMetadata(for: request.alias) { $0.keyLoginWorks = true }
             succeeded = true
         } catch {

@@ -64,6 +64,8 @@ public struct TmuxPassthrough {
     public init() {}
 
     public mutating func filter(_ bytes: [UInt8]) -> [UInt8] {
+        // Nearly every chunk: nothing held and no `ESC P` in it — passed on without copying.
+        if held.isEmpty, !Self.holdsDCS(bytes), Self.partialStart(bytes) == nil { return bytes }
         var input = held + bytes
         held = []
         guard input.count >= 2, Self.find(Self.start, in: input, from: 0) != nil || Self.partialStart(input) != nil else { return input }
@@ -106,16 +108,27 @@ public struct TmuxPassthrough {
         guard hay.count >= needle.count, from <= hay.count - needle.count else { return nil }
         var i = from
         while i <= hay.count - needle.count {
-            if hay[i] == needle[0], Array(hay[i..<(i + needle.count)]) == needle { return i }
+            if hay[i] == needle[0], hay[i..<(i + needle.count)].elementsEqual(needle) { return i }
             i += 1
         }
         return nil
     }
 
+    private static func holdsDCS(_ bytes: [UInt8]) -> Bool {
+        bytes.withUnsafeBufferPointer { b in
+            var i = 0
+            while i + 1 < b.count {
+                if b[i] == 0x1b, b[i + 1] == 0x50 { return true }
+                i += 1
+            }
+            return false
+        }
+    }
+
     /// Where the end of `bytes` may be the start of a wrapper cut short (`ESC`, `ESC P t`, …).
     private static func partialStart(_ bytes: [UInt8]) -> Int? {
         for n in stride(from: min(start.count - 1, bytes.count), through: 1, by: -1) {
-            if Array(bytes.suffix(n)) == Array(start.prefix(n)) { return bytes.count - n }
+            if bytes.suffix(n).elementsEqual(start.prefix(n)) { return bytes.count - n }
         }
         return nil
     }
@@ -139,7 +152,7 @@ public enum TabActivity: Equatable, Sendable {
         let runs = running ?? foreground.map { !$0.isEmpty && !ShellNames.contains($0) } ?? false
         guard runs else { return .idle }
         if outputActive { return .working("output") }
-        if let cpu, cpu >= cpuThreshold { return .working("\(Int(cpu.rounded())) % CPU") }
+        if let cpu, cpu.isFinite, cpu >= cpuThreshold { return .working("\(Int(cpu.rounded())) % CPU") }
         if let io, io >= ioThreshold { return .working("network or disk") }
         return .quiet
     }

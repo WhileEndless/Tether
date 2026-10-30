@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Observation
 import CryptoKit
 
@@ -242,6 +243,11 @@ public final class CommandHistoryStore {
     /// Of `lockedFiles`, those encrypted with a key that is not loaded (rather than unreadable).
     @ObservationIgnored private var sealedFiles: Set<String> = []
     @ObservationIgnored private var dirty: Set<String> = []
+    /// Of `dirty`: the records that changed per host, and the hosts to write whole.
+    @ObservationIgnored private var changedRecords: [String: Set<UUID>] = [:]
+    @ObservationIgnored private var rewrite: Set<String> = []
+    /// A journal is folded into its file once it grows past this (or past the file itself).
+    nonisolated static let journalLimit = 256 * 1024
     /// While a host's file cannot be opened (Tether locked), what is recorded for it meanwhile is
     /// written next to it, `<file>.pending-<run>.json`, one per run of the app; once the file opens,
     /// they are merged into it and removed. So nothing waits in memory only.
@@ -267,6 +273,9 @@ public final class CommandHistoryStore {
 
     /// The record of the command still running in a terminal (as last seen), if any.
     public func running(sessionID: UUID) -> CommandRecord? {
+        // Asked when a terminal's command is followed again (not by views): the history must be
+        // there, or a command still running would get a second record.
+        loadIfNeeded()
         return records.first { $0.sessionID == sessionID && $0.isRunning }
     }
 
@@ -286,7 +295,7 @@ public final class CommandHistoryStore {
         var r = record
         r.hostStarted = process.hostStarted
         records.insert(r, at: 0)
-        changed(hostKey, soon: true)
+        changed(hostKey, soon: true, record: record.id)
         return record.id
     }
 
@@ -301,14 +310,14 @@ public final class CommandHistoryStore {
         record.ended = ended
         record.short = true
         records.insert(record, at: 0)
-        changed(hostKey, soon: false)
+        changed(hostKey, soon: true, record: record.id)
     }
 
     /// Adds a reading to a running record.
     public func add(_ sample: CommandSample, to id: UUID, weight: Double) {
         guard let i = records.firstIndex(where: { $0.id == id }), records[i].isRunning else { return }
         records[i].add(sample, weight: weight)
-        changed(records[i].hostKey, soon: false)
+        changed(records[i].hostKey, soon: false, record: id)
     }
 
     /// Adds the processes and connections one look saw (each part only when it is kept).
@@ -324,7 +333,7 @@ public final class CommandHistoryStore {
         guard seconds > 0, let i = records.firstIndex(where: { $0.id == id }), records[i].isRunning else { return }
         records[i].disconnectedSeconds += seconds
         records[i].lastSeen = max(records[i].lastSeen, date)
-        changed(records[i].hostKey, soon: true)
+        changed(records[i].hostKey, soon: true, record: id)
     }
 
     /// Ends a running record. `before` is the latest it can have ended, when it ended unseen.
@@ -335,7 +344,7 @@ public final class CommandHistoryStore {
         if let at, at > records[i].lastSeen { records[i].lastSeen = at }
         records[i].ended = records[i].lastSeen
         records[i].endedBefore = before
-        changed(records[i].hostKey, soon: true)
+        changed(records[i].hostKey, soon: true, record: id)
     }
 
     /// Records left running by terminals that are not open any more (closed, or Tether quit and
@@ -412,12 +421,26 @@ public final class CommandHistoryStore {
     /// changes `records`, so the app does it before views look.
     public func load() { loadIfNeeded() }
 
+    /// The same, with the files read, opened and decoded in the background (up to tens of
+    /// megabytes at launch): the window stays responsive meanwhile.
+    public func loadInBackground() async {
+        guard !loaded else { return }
+        let files = files(), codec = codec
+        let read = await Task.detached(priority: .utility) { files.map { ($0, Self.readFile($0, codec: codec)) } }.value
+        guard !loaded else { return }       // something that writes loaded meanwhile
+        apply(read)
+    }
+
     private func loadIfNeeded() {
         guard !loaded else { return }
+        apply(files().map { ($0, Self.readFile($0, codec: codec)) })
+    }
+
+    private func apply(_ read: [(URL, FileContents)]) {
         loaded = true
         var all: [CommandRecord] = []
-        for file in files() {
-            guard let list = read(file) else { continue }
+        for (file, contents) in read {
+            guard let list = take(file, contents) else { continue }
             all += list
             if Self.isPending(file) { mergedPending.insert(file) }
         }
@@ -429,7 +452,8 @@ public final class CommandHistoryStore {
     /// seen last.
     private static func unique(_ list: [CommandRecord]) -> [CommandRecord] {
         var best: [UUID: CommandRecord] = [:]
-        for r in list where best[r.id].map({ $0.lastSeen < r.lastSeen }) ?? true { best[r.id] = r }
+        // On a tie the later one (a journal comes after its file).
+        for r in list where best[r.id].map({ $0.lastSeen <= r.lastSeen }) ?? true { best[r.id] = r }
         return Array(best.values)
     }
 
@@ -447,35 +471,108 @@ public final class CommandHistoryStore {
             .filter { $0.pathExtension == "json" && !$0.lastPathComponent.contains(".unreadable") }
     }
 
+    /// What a file held, read without touching the store (in the background at launch).
+    enum FileContents: Sendable {
+        case unavailable
+        case locked(size: Int)
+        case unreadable(size: Int)
+        case records([CommandRecord], size: Int)
+    }
+
+    nonisolated static func readFile(_ file: URL, codec: Codec) -> FileContents {
+        guard let data = try? Data(contentsOf: file) else { return .unavailable }
+        switch codec.open(data) {
+        case .locked: return .locked(size: data.count)
+        case .unreadable: return .unreadable(size: data.count)
+        case .data(let packed):
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let plain = unpack(packed), let list = try? decoder.decode(HostFile.self, from: plain) else {
+                return .unreadable(size: data.count)
+            }
+            return .records(list.records + readJournal(of: file, codec: codec), size: data.count)
+        }
+    }
+
+    /// Records added to a file's journal since it was written, in order (later ones are newer).
+    /// A frame cut short (a crash while adding) ends it.
+    nonisolated static func readJournal(of file: URL, codec: Codec) -> [CommandRecord] {
+        guard let data = try? Data(contentsOf: file.deletingPathExtension().appendingPathExtension("journal")) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var out: [CommandRecord] = []
+        var pos = data.startIndex
+        while pos + 4 <= data.endIndex {
+            let length = Int(data[pos..<(pos + 4)].reduce(UInt32(0)) { $0 << 8 | UInt32($1) })
+            let start = pos + 4
+            guard length > 0, start + length <= data.endIndex else { break }
+            if case .data(let packed) = codec.open(data.subdata(in: start..<(start + length))),
+               let plain = unpack(packed), let list = try? decoder.decode([CommandRecord].self, from: plain) {
+                out += list
+            }
+            pos = start + length
+        }
+        // A frame cut short (Tether stopped, or the disk filled, while adding it): nothing more may be
+        // added after it, or it would never be read. Not cut off here — a reading can overlap a frame
+        // being added — but noted, and the host's next write is the whole file, which removes the journal.
+        if pos < data.endIndex { _ = tornJournals.withLock { $0.insert(file.deletingPathExtension().path) } }
+        return out
+    }
+
+    /// Journals found to end in a frame cut short (by their host file's path).
+    nonisolated static let tornJournals = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+
+    /// Adds one frame (its length, then it) to the end of a journal; returns the journal's size.
+    nonisolated static func append(_ frame: Data, to url: URL) throws -> Int {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            guard fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let end = try handle.seekToEnd()
+        var length = UInt32(frame.count).bigEndian
+        do {
+            try handle.write(contentsOf: Data(bytes: &length, count: 4) + frame)
+        } catch {
+            // Part of it may be there (a full disk): cut it off, or frames added later would sit
+            // behind a broken one and never be read.
+            try? handle.truncate(atOffset: end)
+            throw error
+        }
+        return Int(end) + 4 + frame.count
+    }
+
     /// The records in `file`; nil when it is locked (the host is then not written until opened).
     private func read(_ file: URL) -> [CommandRecord]? {
-        guard let data = try? Data(contentsOf: file) else {
+        take(file, Self.readFile(file, codec: codec))
+    }
+
+    private func take(_ file: URL, _ contents: FileContents) -> [CommandRecord]? {
+        switch contents {
+        case .unavailable:
             // Not readable now (permissions, a disk error): treated as locked, never overwritten.
             lockedFiles.insert(Self.name(of: file))
             diagnostics.add("A command history file could not be read; it is left as it is.", source: "history")
             return nil
-        }
-        fileSizes[Self.name(of: file)] = data.count
-        switch codec.open(data) {
-        case .locked:
+        case .locked(let size):
+            fileSizes[Self.name(of: file)] = size
             lockedFiles.insert(Self.name(of: file))
             sealedFiles.insert(Self.name(of: file))
             return nil
-        case .unreadable:
+        case .unreadable(let size):
+            fileSizes[Self.name(of: file)] = size
             moveAside(file)
             return []
-        case .data(let packed):
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            guard let plain = Self.unpack(packed), let list = try? decoder.decode(HostFile.self, from: plain) else {
-                moveAside(file)
-                return []
-            }
-            return list.records
+        case .records(let list, let size):
+            fileSizes[Self.name(of: file)] = size
+            return list
         }
     }
 
-    private struct HostFile: Codable {
+    private struct HostFile: Codable, Sendable {
         var hostKey: String
         var records: [CommandRecord]
     }
@@ -521,8 +618,11 @@ public final class CommandHistoryStore {
         }
     }
 
-    private func changed(_ hostKey: String, soon: Bool) {
+    /// `record`: only that record changed (it can be added to the host's journal); nil: the file is
+    /// written whole (records removed, many changed).
+    private func changed(_ hostKey: String, soon: Bool, record: UUID? = nil) {
         dirty.insert(hostKey)
+        if let record { changedRecords[hostKey, default: []].insert(record) } else { rewrite.insert(hostKey) }
         if soon {
             saveTask?.cancel()
             saveTask = nil
@@ -530,7 +630,9 @@ public final class CommandHistoryStore {
             return
         }
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(soon ? 1 : 30))
+            // Samples of a running command only now and then (a long build would rewrite the
+            // host's whole file every half minute); starts and ends at once.
+            try? await Task.sleep(for: .seconds(soon ? 1 : 300))
             guard !Task.isCancelled, let self else { return }
             self.saveTask = nil
             self.writeDirty()
@@ -541,18 +643,28 @@ public final class CommandHistoryStore {
     /// a snapshot of the records is taken here. The sizes come back afterwards: over the limit, the
     /// oldest finished records go and the files are written again.
     private func writeDirty() {
+        prune()
         let hosts = dirty
         dirty = []
+        let changedNow = changedRecords, rewriteNow = rewrite
+        changedRecords = [:]
+        rewrite = []
         guard !hosts.isEmpty else { return }
-        prune()
         // A host whose file cannot be opened now gets this run's pending file instead (never the
         // file itself); one that can is written whole, and its merged pending files go.
-        let snapshot = hosts.map { host -> (host: String, list: [CommandRecord], url: URL, pending: Bool, merged: [URL]) in
+        // Only some records of a host changed, its file is there and its journal is still small:
+        // they are added to the journal (a few hundred bytes) instead of writing the file again.
+        let snapshot = hosts.map { host -> (host: String, list: [CommandRecord], url: URL, pending: Bool, merged: [URL], journal: [CommandRecord]?) in
             let name = Self.fileName(for: host)
             let pending = lockedFiles.contains(name)
             let url = directory.appendingPathComponent(pending ? "\(name).pending-\(runID).json" : name + ".json")
             let merged = pending ? [] : mergedPending.filter { Self.owner(ofPending: $0) == name && $0 != url }
-            return (host, records.filter { $0.hostKey == host }, url, pending, Array(merged))
+            let list = records.filter { $0.hostKey == host }
+            var journal: [CommandRecord]?
+            if !pending, merged.isEmpty, !rewriteNow.contains(host), let ids = changedNow[host] {
+                journal = list.filter { ids.contains($0.id) }
+            }
+            return (host, list, url, pending, Array(merged), journal)
         }
         let dir = directory
         let codec = self.codec
@@ -563,11 +675,23 @@ public final class CommandHistoryStore {
             var removed: [URL] = []
             var pendingWritten: [URL] = []
             var failures: [String] = []
-            for (host, list, url, pending, merged) in snapshot {
+            for (host, list, url, pending, merged, journal) in snapshot {
+                let journalURL = url.deletingPathExtension().appendingPathExtension("journal")
                 do {
+                    // The file is there and its journal still small (by their sizes on disk now).
+                    func size(_ u: URL) -> Int? { (try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? NSNumber)?.intValue }
+                    let name = url.deletingPathExtension().path
+                    let torn = Self.tornJournals.withLock { $0.contains(name) }
+                    if !torn, let journal, !journal.isEmpty, let fileSize = size(url), fileSize > 0,
+                       (size(journalURL) ?? 0) < min(Self.journalLimit, fileSize),
+                       let json = try? encoder.encode(journal), let packed = Self.pack(json),
+                       let sealed = codec.seal(packed), (try? Self.append(sealed, to: journalURL)) != nil {
+                        continue
+                    }
                     guard !list.isEmpty else {
                         if !pending {
                             if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+                            try? FileManager.default.removeItem(at: journalURL)
                             for file in merged where (try? FileManager.default.removeItem(at: file)) != nil { removed.append(file) }
                         }
                         sizes[host] = .some(0)
@@ -582,6 +706,11 @@ public final class CommandHistoryStore {
                     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                     try sealed.write(to: url, options: [.atomic])
                     sizes[host] = pending ? .some(0) : .some(sealed.count)
+                    // The file holds everything now: its journal goes (also one cut short).
+                    if !pending {
+                        try? FileManager.default.removeItem(at: journalURL)
+                        _ = Self.tornJournals.withLock { $0.remove(name) }
+                    }
                     if pending { pendingWritten.append(url) }
                     // Everything they held is in the file now.
                     for file in merged where (try? FileManager.default.removeItem(at: file)) != nil { removed.append(file) }
@@ -624,11 +753,15 @@ public final class CommandHistoryStore {
     private func prune() {
         let cutoff = retentionDays > 0 ? Date().addingTimeInterval(-Double(retentionDays) * 86_400) : nil
         var perHost: [String: Int] = [:]
+        var pruned: Set<String> = []
         records = records.filter { r in
             if r.isRunning { return true }
-            if let cutoff, (r.ended ?? r.lastSeen) < cutoff { return false }
+            if let cutoff, (r.ended ?? r.lastSeen) < cutoff { pruned.insert(r.hostKey); return false }
             perHost[r.hostKey, default: 0] += 1
-            return perHost[r.hostKey]! <= maxRecordsPerHost
+            if perHost[r.hostKey]! > maxRecordsPerHost { pruned.insert(r.hostKey); return false }
+            return true
         }
+        // Records gone: those files are written whole (a journal only adds).
+        for host in pruned { dirty.insert(host); rewrite.insert(host) }
     }
 }

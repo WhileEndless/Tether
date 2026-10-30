@@ -1,5 +1,6 @@
 import AppKit
 import LocalAuthentication
+import SSHTransport
 import TetherCore
 import SSHConfigKit
 import SessionKit
@@ -69,12 +70,32 @@ final class SecretGate {
     /// Ends the grace period: the next saved password needs a new check.
     func lock() {
         lastSuccess = nil
+        // Saved passwords remembered for this run need Touch ID again too; with "forget when
+        // locking", typed ones go as well.
+        let model = AppModel.shared
+        model.quickConnectPasswords.removeAll()
+        if model.settings.forgetSignInPasswordsOnLock { model.passwordCache.removeAll() }
+        else if isRequired { model.passwordCache.removeKeychainEntries() }
     }
 }
 
 /// Names of keychain items. Login passwords keep the plain host key (as in earlier versions).
 enum CredentialKey {
-    static func passphrase(keyPath: String) -> String { "passphrase:" + keyPath }
+    /// The item for a key file's passphrase: one name however the file is reached (`~`, `..`, a
+    /// symbolic link to it), so every host using the key finds the same one.
+    static func passphrase(keyPath: String) -> String { SealedPasswordCache.passphrasePrefix + canonicalKeyPath(keyPath) }
+
+    static func canonicalKeyPath(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// The item to read and save a key's passphrase under: `passphrase(keyPath:)`, or the name an
+    /// earlier version saved it under (the path as ssh wrote it) while only that one exists.
+    static func passphraseItem(keyPath: String) -> String {
+        let item = passphrase(keyPath: keyPath)
+        let earlier = SealedPasswordCache.passphrasePrefix + keyPath
+        return earlier != item && !PasswordVault.hasPassword(for: item) && PasswordVault.hasPassword(for: earlier) ? earlier : item
+    }
 
     /// The key file named by an `Enter passphrase for key '/path':` prompt, when it exists here.
     static func localKeyPath(in prompt: String) -> String? {
@@ -117,7 +138,7 @@ enum CredentialKey {
         case .passphrase:
             // A key on this Mac: the same item ssh's own prompt (askpass) uses, so its passphrase is
             // kept once. A key on a server stays with that host.
-            if hostKey == ConnectionTarget.local.key, let path = localKeyPath(in: prompt.text) { return passphrase(keyPath: path) }
+            if hostKey == ConnectionTarget.local.key, let path = localKeyPath(in: prompt.text) { return passphraseItem(keyPath: path) }
             return "passphrase:\(hostKey):\(prompt.text)"
         case .generic:
             let asker = (process?.command ?? program).flatMap { $0.isEmpty || TerminalSession.isShell($0) ? nil : $0 }
@@ -137,7 +158,12 @@ enum CredentialKey {
         case "doas" where parts.count == 3:
             return ("lock.shield", "doas on \(parts[1])", "for \(parts[2])")
         case "passphrase":
-            return ("key.fill", "Key passphrase", parts.dropFirst().joined(separator: ":"))
+            let path = parts.dropFirst().joined(separator: ":")
+            // A key on this Mac that was moved or deleted: its passphrase opens nothing any more.
+            if path.hasPrefix("/"), !FileManager.default.fileExists(atPath: path) {
+                return ("exclamationmark.triangle", "Key passphrase (key file not found)", path)
+            }
+            return ("key.fill", "Key passphrase", path)
         case "prompt" where parts.count == 3:
             return ("terminal", "Password on \(parts[1])", parts[2])
         case "login":

@@ -31,8 +31,26 @@ public final class RemoteStream: @unchecked Sendable {
     }
 
     /// Starts the variant of `script` for `platform` (resolve it first with `resolvedPlatform()`).
+    /// A remote stream first gets its host's shared connection (it never signs in for quiet work).
     public func start(executor: RemoteExecutor, script remoteScript: RemoteScript, platform: RemotePlatform,
                       arguments: [String], purpose: String) {
+        guard !executor.target.isLocal, executor.options.useControlMaster else {
+            launch(executor: executor, script: remoteScript, platform: platform, arguments: arguments, purpose: purpose)
+            return
+        }
+        Task {
+            switch await executor.prepared(purpose: purpose) {
+            case .ready(let ready):
+                self.launch(executor: ready, script: remoteScript, platform: platform, arguments: arguments, purpose: purpose)
+            case .refused(let result):
+                DispatchQueue.main.async { self.onEnd?(result.status, result.errorOutput) }
+            }
+        }
+    }
+
+    private func launch(executor: RemoteExecutor, script remoteScript: RemoteScript, platform: RemotePlatform,
+                        arguments: [String], purpose: String) {
+        guard !lock.withLock({ stopped }) else { return }
         var stdinData: Data
         if executor.target.isLocal {
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -55,6 +73,7 @@ public final class RemoteStream: @unchecked Sendable {
         }
         env = AskPassBridge.shared.environment(for: executor.target.key, purpose: purpose)
         let quiet = SSHOptions.isQuietPurpose(purpose), local = executor.target.isLocal, key = executor.target.key
+        let shared = executor.options.usesSharedConnection
         process.environment = ChildEnvironment.base.merging(env) { $1 }
         let out = Pipe(), err = Pipe(), input = Pipe()
         process.standardOutput = out
@@ -76,8 +95,9 @@ public final class RemoteStream: @unchecked Sendable {
             let status = p.terminationStatus
             let text = errData.text
             // Only a stream that never delivered anything can have failed to sign in (one that ran
-            // for hours and then lost its network did not).
-            if quiet, !local, self?.receivedAny != true { BackgroundSignIn.shared.noteQuietResult(key, status: status, stderr: text) }
+            // for hours and then lost its network did not). Through a shared connection it cannot
+            // have tried to sign in at all.
+            if quiet, !local, !shared, self?.receivedAny != true { BackgroundSignIn.shared.noteQuietResult(key, status: status, stderr: text) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 AskPassBridge.shared.revoke(environment: self.env)
@@ -87,11 +107,15 @@ public final class RemoteStream: @unchecked Sendable {
         do {
             try process.run()
             AskPassBridge.shared.bindToken(env, pid: process.processIdentifier)
+            // Stopped while the connection was being prepared: nothing more to do.
+            if lock.withLock({ stopped }) { process.terminate(); return }
             let data = stdinData
-            // Keep stdin open: closing it would end `sh -s` once the script has been read anyway,
-            // but some shells read lazily, so the pipe stays open until stop().
-            try input.fileHandleForWriting.write(contentsOf: data)
-            try input.fileHandleForWriting.close()
+            // Off the caller's thread (often the main one): a script larger than the pipe's buffer
+            // would wait there until the far end reads it, however slow its host is.
+            DispatchQueue.global().async {
+                try? input.fileHandleForWriting.write(contentsOf: data)
+                try? input.fileHandleForWriting.close()
+            }
         } catch {
             DispatchQueue.main.async { self.onEnd?(-1, error.localizedDescription) }
         }

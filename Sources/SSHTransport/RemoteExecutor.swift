@@ -27,34 +27,56 @@ public struct RemoteExecutor: Sendable {
     }
 
     /// Runs the variant of `script` for the host's platform (detected once, then cached).
+    /// - Parameter stopOnCancel: cancelling the calling task ends the command (see `ProcessRunner`).
     public func run(_ script: RemoteScript, arguments: [String] = [], stdin extra: Data? = nil,
-                    timeout: TimeInterval = 30, purpose: String = "command") async -> ProcessResult {
+                    timeout: TimeInterval = 30, purpose: String = "command", stopOnCancel: Bool = false) async -> ProcessResult {
         if target.isLocal {
-            var input = Data(script.posix.utf8)
+            // Many arguments (thousands of file names): macOS starts no program with more than
+            // 4,096. They are set at the top of the script instead, which comes on stdin.
+            let many = arguments.count > 512
+            var input = Data(((many ? "set -- " + arguments.map(\.shellQuoted).joined(separator: " ") + "\n" : "") + script.posix).utf8)
             if !script.posix.hasSuffix("\n") { input.append(0x0a) }
             if let extra { input.append(extra) }
-            return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + arguments, environment: ChildEnvironment.local,
-                                           input: input, timeout: timeout)
+            return await ProcessRunner.run("/bin/sh", arguments: ["-s", "--"] + (many ? [] : arguments), environment: ChildEnvironment.local,
+                                           input: input, timeout: timeout, stopOnCancel: stopOnCancel)
         }
-        // Wait for a login to this host in progress, shared connection or not: its host-key
-        // question is answered once, and known_hosts has the key when this ssh starts.
-        await ConnectionGate.shared.waitForTurn(target.key)
         let quiet = SSHOptions.isQuietPurpose(purpose)
-        if quiet, !(await backgroundWorkAllowed()) {
-            return ProcessResult(status: 255, stdout: Data(), stderr: Data(backgroundWaitingMessage.utf8), timedOut: false)
-        }
-        let platform = await resolvedPlatform(quiet: quiet)
-        let call: (command: String, input: Data)
-        do {
-            call = try invocation(script, arguments: arguments, platform: platform, extra: extra)
-        } catch {
-            return ProcessResult(status: 127, stdout: Data(), stderr: Data(error.localizedDescription.utf8), timedOut: false)
-        }
-        let args = options.batchArguments(target: target, remoteCommand: call.command, quiet: quiet)
-        let env = AskPassBridge.shared.environment(for: target.key, purpose: purpose)
-        defer { AskPassBridge.shared.revoke(environment: env) }
-        var result = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: call.input, timeout: timeout)
-        if quiet { BackgroundSignIn.shared.noteQuietResult(target.key, status: result.status, stderr: result.errorOutput) }
+        var attempt = 0
+        var result: ProcessResult
+        var platform: RemotePlatform
+        repeat {
+            attempt += 1
+            let me: RemoteExecutor
+            switch await prepared(purpose: purpose) {
+            case .ready(let ready): me = ready
+            case .refused(let refusal): return refusal
+            }
+            platform = await me.resolvedPlatform(quiet: quiet)
+            let call: (command: String, input: Data)
+            do {
+                call = try me.invocation(script, arguments: arguments, platform: platform, extra: extra)
+            } catch {
+                return ProcessResult(status: 127, stdout: Data(), stderr: Data(error.localizedDescription.utf8), timedOut: false)
+            }
+            let args = me.options.batchArguments(target: target, remoteCommand: call.command, quiet: quiet)
+            let env = AskPassBridge.shared.environment(for: target.key, purpose: purpose)
+            // Without sharing, this ssh signs in by itself: as its connection (Signing In Again).
+            let ownSignIn = !quiet && !me.options.useControlMaster ? env["TETHER_ASKPASS_TOKEN"] : nil
+            if let token = ownSignIn, let identity = await SharedConnections.shared.identity(of: target, options: me.options) {
+                SharedConnections.onSignInStarted?(token, identity)
+            }
+            result = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: call.input, timeout: timeout,
+                                             stopOnCancel: stopOnCancel)
+            AskPassBridge.shared.revoke(environment: env)
+            if let token = ownSignIn {
+                SharedConnections.onSignInResult?(token, result.status != 255 && !result.timedOut,
+                                                  BackgroundSignIn.reasonFor(stderr: result.errorOutput) == .password)
+            }
+            if quiet, !me.options.usesSharedConnection { BackgroundSignIn.shared.noteQuietResult(target.key, status: result.status, stderr: result.errorOutput) }
+            // The shared connection ended between preparing and running: once more, which signs
+            // in again (once for the host) or finds it back.
+            guard !(stopOnCancel && Task.isCancelled), await me.lostSharedConnection(result) else { break }
+        } while attempt < 2
         if platform.isWindows {
             // PowerShell writes CRLF; the parsers expect LF.
             result.stdout = PowerShell.normalize(result.stdout)
@@ -70,8 +92,9 @@ public struct RemoteExecutor: Sendable {
     }
 
     public func output(_ script: RemoteScript, arguments: [String] = [], timeout: TimeInterval = 30,
-                       purpose: String = "command") async throws -> String {
-        let r = await run(script, arguments: arguments, timeout: timeout, purpose: purpose)
+                       purpose: String = "command", stopOnCancel: Bool = false) async throws -> String {
+        let r = await run(script, arguments: arguments, timeout: timeout, purpose: purpose, stopOnCancel: stopOnCancel)
+        if stopOnCancel { try Task.checkCancellation() }
         if r.timedOut { throw RemoteError("The command timed out.") }
         if r.status == 255 {
             throw RemoteError(Self.cleanError(r.errorOutput, fallback: "Could not connect to \(target.displayName)."))
@@ -82,22 +105,63 @@ public struct RemoteExecutor: Sendable {
         return r.output
     }
 
-    static func cleanError(_ text: String, fallback: String) -> String {
+    public static func cleanError(_ text: String, fallback: String) -> String {
         let lines = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("Warning: Permanently added") }
         return lines.isEmpty ? fallback : lines.suffix(3).joined(separator: "\n")
     }
 
-    /// Whether a multiplex master is alive for this target.
+    /// Whether this target's shared connection is up (never signs in).
     public func isMasterAlive() async -> Bool {
-        guard options.useControlMaster, !target.isLocal else { return false }
-        let r = await ProcessRunner.run(options.sshBinary, arguments: options.controlArguments(target: target, command: "check"), timeout: 5)
-        return r.status == 0
+        await SharedConnections.shared.isUp(target, options: options)
     }
 
-    /// Asks the multiplex master to exit, dropping every channel that shares it.
+    /// Asks the shared connection to exit, dropping every channel that shares it.
     public func closeMaster() async {
-        guard options.useControlMaster, !target.isLocal else { return }
-        _ = await ProcessRunner.run(options.sshBinary, arguments: options.controlArguments(target: target, command: "exit"), timeout: 5)
+        guard let ready = await SharedConnections.shared.readyOptions(target, options: options), let socket = ready.controlPath else { return }
+        _ = await ProcessRunner.run(options.sshBinary, arguments: ["-F", "/dev/null", "-o", "ControlPath=\(socket)", "-O", "exit", "tether-master"], timeout: 5)
+        await SharedConnections.shared.forget(socket: socket)
+    }
+
+    public enum Prepared: Sendable {
+        case ready(RemoteExecutor)
+        /// What to report instead of running (no connection, or it needs the user).
+        case refused(ProcessResult)
+    }
+
+    /// This executor with the shared connection prepared (signing in once for the host when the
+    /// purpose may ask), or the result to report instead.
+    public func prepared(purpose: String) async -> Prepared {
+        let quiet = SSHOptions.isQuietPurpose(purpose)
+        guard options.useControlMaster, !target.isLocal else {
+            // Without sharing: a login in progress first (its host-key question is answered once).
+            await ConnectionGate.shared.waitForTurn(target.key)
+            if quiet, !(await backgroundWorkAllowed()) {
+                return .refused(ProcessResult(status: 255, stdout: Data(), stderr: Data(backgroundWaitingMessage.utf8), timedOut: false))
+            }
+            return .ready(self)
+        }
+        let signIn = quiet ? nil : SharedConnections.SignIn(purpose: purpose)
+        switch await SharedConnections.shared.prepare(target, options: options, signIn: signIn) {
+        case .ready(let ready, _):
+            return .ready(RemoteExecutor(target: target, options: ready))
+        case .needsUser(let message):
+            return .refused(ProcessResult(status: 255, stdout: Data(), stderr: Data(message.utf8), timedOut: false))
+        case .failed(let message, let log):
+            let text = ([message] + log.suffix(3)).joined(separator: "\n")
+            return .refused(ProcessResult(status: 255, stdout: Data(), stderr: Data(text.utf8), timedOut: false))
+        }
+    }
+
+    /// ssh failed because the shared connection it was given is gone: its socket was removed, or
+    /// nothing answers on it (the client's ProxyCommand then fails at once, so it never signs in).
+    func lostSharedConnection(_ result: ProcessResult) async -> Bool {
+        guard result.status == 255, !result.timedOut, options.usesSharedConnection, let socket = options.controlPath else { return false }
+        if SharedConnections.isSocket(socket) {
+            guard SharedConnections.isLostConnectionMessage(result.errorOutput),
+                  case .gone = await SharedConnections.check(socket, ssh: options.sshBinary) else { return false }
+        }
+        await SharedConnections.shared.forget(socket: socket)
+        return true
     }
 }

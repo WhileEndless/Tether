@@ -1,6 +1,7 @@
 import SwiftUI
 import TetherCore
 import SessionKit
+import SSHTransport
 
 extension AppModel {
     /// The keychain item for the password prompt showing in `session`, if any (with the last known
@@ -36,10 +37,16 @@ extension AppModel {
             let host = session.descriptor.target.displayName
             // Touch ID (if enabled) first; the password is read from the keychain only afterwards.
             guard await !refuseIfShell(prompt, in: session) else { return }
+            let localKey = Self.isLocalKeyPassphrase(key)
+            if localKey, await refuseUnlessReadingLocally(prompt, in: session) { return }
             guard await SecretGate.shared.authorize("enter the \(Self.label(prompt)) on \(host)") else { return }
             // Touch ID can take a while: check again that a shell has not come to the foreground meanwhile.
+            if localKey, await refuseUnlessReadingLocally(prompt, in: session) { return }
             guard session.passwordPrompt == prompt, await !refuseIfShell(prompt, in: session),
-                  let password = PasswordVault.password(for: key) else { return }
+                  let password = await PasswordVault.passwordOffThread(for: key),
+                  session.passwordPrompt == prompt else { return }
+            // Reading the keychain can wait for macOS's dialog: still the same program asking?
+            if localKey, await refuseUnlessReadingLocally(prompt, in: session) { return }
             session.send(Array((password + "\r").utf8)[...])
             lastFilled[session.id] = Date()
         }
@@ -113,6 +120,32 @@ extension AppModel {
         return true
     }
 
+    /// The keychain item of a key file on this Mac (not `passphrase:<host>:…` of a key on a server).
+    static func isLocalKeyPassphrase(_ key: String) -> Bool {
+        key.hasPrefix(SealedPasswordCache.passphrasePrefix + "/")
+    }
+
+    /// A key on this Mac: its passphrase is typed only while an ssh tool on this Mac reads one from
+    /// this terminal, and every ssh reading is one that marks a server's questions. An ssh already
+    /// connected shows whatever the server prints, and an older ssh shows a server's question in
+    /// the same state as its own: either would send the passphrase to the server. Refuses (and
+    /// says why) otherwise, also when the terminal cannot be looked at
+    /// (`LocalTTY.refusalToTypeKeyPassphrase`).
+    private func refuseUnlessReadingLocally(_ prompt: PasswordPrompt, in session: TerminalSession) async -> Bool {
+        var refusal = "Tether cannot look at this terminal."
+        if session.descriptor.target == .local, case .posix(let pid)? = await session.shellAnchor(),
+           let tty = LocalTTY.path(ofProcess: Int32(pid)) {
+            // Off the main thread: it may ask an ssh program for its version once.
+            guard let why = await Task.detached(operation: { await LocalTTY.refusalToTypeKeyPassphrase(path: tty) }).value else { return false }
+            refusal = why
+        }
+        let alert = NSAlert()
+        alert.messageText = "The passphrase was not typed"
+        alert.informativeText = refusal + " The passphrase of your key is typed only for ssh on this Mac. If you are sure a program here is asking, type it with Enter… instead."
+        alert.runModal()
+        return true
+    }
+
     /// ⌥⌘P: fill the saved password, or open the secure entry sheet when there is none.
     func fillOrEnterPassword(in session: TerminalSession, state: WindowState?) {
         guard session.passwordPrompt != nil else { return }
@@ -130,11 +163,17 @@ extension AppModel {
         }
     }
 
+    /// The file name in `Enter passphrase for key '/path/id_example':`.
+    static func keyFileName(_ text: String) -> String? {
+        guard let m = text.firstMatch(of: #/passphrase for (?:key )?'([^']+)'/#) else { return nil }
+        return (String(m.1) as NSString).lastPathComponent
+    }
+
     static func label(_ prompt: PasswordPrompt) -> String {
         switch prompt.kind {
         case .sudo: prompt.user.map { "sudo password for \($0)" } ?? "sudo password"
         case .login: "password for \(prompt.user ?? "")@\(prompt.host ?? "")"
-        case .passphrase: "key passphrase"
+        case .passphrase: keyFileName(prompt.text).map { "passphrase of key \($0)" } ?? "key passphrase"
         case .generic: prompt.user.map { "password for \($0)" } ?? "password"
         }
     }

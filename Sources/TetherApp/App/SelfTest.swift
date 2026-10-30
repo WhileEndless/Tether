@@ -70,6 +70,65 @@ enum SelfTest {
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
 
+        // The menus while typing in a terminal: which item a ⌘ key reaches, and whether it is on.
+        // TETHER_SELFTEST_MENUS=1.
+        if env["TETHER_SELFTEST_MENUS"] != nil {
+            Task { @MainActor in
+                let s = state.connect(.local, persistence: .off)
+                for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                try? await Task.sleep(for: .seconds(1))
+                let view = TerminalRegistry.shared.view(for: s)
+                view.window?.makeKeyAndOrderFront(nil)
+                view.window?.makeFirstResponder(view)
+                try? await Task.sleep(for: .milliseconds(500))
+                say("first responder: \(String(describing: view.window?.firstResponder.map { type(of: $0) }))")
+                @MainActor func walk(_ menu: NSMenu, _ path: String) {
+                    for item in menu.items {
+                        if item.keyEquivalent == "s" || item.title.contains("Save") {
+                            say("item \(path) ▸ \(item.title) key=\(item.keyEquivalent) mods=\(item.keyEquivalentModifierMask.rawValue) enabled=\(item.isEnabled)")
+                        }
+                        if let sub = item.submenu { walk(sub, path + " ▸ " + item.title) }
+                    }
+                }
+                if let main = NSApp.mainMenu { walk(main, "") }
+                if let file = NSApp.mainMenu?.items.first(where: { $0.title == "File" })?.submenu {
+                    say("File menu: " + file.items.map { $0.isSeparatorItem ? "—" : "\($0.title)[\($0.keyEquivalent)]" }.joined(separator: " | "))
+                }
+                if let window = view.window, let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+                                                                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                                                           context: nil, characters: "s", charactersIgnoringModifiers: "s",
+                                                                           isARepeat: false, keyCode: 1) {
+                    NSApp.mainMenu?.update()
+                    let handled = NSApp.mainMenu?.performKeyEquivalent(with: event) ?? false
+                    say("menu took ⌘S: \(handled)")
+                    try? await Task.sleep(for: .seconds(1))
+                    let sheet = window.attachedSheet.map { "\(type(of: $0)) \($0.title)" } ?? "none"
+                    say("sheet after ⌘S: \(sheet)")
+                    window.attachedSheet.map { window.endSheet($0) }
+                }
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Quitting with local tmux tabs that print and record: Tether ends at once and the tmux
+        // sessions outlive it (checked from outside). TETHER_SELFTEST_QUIT=1; with
+        // TETHER_SELFTEST_KEEP it stays up instead (to be killed from outside).
+        if env["TETHER_SELFTEST_QUIT"] != nil {
+            Task { @MainActor in
+                model.settings.recordingEnabled = true
+                let tabs = [state.connect(.local, persistence: .tmux), state.connect(.local, persistence: .tmux)]
+                for _ in 0..<150 where tabs.contains(where: { !$0.phase.isOnline }) { try? await Task.sleep(for: .milliseconds(100)) }
+                for t in tabs { t.send(Array("i=0; while [ $i -lt 3000 ]; do echo line $i; i=$((i+1)); done\r".utf8)[...]) }
+                try? await Task.sleep(for: .seconds(3))
+                say("sessions \(tabs.map { "\($0.descriptor.remoteSessionName) \($0.persistence) \($0.phase.label)" })")
+                say("QUITTING")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
         // What a local terminal runs: shell, directory, persistence. TETHER_SELFTEST_LOCALSHELL=1.
         if env["TETHER_SELFTEST_LOCALSHELL"] != nil {
             Task { @MainActor in

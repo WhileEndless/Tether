@@ -240,9 +240,12 @@ struct HostEditorView: View {
                 }
                 if old != newAlias {
                     model.updateMetadata(for: newAlias) { $0 = model.metadata(for: old) }
-                    if let pw = PasswordVault.password(for: old) {
-                        PasswordVault.setPassword(pw, for: newAlias)
-                        PasswordVault.deletePassword(for: old)
+                    // Read off the main thread: macOS may ask whether Tether may use the item first.
+                    Task {
+                        if let pw = await PasswordVault.passwordOffThread(for: old) {
+                            PasswordVault.setPassword(pw, for: newAlias)
+                            PasswordVault.deletePassword(for: old)
+                        }
                     }
                 }
             } else {

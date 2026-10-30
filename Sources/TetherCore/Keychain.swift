@@ -139,20 +139,55 @@ public enum PasswordVault {
         Keychain.read(service: service, account: account).flatMap { String(data: $0, encoding: .utf8) }
     }
 
+    /// Whether one is saved (no password read, no dialog). Asked while drawing (the prompt bar
+    /// says whether Fill is possible): answers are kept for a few seconds instead of asking the
+    /// keychain on every redraw. Saving and deleting through here update them at once.
     public static func hasPassword(for account: String) -> Bool {
-        Keychain.exists(service: service, account: account)
+        let now = ProcessInfo.processInfo.systemUptime
+        let (known, generation) = existsLock.withLock { (exists[account], existsGeneration) }
+        if let known, now - known.at < 5 { return known.value }
+        let value = Keychain.exists(service: service, account: account)
+        existsLock.withLock {
+            // Saved or deleted while asking: that answer may be old, so it is not kept.
+            guard existsGeneration == generation else { return }
+            if exists.count > 256 { exists.removeAll() }
+            exists[account] = (value, now)
+        }
+        return value
+    }
+
+    private static let existsLock = NSLock()
+    nonisolated(unsafe) private static var exists: [String: (value: Bool, at: TimeInterval)] = [:]
+    nonisolated(unsafe) private static var existsGeneration = 0
+
+    private static func forgetExists(_ account: String) {
+        existsLock.withLock {
+            exists.removeValue(forKey: account)
+            existsGeneration &+= 1
+        }
     }
 
     @discardableResult
     public static func setPassword(_ password: String, for account: String) -> Bool {
-        Keychain.write(Data(password.utf8), service: service, account: account, label: "Tether: \(account)")
+        defer { forgetExists(account) }
+        return Keychain.write(Data(password.utf8), service: service, account: account, label: "Tether: \(account)")
     }
 
     public static func deletePassword(for account: String) {
         Keychain.delete(service: service, account: account)
+        forgetExists(account)
     }
 
     public static func allAccounts() -> [String] {
         Keychain.accounts(service: service)
+    }
+
+    /// Reading a password can block until macOS's "allow access" dialog is answered: one read at a
+    /// time on a queue of its own, never on a thread the rest of Tether's work shares (many sign-ins
+    /// waiting on a dialog would otherwise stall every connection).
+    private static let readQueue = DispatchQueue(label: "tether.keychain-read")
+
+    public static func passwordOffThread(for account: String) async -> String? {
+        await withCheckedContinuation { cont in readQueue.async { cont.resume(returning: password(for: account)) } }
     }
 }

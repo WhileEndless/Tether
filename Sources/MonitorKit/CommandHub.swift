@@ -13,7 +13,7 @@ public enum WatchEvent: Equatable, Sendable {
         // Stream records keep their line break (and Windows output may end in CR).
         let line = line.trimmingCharacters(in: .whitespacesAndNewlines)
         let f = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true).map(String.init)
-        guard f.count >= 2, let tab = Int(f[0]) else { return nil }
+        guard f.count >= 2, let tab = Int(f[0]), tab >= 0 else { return nil }
         switch f[1] {
         case "busy":
             guard f.count >= 3, let pid = Int(f[2]) else { return nil }
@@ -44,6 +44,11 @@ public final class CommandHub {
     /// Settings (Settings ▸ Monitoring): the watcher, how often it checks, how often to look.
     public var watchEnabled = true { didSet { if watchEnabled != oldValue { restartWatcher() } } }
     public var watchInterval: TimeInterval = 0.5 { didSet { if watchInterval != oldValue { restartWatcher() } } }
+
+    /// No Tether window is visible: the watcher goes on (it costs nothing while commands are idle,
+    /// and keeps the history's starts and ends right), looks at running commands only every 15 s.
+    public var backgrounded = false
+    private var lastLook: Date?
 
     private var watcher: RemoteStream?
     /// The terminals the running watcher reports on, by its tab numbers.
@@ -78,7 +83,12 @@ public final class CommandHub {
     /// Cuts the current wait short (a command started, a view opened).
     public func wake() { nap?.cancel() }
 
-    /// Ends the loop and the watcher (no terminals left online, or the app quits).
+    /// Starts again after `stop()` if a terminal is online (the Mac woke up).
+    public func resume() {
+        if samplers.values.contains(where: \.isOnline) { start() }
+    }
+
+    /// Ends the loop and the watcher (no terminals left online, the Mac goes to sleep, the app quits).
     public func stop() {
         loop?.cancel()
         loop = nil
@@ -113,8 +123,10 @@ public final class CommandHub {
     private func round() async {
         await keepWatcherCurrent()
         let now = Date()
+        if backgrounded, let lastLook, now.timeIntervalSince(lastLook) < 15 { return }
         let due = samplers.values.filter { $0.isOnline && $0.isDue(at: now) }
         guard !due.isEmpty else { return }
+        lastLook = now
         var anchors: [ShellAnchor] = []
         var asked: [(CommandSampler, CommandSampler.LookToken)] = []
         for s in due {

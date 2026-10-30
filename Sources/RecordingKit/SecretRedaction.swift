@@ -168,6 +168,19 @@ extension SecretRedactor {
         let fileKey: SymmetricKey?
         do { fileKey = try RecordingCrypto.readingKey(for: url, loaded: loaded) } catch { return .notNow }
         if RecordingCrypto.isEncrypted(url) && fileKey == nil { return .notNow }
+        // Looked through first without writing anything: most files have nothing to mask, and a
+        // copy of each (decrypted, recompressed, encrypted again) would be written for nothing.
+        do {
+            var scan = stream()
+            try RecordingReader.forEachChunk(ofFile: url, key: loaded) { chunk in
+                _ = scan.feed(chunk)
+                return true
+            }
+            _ = scan.finish()
+            guard scan.masked > 0 else { return .done(masked: 0) }
+        } catch {
+            return .failed
+        }
         let tmp = url.appendingPathExtension("redact.tmp")
         guard fm.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600]),
               let output = try? FileHandle(forWritingTo: tmp) else { return .failed }

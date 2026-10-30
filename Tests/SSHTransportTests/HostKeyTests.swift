@@ -129,8 +129,11 @@ import Foundation
 }
 
 @Suite struct AskPassClassificationTests {
+    /// Asked by an ssh that marks a server's questions (the bridge checks the asking program).
     func request(_ prompt: String) -> AskPassRequest {
-        AskPassRequest(token: "t", targetKey: "web", purpose: "connect", prompt: prompt, sequence: 1)
+        var r = AskPassRequest(token: "t", targetKey: "web", purpose: "connect", prompt: prompt, sequence: 1)
+        r.askerNamesItsQuestions = true
+        return r
     }
 
     @Test func serverTextIsNeverAPassphraseOrHostKeyQuestion() throws {

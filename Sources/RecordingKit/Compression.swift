@@ -14,6 +14,37 @@ public enum RecordingCompression {
     @discardableResult
     public static func compress(_ url: URL, key loaded: SymmetricKey? = RecordingCrypto.key,
                                 encryptPlain: Bool = RecordingCrypto.encryptNew) throws -> URL {
+        // A file that just failed (the disk is full) is not tried again for a while: each try
+        // writes a copy until the disk refuses, and maintenance runs every few megabytes of output.
+        let size = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        if let failed = failures.withLock({ $0[url.path] }), Date().timeIntervalSince(failed.at) < 600 {
+            throw failed.error
+        }
+        // The compressed copy is written next to the original first: it needs about a quarter of
+        // the size (terminal output shrinks 5–10×), with a margin.
+        if let free = try? url.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage, free > 0, free < size / 4 + 16 * 1024 * 1024 {
+            let error = CocoaError(.fileWriteOutOfSpace) as NSError
+            failures.withLock { $0[url.path] = (Date(), error) }
+            throw error
+        }
+        do {
+            let out = try compressNow(url, key: loaded, encryptPlain: encryptPlain)
+            failures.withLock { _ = $0.removeValue(forKey: url.path) }
+            return out
+        } catch {
+            // Tether locked while it ran: tried again as soon as it is unlocked, not 10 minutes later
+            // (meanwhile the storage limit could only delete what it cannot compress).
+            if (error as? RecordingCrypto.Failure) != .locked {
+                failures.withLock { if $0.count > 1000 { $0.removeAll() }; $0[url.path] = (Date(), error as NSError) }
+            }
+            throw error
+        }
+    }
+
+    private static let failures = Locked<[String: (at: Date, error: NSError)]>([:])
+
+    private static func compressNow(_ url: URL, key loaded: SymmetricKey?, encryptPlain: Bool) throws -> URL {
         let out = url.appendingPathExtension(compressedExtension)
         let tmp = out.appendingPathExtension("tmp")
         let fm = FileManager.default
@@ -64,6 +95,7 @@ public enum RecordingCompression {
         try fm.moveItem(at: tmp, to: out)
         finished = true
         if let date { try? fm.setAttributes([.modificationDate: date], ofItemAtPath: out.path) }
+        if let mark = RecordingStore.redactionMark(of: url) { RecordingStore.setRedactionMark(mark, on: out) }
         try fm.removeItem(at: url)
         return out
     }
@@ -78,4 +110,12 @@ public enum RecordingCompression {
     public static func slice(of url: URL, around fraction: Double, maxBytes: Int) -> (Data, Double) {
         RecordingReader.slice(of: url, around: fraction, maxBytes: maxBytes)
     }
+}
+
+/// A value guarded by a lock.
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    func withLock<T>(_ body: (inout Value) -> T) -> T { lock.withLock { body(&value) } }
 }

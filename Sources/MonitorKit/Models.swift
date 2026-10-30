@@ -264,6 +264,21 @@ public enum LogSource: Hashable, Sendable, CaseIterable, Identifiable {
     }
 }
 
+/// How serious the log lines shown must be. Chosen on the server (journalctl's priorities, the
+/// event log's levels, the words a plain log file uses), so "Errors" brings the last errors — not
+/// the errors among the last few hundred lines.
+public enum LogLevel: String, Hashable, Sendable, CaseIterable, Identifiable {
+    case all, warnings, errors
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .all: "All"
+        case .warnings: "Warnings and Errors"
+        case .errors: "Errors"
+        }
+    }
+}
+
 /// One GPU as reported by nvidia-smi, rocm-smi or sysfs. Fields are nil when the driver does not
 /// report them (e.g. unified-memory GPUs report no dedicated memory).
 public struct GPUInfo: Identifiable, Hashable, Sendable {

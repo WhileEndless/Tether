@@ -17,9 +17,20 @@ final class FindOverlay {
         var textWidth: CGFloat
         /// The scroller's frame, when one is shown (marks are drawn on it).
         var scroller: CGRect?
-        /// First scroll-invariant row of the buffer and how many rows it has (for the marks).
+        /// First scroll-invariant row of the buffer and how many lines the scroller stands for.
         var firstRow: Int
         var lineCount: Int
+        /// The scroller's line of `firstRow` (lines of the session before memory), and the rows a
+        /// line takes in memory: a mark sits where the scroller's knob is when its row is at the top.
+        var lineBefore: Double = 0
+        var rowsPerLine: Double = 1
+        /// Lines on screen, as the scroller's knob has them.
+        var visibleLines = 1
+
+        /// Where row `row` is on the scroller, 0…1 from the top.
+        func share(row: Int) -> Double {
+            (lineBefore + Double(row - firstRow) / max(rowsPerLine, 1)) / Double(max(lineCount, 1))
+        }
 
         func rect(row: Int, columns: Range<Int>) -> CGRect? {
             let v = row - topRow
@@ -50,10 +61,19 @@ final class FindOverlay {
 
     func remove() { root.removeFromSuperlayer() }
 
+    /// Something is drawn over the text (not only on the scroller): the current match, its line or
+    /// the other matches.
+    var drawsOverText: Bool {
+        !current.isHidden || !(line.path?.isEmpty ?? true) || !(others.path?.isEmpty ?? true)
+    }
+
     /// Redraws for the matches and the current one (an index into `matches`).
     /// - Parameter text: the characters of a row's cells, for drawing the current match's text.
+    /// `earlier`: where matches in the recording before memory are, as shares of the whole session
+    /// from its top (marks on the scroller only); `currentEarlier`: the one being shown.
     func update(matches: [BufferMatch], current index: Int?, geometry g: Geometry, style: FindHighlightStyle,
-                font: NSFont, scale: CGFloat, appearance: NSAppearance, text: (Int, Range<Int>) -> [(Int, String)]) {
+                font: NSFont, scale: CGFloat, appearance: NSAppearance, earlier: [CGFloat] = [], currentEarlier: Int? = nil,
+                text: (Int, Range<Int>) -> [(Int, String)]) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
@@ -132,10 +152,12 @@ final class FindOverlay {
             let marksPath = CGMutablePath(), currentPath = CGMutablePath()
             if style.showScrollerMarks, let track = g.scroller, g.lineCount > 0 {
                 let inset = track.insetBy(dx: 3, dy: 2)
-                func y(_ row: Int) -> CGFloat {
-                    let f = CGFloat(row - g.firstRow) / CGFloat(max(g.lineCount, 1))
-                    return (inset.maxY - f * inset.height).rounded()
+                // The same place the scroller's knob takes for that line (`HistoryScroller.markOffset`).
+                func y(line: Double) -> CGFloat {
+                    (track.maxY - HistoryScroller.markOffset(line: line, total: g.lineCount, visible: g.visibleLines,
+                                                             height: track.height)).rounded()
                 }
+                func y(_ row: Int) -> CGFloat { y(line: g.share(row: row) * Double(max(g.lineCount, 1))) }
                 var last = CGFloat.nan
                 for (i, m) in matches.enumerated() where i != index {
                     let p = y(m.row)
@@ -146,6 +168,16 @@ final class FindOverlay {
                 if let m = currentMatch {
                     currentPath.addRoundedRect(in: CGRect(x: inset.minX, y: y(m.row) - 1.5, width: inset.width, height: 3),
                                                cornerWidth: 1.5, cornerHeight: 1.5)
+                }
+                for (i, f) in earlier.enumerated() {
+                    let p = y(line: Double(f) * Double(max(g.lineCount, 1)))
+                    if i == currentEarlier {
+                        currentPath.addRoundedRect(in: CGRect(x: inset.minX, y: p - 1.5, width: inset.width, height: 3),
+                                                   cornerWidth: 1.5, cornerHeight: 1.5)
+                    } else if p != last {
+                        last = p
+                        marksPath.addRect(CGRect(x: inset.minX + 2, y: p - 1, width: max(inset.width - 4, 2), height: 2))
+                    }
                 }
             }
             marks.path = marksPath

@@ -68,7 +68,16 @@ public struct PasswordPromptDetector {
 
     /// Feeds output; returns the prompt now showing (nil if none).
     public mutating func feed(_ bytes: [UInt8]) -> PasswordPrompt? {
-        for scalar in String(decoding: bytes, as: UTF8.self).unicodeScalars {
+        // Only the current line matters: what comes before the chunk's last line break is skipped
+        // without decoding it (a line break also ends any escape sequence: none spans lines).
+        var rest = bytes[...]
+        if let lastBreak = bytes.lastIndex(where: { $0 == 0x0a || $0 == 0x0d }) {
+            rest = bytes[(lastBreak + 1)...]
+            line = ""
+            inEscape = false
+            escapeKind = nil
+        }
+        for scalar in String(decoding: rest, as: UTF8.self).unicodeScalars {
             if inEscape {
                 // CSI ends with a letter; OSC ends with BEL or ST (ESC \).
                 if escapeKind == nil {

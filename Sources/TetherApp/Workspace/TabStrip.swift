@@ -61,10 +61,29 @@ final class TabBarCenter {
             let p = CGPoint(x: event.locationInWindow.x, y: content.bounds.height - event.locationInWindow.y)
             return closeTab(at: p, in: window)
         }
-        // Vertical wheel over a tab bar → horizontal scrolling (trackpads already scroll sideways).
+        // A trackpad gesture belongs to where it began, momentum included: it never passes from the
+        // terminal to the tab bar (or back) as the pointer crosses between them, which made both jump.
+        if event.phase.contains(.began) || (event.phase.isEmpty && event.momentumPhase.isEmpty) {
+            gestureOnTabs = isOverTabBar(event.locationInWindow, in: window)
+            gestureWindow = ObjectIdentifier(window)
+        }
+        let onTabs = gestureWindow == ObjectIdentifier(window) ? gestureOnTabs : isOverTabBar(event.locationInWindow, in: window)
+        // The gesture is over once its momentum ends (a gesture without momentum: at the next one).
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) { gestureWindow = nil }
+        guard onTabs else { return false }
+        // Sideways gestures scroll the bar themselves; vertical wheel or swipes scroll it sideways.
         guard abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) else { return false }
         let step = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
-        return scrollTabs(by: step, at: event.locationInWindow, in: window)
+        _ = scrollTabs(by: step, at: event.locationInWindow, in: window, anywhere: true)
+        return true
+    }
+
+    /// Where the current trackpad gesture began (see `handle`).
+    @ObservationIgnored private var gestureOnTabs = false
+    @ObservationIgnored private var gestureWindow: ObjectIdentifier?
+
+    private func isOverTabBar(_ location: CGPoint, in window: NSWindow) -> Bool {
+        scrollViews.values.compactMap(\.view).contains { $0.window === window && $0.bounds.contains($0.convert(location, from: nil)) }
     }
 
     /// Closes the tab, or the sidebar row's terminal or file tab, at a point in window coordinates
@@ -101,10 +120,11 @@ final class TabBarCenter {
     }
 
     /// Scrolls the tab bar under a point (window coordinates, bottom-left origin) sideways.
-    func scrollTabs(by delta: CGFloat, at location: CGPoint, in window: NSWindow) -> Bool {
+    /// `anywhere`: the window's bar even when the pointer has left it (a gesture that began on it).
+    func scrollTabs(by delta: CGFloat, at location: CGPoint, in window: NSWindow, anywhere: Bool = false) -> Bool {
         for case let scroll? in scrollViews.values.map(\.view) where scroll.window === window {
             let local = scroll.convert(location, from: nil)
-            guard scroll.bounds.contains(local) else { continue }
+            guard anywhere || scroll.bounds.contains(local) else { continue }
             let clip = scroll.contentView
             let docWidth = scroll.documentView?.frame.width ?? 0
             let maxX = max(docWidth - clip.bounds.width, 0)
@@ -338,6 +358,36 @@ final class TabBarCenter {
 }
 
 /// The picture of a tab that follows the pointer outside its tab bar.
+private struct AllTabsMenu: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uiScale) private var scale
+    @Environment(WindowState.self) private var state
+    let tabs: [TabItem]
+
+    var body: some View {
+        Menu {
+            ForEach(Array(tabs.enumerated()), id: \.element.id) { index, item in
+                Button {
+                    state.select(item.id)
+                } label: {
+                    switch item {
+                    case .terminal(let session):
+                        Text("\(index < 9 ? "\(index + 1). " : "")\(session.displayTitle) — \(session.phase.label)")
+                    case .files(let tab):
+                        Text("\(index < 9 ? "\(index + 1). " : "")\(model.fileTabs.title(of: tab)) — \(tab.target.displayName)")
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "chevron.down").uiFont(size: 10, weight: .semibold)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("All \(tabs.count) tabs")
+    }
+}
+
 private struct TabDragPreview: View {
     let title: String
 
@@ -363,7 +413,19 @@ struct TabStrip: View {
 
     @State private var contentWidth: CGFloat = 0
     @State private var visibleWidth: CGFloat = 0
-    @State private var offset: CGFloat = 0
+    /// The scroll offset, kept outside SwiftUI's state: it changes on every scroll event, and only
+    /// whether more tabs are hidden at either end is shown (`moreLeft`, `moreRight`).
+    @State private var offset = OffsetBox()
+    @State private var moreLeft = false
+    @State private var moreRight = false
+    private final class OffsetBox { var x: CGFloat = 0 }
+
+    private func updateEdges() {
+        let left = overflowing && offset.x > 1
+        let right = overflowing && offset.x < contentWidth - visibleWidth - 1
+        if left != moreLeft { moreLeft = left }
+        if right != moreRight { moreRight = right }
+    }
     @State private var scroller = TabScroller()
 
     private var overflowing: Bool { contentWidth > visibleWidth + 1 }
@@ -373,10 +435,12 @@ struct TabStrip: View {
         let selected = state.workspace.selected
         HStack(spacing: 0) {
             if overflowing {
-                TabArrow(symbol: "chevron.left", enabled: offset > 1) { scroller.scroll(by: -max(visibleWidth * 0.8, 200)) }
+                TabArrow(symbol: "chevron.left", enabled: moreLeft) { scroller.scroll(by: -max(visibleWidth * 0.8, 200)) }
             }
             ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: true) {
+                // No scroller: with "always show scroll bars" (or a mouse) it took a third of the
+                // bar's height and pushed the tabs up. The arrows and the fades show that more are hidden.
+                ScrollView(.horizontal) {
                     HStack(spacing: 4) {
                         ForEach(Array(tabs.enumerated()), id: \.element.id) { index, item in
                             switch item {
@@ -394,17 +458,18 @@ struct TabStrip: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
                     .background(TabScrollMarker(scroller: scroller))
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0; updateEdges() }
                 }
-                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0 }
-                .onHorizontalScroll { offset = $0 }
+                .scrollIndicators(.never)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0; updateEdges() }
+                .onHorizontalScroll { offset.x = $0; updateEdges() }
                 // Fades at the edges show that more tabs are hidden there.
                 .mask {
                     HStack(spacing: 0) {
-                        LinearGradient(colors: [overflowing && offset > 1 ? .clear : .black, .black], startPoint: .leading, endPoint: .trailing)
+                        LinearGradient(colors: [moreLeft ? .clear : .black, .black], startPoint: .leading, endPoint: .trailing)
                             .frame(width: 18)
                         Color.black
-                        LinearGradient(colors: [.black, overflowing && offset < contentWidth - visibleWidth - 1 ? .clear : .black],
+                        LinearGradient(colors: [.black, moreRight ? .clear : .black],
                                        startPoint: .leading, endPoint: .trailing)
                             .frame(width: 18)
                     }
@@ -414,32 +479,14 @@ struct TabStrip: View {
                 }
             }
             if overflowing {
-                TabArrow(symbol: "chevron.right", enabled: offset < contentWidth - visibleWidth - 1) {
+                TabArrow(symbol: "chevron.right", enabled: moreRight) {
                     scroller.scroll(by: max(visibleWidth * 0.8, 200))
                 }
             }
             if tabs.count > 1 {
-                // Every tab in a list: handy with dozens of tabs.
-                Menu {
-                    ForEach(Array(tabs.enumerated()), id: \.element.id) { index, item in
-                        Button {
-                            state.select(item.id)
-                        } label: {
-                            switch item {
-                            case .terminal(let session):
-                                Text("\(index < 9 ? "\(index + 1). " : "")\(session.displayTitle) — \(session.phase.label)")
-                            case .files(let tab):
-                                Text("\(index < 9 ? "\(index + 1). " : "")\(model.fileTabs.title(of: tab)) — \(tab.target.displayName)")
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "chevron.down").uiFont(size: 10, weight: .semibold)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("All \(tabs.count) tabs")
+                // Every tab in a list: handy with dozens of tabs. A view of its own, so a title
+                // changing in any tab redraws only this menu, not the whole strip.
+                AllTabsMenu(tabs: tabs)
             }
             // "+" opens another tab like the one in front, as in browsers; its menu has the others.
             Menu {

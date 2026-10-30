@@ -25,7 +25,9 @@ This file is public: it is committed to GitHub like everything else.
    write the real keychain (it is in-memory under tests and `TETHER_DEFAULTS_SUITE`), the real
    preferences, the real tmux server (set `TMUX_TMPDIR` to a private folder **and unset `TMUX`** —
    with `$TMUX` set, as when tests run inside tmux, tmux ignores `TMUX_TMPDIR` and talks to that
-   server), or the shared `/tmp/tether-<uid>` sockets; and they remove the temporary files they
+   server; end a test's own server only with `TestSupport.PrivateTmux.killServer(in:)`, by its socket
+   — with its folder gone, tmux falls back to the user's default server), or the shared
+   `/tmp/tether-<uid>` sockets; and they remove the temporary files they
    create, also when a test fails. Child processes in tests run through `TestSupport.BoundedProcess`
    (never wait without a timeout), and a process a test stops (SIGSTOP) is always resumed.
 8. **Keys without ⌘ belong to the terminal.** App shortcuts always use ⌘ and are declared in

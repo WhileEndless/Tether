@@ -14,6 +14,9 @@ import TetherCore
 extension TerminalWindowTests {
     /// This suite's private tmux server (never the user's).
     func privateTmux(_ args: [String]) -> String {
+        // Never without the folder: tmux would use the user's own server instead.
+        guard FileManager.default.fileExists(atPath: dir.path) else { return "" }
+        if args == ["kill-server"] { PrivateTmux.killServer(in: dir); return "" }
         var env = ProcessInfo.processInfo.environment
         env["TMUX_TMPDIR"] = dir.path
         env["TMUX"] = nil

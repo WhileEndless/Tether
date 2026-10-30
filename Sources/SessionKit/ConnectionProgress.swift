@@ -100,6 +100,16 @@ public struct ConnectionProgress: Equatable, Sendable {
         }
     }
 
+    /// ssh's words for a server it could not reach at all (no answer, refused, no route, no such
+    /// name, the connection closed before ssh's greeting): the same for every tab to that server,
+    /// unlike a refused sign-in or a cancelled question, which belong to one login.
+    public static func isUnreachable(_ text: String) -> Bool {
+        let l = text.lowercased()
+        return ["connection timed out", "operation timed out", "connection refused", "no route to host",
+                "network is unreachable", "host is down", "could not resolve hostname",
+                "kex_exchange_identification", "banner exchange"].contains { l.contains($0) }
+    }
+
     /// Recognises well-known ssh failures and suggests what to do.
     public static func diagnose(_ line: String) -> (String, String)? {
         let l = line.lowercased()
@@ -130,79 +140,5 @@ public struct ConnectionProgress: Equatable, Sendable {
                     "It may be overloaded, blocking your address, or the port is not SSH.")
         }
         return nil
-    }
-}
-
-/// Opens the shared (ControlMaster) connection for a host as a separate step, reading `ssh -v`
-/// from a log file so progress can be shown without anything appearing in the terminal.
-@MainActor
-final class MasterConnector {
-    private var process: Process?
-    private var timer: Timer?
-    private var offset: UInt64 = 0
-    private var partial = ""
-    private let logURL: URL
-
-    init() {
-        logURL = AppPaths.controlSocketDirectory.appendingPathComponent("connect-\(UUID().uuidString.prefix(8)).log")
-    }
-
-    /// Returns nil on success, or the last error lines.
-    func connect(target: ConnectionTarget, options: SSHOptions, environment: [String: String],
-                 onLine: @escaping (String) -> Void) async -> String? {
-        FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: options.sshBinary)
-        // `exit` runs once (it works in sh, cmd and PowerShell alike); with ControlMaster=auto +
-        // ControlPersist the connection stays up as master.
-        p.arguments = options.commonOptions() + ["-v", "-E", logURL.path, "-o", "ConnectTimeout=20", "-T"]
-            + SSHOptions.destinationArguments(for: target) + ["exit"]
-        p.environment = ChildEnvironment.base.merging(environment) { $1 }
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        process = p
-        let poll = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.readLog(onLine) }
-        }
-        RunLoop.main.add(poll, forMode: .common)
-        timer = poll
-        let status: Int32 = await withCheckedContinuation { cont in
-            // Ended by a signal (Tether stopped a login nobody answered): a failure, whatever the number.
-            p.terminationHandler = { cont.resume(returning: $0.terminationReason == .uncaughtSignal ? -2 : $0.terminationStatus) }
-            do {
-                try p.run()
-                AskPassBridge.shared.bindToken(environment, pid: p.processIdentifier)
-            } catch { p.terminationHandler = nil; cont.resume(returning: -1) }
-        }
-        readLog(onLine)
-        timer?.invalidate()
-        timer = nil
-        process = nil
-        // The master keeps logging to this file; remove the name so nothing accumulates.
-        try? FileManager.default.removeItem(at: logURL)
-        // ssh itself fails with 255; any other code is `exit`'s own answer — the login worked (a
-        // device CLI may not know `exit`, or may report it as an error).
-        if status == -2 { return "The sign-in was stopped" }
-        return status >= 0 && status != 255 ? nil : "ssh exited with code \(status)"
-    }
-
-    func cancel() {
-        process?.terminate()
-    }
-
-    private func readLog(_ onLine: (String) -> Void) {
-        guard let h = try? FileHandle(forReadingFrom: logURL) else { return }
-        defer { try? h.close() }
-        try? h.seek(toOffset: offset)
-        guard let data = try? h.readToEnd(), !data.isEmpty else { return }
-        offset += UInt64(data.count)
-        let text = partial + String(decoding: data, as: UTF8.self)
-        var lines = text.components(separatedBy: "\n")
-        partial = lines.removeLast()
-        for l in lines {
-            let t = l.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty { onLine(t) }
-        }
     }
 }

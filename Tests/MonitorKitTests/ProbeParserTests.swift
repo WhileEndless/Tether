@@ -46,6 +46,18 @@ import TetherCore
         #expect(s.disks.map(\.mount) == ["/"])
     }
 
+    /// A stream reads disks and GPUs every few frames only: a frame without them keeps the last ones.
+    @Test func framesWithoutSlowSectionsKeepTheLastValues() {
+        let gpu = linux.replacingOccurrences(of: "@@end", with: "@@nvidia\n0, Example GPU, 37, 1000, 8000, 50, 70.5, 300, GPU-1\n@@end")
+        let first = ProbeParser.system(gpu, previous: nil)
+        #expect(first.gpus.count == 1 && first.disks.count == 1)
+        let quick = linux.replacingOccurrences(of: "@@disk\n/dev/sda1 100000 40000 60000 40% /\ntmpfs 1000 0 1000 0% /run\n", with: "")
+        #expect(!quick.contains("@@disk"))
+        let next = ProbeParser.system(quick, previous: first)
+        #expect(next.disks.map(\.mount) == ["/"], "disks kept")
+        #expect(next.gpus.first?.utilization == first.gpus.first?.utilization, "GPU kept")
+    }
+
     /// The container and Kubernetes tabs show only for hosts that have the tools.
     @Test func parsesTools() {
         #expect(ProbeParser.system(linux, previous: nil).tools == nil)              // not known yet

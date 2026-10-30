@@ -20,4 +20,24 @@ import Testing
         #expect(bytes > 7_000_000)
         #expect(elapsed < 2.0)
     }
+
+    /// A long command reply (capture-pane of the history on re-attach) is collected in linear time.
+    @Test func longRepliesParseQuickly() {
+        var parser = TmuxControlParser()
+        _ = parser.feed(Array("\u{1b}P1000p".utf8))
+        var reply = Array("%begin 1 5 1\n".utf8)
+        for i in 0..<80_000 { reply += Array("history line \(i) with some text in it\n".utf8) }
+        reply += Array("%end 1 5 1\n".utf8)
+        let start = Date()
+        var lines = 0
+        var offset = 0
+        while offset < reply.count {           // in pty-sized reads
+            let end = min(offset + 64 * 1024, reply.count)
+            for e in parser.feed(reply[offset..<end]) { if case .commandReply(_, _, let l) = e { lines = l.count } }
+            offset = end
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(lines == 80_000)
+        #expect(elapsed < 2.0, "took \(elapsed) s")
+    }
 }

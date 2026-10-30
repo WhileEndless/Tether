@@ -12,6 +12,8 @@ public enum BoundedProcess {
         public var timedOut: Bool
     }
 
+    private static let ignoreBrokenPipes: Void = { signal(SIGPIPE, SIG_IGN) }()
+
     @discardableResult
     public static func run(_ executable: String, _ arguments: [String], environment: [String: String]? = nil,
                            input: String? = nil, timeout: Double) -> Result {
@@ -41,8 +43,14 @@ public enum BoundedProcess {
             return Result(output: "", errorOutput: "could not start \(executable)", status: -1, timedOut: false)
         }
         if let input {
-            inPipe.fileHandleForWriting.write(Data(input.utf8))
-            try? inPipe.fileHandleForWriting.close()
+            // A program that ends before reading all of it must fail its test, not end the test
+            // run (SIGPIPE), and one that never reads must not block this write past `timeout`.
+            _ = ignoreBrokenPipes
+            let writer = inPipe.fileHandleForWriting
+            DispatchQueue.global().async {
+                try? writer.write(contentsOf: Data(input.utf8))
+                try? writer.close()
+            }
         }
         var timedOut = false
         if done.wait(timeout: .now() + timeout) == .timedOut {

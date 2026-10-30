@@ -158,10 +158,12 @@ struct Shortcut: Identifiable {
                                      note: "File manager tab in the terminal's current directory (as the Browse button)")
     static let filesWindow = Shortcut("Open File Manager Window", .files, k("o", [.command, .option]))
     static let transfers = Shortcut("Show Transfers", .files, k("l", [.command, .option]))
-    static let fileCopyPaste = Shortcut("Copy to Mac / Paste from Mac", .files, display: "⌘C  ⌘V",
-                                        note: "In the file manager; works with Finder")
+    static let fileCopyPaste = Shortcut("Copy / Paste Files", .files, display: "⌘C  ⌘V",
+                                        note: "In the file manager: paste into another folder or server, a terminal or Finder; files copied in Finder are uploaded. Nothing is replaced")
     static let fileOpen = Shortcut("Open / Go Up", .files, display: "↩  ⌘↓  ⌘↑")
     static let fileDelete = Shortcut("Delete", .files, display: "⌘⌫", note: "Asks first")
+    static let fileSearch = Shortcut("Search Files", .files, display: "⌘F  ↩  Esc",
+                                     note: "In a file manager: ⌘F goes to its search field, typing filters the folder, ↩ searches the folders below, Esc ends the search")
     static let fileBackForward = Shortcut("Back / Forward", .files, display: "⌘[  ⌘]",
                                           note: "The mouse's side buttons work too")
 
@@ -189,7 +191,7 @@ struct Shortcut: Identifiable {
         clearScrollback, mouseReporting, clearScreen, copy, jumpMarks, selectMarks, scrollPage, scrollEnds,
         biggerFont, smallerFont, defaultFont,
         find, findNext, findPrevious, useSelection, searchAll, searchSession,
-        browseHere, pasteFilesTo, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete,
+        browseHere, pasteFilesTo, filesWindow, transfers, fileCopyPaste, fileOpen, fileBackForward, fileDelete, fileSearch,
         toggleSidebar, hostPanel, runningCommand, showArchive, statusBar,
         biggerInterface, smallerInterface, defaultInterface, settings, lockApp, shortcuts,
     ]

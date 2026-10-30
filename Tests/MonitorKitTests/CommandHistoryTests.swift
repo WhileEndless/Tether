@@ -40,6 +40,71 @@ import TetherCore
         #expect(r.duration == 499)
     }
 
+    /// Starting and ending commands adds to a small journal instead of writing the host's whole
+    /// file again; another launch reads both; once the journal is large it is folded into the file.
+    @Test func changesAreAddedToAJournalNotRewritten() throws {
+        try withFolder { dir in
+            let store = CommandHistoryStore(directory: dir)
+            let session = UUID()
+            for i in 0..<40 {
+                let id = store.begin(hostKey: "web", hostName: "web", sessionID: session, sessionTitle: "web",
+                                     process: process(100 + i, started: now.addingTimeInterval(Double(i) * 10)), at: now.addingTimeInterval(Double(i) * 10))
+                store.end(id, status: .finished, at: now.addingTimeInterval(Double(i) * 10 + 5))
+            }
+            store.flush()                               // the first write: the whole file
+            let file = try #require(try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+                .first { $0.pathExtension == "json" })
+            let journal = file.deletingPathExtension().appendingPathExtension("journal")
+            let written = try #require(try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date)
+            let id = store.begin(hostKey: "web", hostName: "web", sessionID: session, sessionTitle: "web",
+                                 process: process(999, started: now.addingTimeInterval(1000)), at: now.addingTimeInterval(1000))
+            store.flush()
+            store.end(id, status: .finished, at: now.addingTimeInterval(1010))
+            store.flush()
+            #expect(FileManager.default.fileExists(atPath: journal.path), "the change went to the journal")
+            #expect((try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date) == written,
+                    "the file was not written again")
+            let again = CommandHistoryStore(directory: dir)
+            again.load()
+            #expect(again.records().count == 41)
+            #expect(again.record(id)?.status == .finished && again.record(id)?.ended == now.addingTimeInterval(1010))
+            // Removing records writes the file whole, and the journal goes.
+            again.clear()
+            again.flush()
+            #expect(!FileManager.default.fileExists(atPath: journal.path))
+        }
+    }
+
+    /// A journal entry cut short (Tether stopped while adding it) is skipped when read, and the next
+    /// write is the whole file, so what is added after it can be read too.
+    @Test func aJournalCutShortIsRepaired() throws {
+        try withFolder { dir in
+            let store = CommandHistoryStore(directory: dir)
+            let session = UUID()
+            let first = store.begin(hostKey: "web", hostName: "web", sessionID: session, sessionTitle: "web",
+                                    process: process(1, started: now), at: now)
+            store.flush()
+            store.end(first, status: .finished, at: now.addingTimeInterval(5))
+            store.flush()
+            let journal = try #require(try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+                .first { $0.pathExtension == "journal" })
+            let handle = try FileHandle(forWritingTo: journal)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data([0, 0, 9, 9, 1, 2, 3]))     // a frame that never finished
+            try handle.close()
+            let again = CommandHistoryStore(directory: dir)
+            again.load()
+            #expect(again.record(first)?.status == .finished)
+            let second = again.begin(hostKey: "web", hostName: "web", sessionID: session, sessionTitle: "web",
+                                     process: process(2, started: now.addingTimeInterval(10)), at: now.addingTimeInterval(10))
+            again.flush()
+            let third = CommandHistoryStore(directory: dir)
+            third.load()
+            #expect(third.record(second) != nil, "added after the cut, and read")
+            #expect(third.record(first)?.status == .finished)
+        }
+    }
+
     @Test func recordsSurviveAndCarryOn() throws {
         try withFolder { dir in
             let session = UUID()
@@ -112,6 +177,34 @@ import TetherCore
             let files = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             #expect(files.contains { $0.contains(".unreadable-1") })
         }
+    }
+
+    /// When the shell was last seen at its prompt (for mouse tracking a program left on).
+    @Test func samplerTellsWhenTheShellWasSeenIdle() {
+        let s = CommandSampler(anchor: { nil }) {
+            CommandSampler.Context(hostKey: "web", hostName: "web", sessionID: UUID(), sessionTitle: "web")
+        }
+        s.keepHistory = false
+        s.update(online: true, foreground: nil)
+        #expect(s.idleSeenAt == nil)
+        // A look finds nothing but the shell.
+        s.ingest(CommandFrame(takenAt: now, shellPid: 1))
+        #expect(s.status == .idle)
+        #expect(s.idleSeenAt == now)
+        // A program runs: not idle any more.
+        var busy = CommandFrame(takenAt: now.addingTimeInterval(2), shellPid: 1)
+        busy.processes = [CommandProcess(pid: 10, ppid: 1, cpuSeconds: 1, rssBytes: 100, started: now)]
+        s.ingest(busy)
+        #expect(s.idleSeenAt == nil)
+        // The watcher says it ended, then that another one started.
+        s.watched(.idle, at: now.addingTimeInterval(5))
+        #expect(s.idleSeenAt == now.addingTimeInterval(5))
+        s.watched(.busy(pid: 11, commandLine: "fzf"), at: now.addingTimeInterval(6))
+        #expect(s.idleSeenAt == nil)
+        // Offline: nothing known.
+        s.watched(.idle, at: now.addingTimeInterval(7))
+        s.update(online: false, foreground: nil)
+        #expect(s.idleSeenAt == nil)
     }
 
     /// After a reconnect the same process continues its record; a different one closes it.

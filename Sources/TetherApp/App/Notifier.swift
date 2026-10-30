@@ -59,6 +59,42 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// A paste or upload in a file manager ended while Tether was not in front (no file names: the
+    /// count, the folder and the server, as the file manager's own notice says).
+    func fileWorkEnded(_ text: String, on host: String, failed: Bool) {
+        guard !NSApp.isActive else { return }
+        let content = UNMutableNotificationContent()
+        content.title = failed ? "File transfer did not finish" : "Files pasted"
+        content.subtitle = host
+        content.body = text
+        content.threadIdentifier = "tether-files"
+        Task {
+            let center = UNUserNotificationCenter.current()
+            if authorized == nil {
+                authorized = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+            }
+            guard authorized == true else { return }
+            try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+    }
+
+    /// A newer Tether was found (`ready`: built, installed when Tether restarts or quits).
+    func updateAvailable(_ version: String, ready: Bool) {
+        let content = UNMutableNotificationContent()
+        content.title = ready ? "Tether \(version) is ready" : "Tether \(version) is available"
+        content.body = ready ? "It is installed when you quit Tether, or now with Restart to Update (Settings ▸ General)."
+            : "Settings ▸ General ▸ Updates has the release page."
+        content.userInfo = ["update": version]
+        Task {
+            let center = UNUserNotificationCenter.current()
+            if authorized == nil {
+                authorized = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+            }
+            guard authorized == true else { return }
+            try? await center.add(UNNotificationRequest(identifier: "tether-update", content: content, trigger: nil))
+        }
+    }
+
     /// The tab was looked at: its notifications are no longer news.
     func seen(_ session: TerminalSession) {
         session.clearAttention()
@@ -72,7 +108,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
         let id = (response.notification.request.content.userInfo["session"] as? String).flatMap(UUID.init(uuidString:))
+        let update = response.notification.request.content.userInfo["update"] != nil
         Task { @MainActor in
+            if update { NSApp.activate(); Updater.shared.showWindow() }
             if let id { Self.bringToFront(id) }
             completionHandler()
         }

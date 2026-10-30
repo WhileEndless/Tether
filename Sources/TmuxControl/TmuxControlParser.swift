@@ -80,17 +80,21 @@ public struct TmuxControlParser: Sendable {
         }
     }
 
+    private static let endPrefix = Array("%end ".utf8), errorPrefix = Array("%error ".utf8)
+
     private mutating func handle(line: [UInt8]) -> TmuxEvent? {
-        if var b = block {
-            if line.starts(with: Array("%end ".utf8)) || line.starts(with: Array("%error ".utf8)) {
+        if let number = block?.number {
+            if line.starts(with: Self.endPrefix) || line.starts(with: Self.errorPrefix) {
                 let parts = String(decoding: line, as: UTF8.self).split(separator: " ")
-                if parts.count >= 3, Int(parts[2]) == b.number {
+                if parts.count >= 3, Int(parts[2]) == number {
+                    let lines = block?.lines ?? []
                     block = nil
-                    return .commandReply(number: b.number, success: parts[0] == "%end", lines: b.lines)
+                    return .commandReply(number: number, success: parts[0] == "%end", lines: lines)
                 }
             }
-            b.lines.append(line)
-            block = b
+            // In place: a copy of the block per line made a long reply (capture-pane of the
+            // history on re-attach) take seconds to minutes.
+            block?.lines.append(line)
             return nil
         }
 

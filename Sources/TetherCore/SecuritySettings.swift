@@ -24,6 +24,10 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
     public var hostKeyPolicy: HostKeyPolicy
     public var useControlMaster: Bool
     public var detectPasswordPrompts: Bool
+    public var rememberSignInPasswords: Bool
+    public var forgetSignInPasswordsAfterHours: Int
+    public var forgetSignInPasswordsOnLock: Bool
+    public var keepConnectionsAfterQuit: Bool
 
     /// Tolerant: a field added in a later version takes its default instead of failing, so an older
     /// keychain copy is never thrown away (which would let the preferences file decide).
@@ -44,6 +48,10 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
         hostKeyPolicy = try c.decodeIfPresent(HostKeyPolicy.self, forKey: .hostKeyPolicy) ?? d.hostKeyPolicy
         useControlMaster = try c.decodeIfPresent(Bool.self, forKey: .useControlMaster) ?? d.useControlMaster
         detectPasswordPrompts = try c.decodeIfPresent(Bool.self, forKey: .detectPasswordPrompts) ?? d.detectPasswordPrompts
+        rememberSignInPasswords = try c.decodeIfPresent(Bool.self, forKey: .rememberSignInPasswords) ?? d.rememberSignInPasswords
+        forgetSignInPasswordsAfterHours = try c.decodeIfPresent(Int.self, forKey: .forgetSignInPasswordsAfterHours) ?? d.forgetSignInPasswordsAfterHours
+        forgetSignInPasswordsOnLock = try c.decodeIfPresent(Bool.self, forKey: .forgetSignInPasswordsOnLock) ?? d.forgetSignInPasswordsOnLock
+        keepConnectionsAfterQuit = try c.decodeIfPresent(Bool.self, forKey: .keepConnectionsAfterQuit) ?? d.keepConnectionsAfterQuit
     }
 
     public init(_ s: AppSettings) {
@@ -61,6 +69,10 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
         hostKeyPolicy = s.hostKeyPolicy
         useControlMaster = s.useControlMaster
         detectPasswordPrompts = s.detectPasswordPrompts
+        rememberSignInPasswords = s.rememberSignInPasswords
+        forgetSignInPasswordsAfterHours = s.forgetSignInPasswordsAfterHours
+        forgetSignInPasswordsOnLock = s.forgetSignInPasswordsOnLock
+        keepConnectionsAfterQuit = s.keepConnectionsAfterQuit
     }
 
     /// An ssh or scp program that can actually be used: an existing executable file outside any
@@ -89,6 +101,10 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
         s.hostKeyPolicy = hostKeyPolicy
         s.useControlMaster = useControlMaster
         s.detectPasswordPrompts = detectPasswordPrompts
+        s.rememberSignInPasswords = rememberSignInPasswords
+        s.forgetSignInPasswordsAfterHours = forgetSignInPasswordsAfterHours
+        s.forgetSignInPasswordsOnLock = forgetSignInPasswordsOnLock
+        s.keepConnectionsAfterQuit = keepConnectionsAfterQuit
     }
 
     /// Names of the settings that differ (for the warning shown at launch).
@@ -108,6 +124,10 @@ public struct SecuritySettings: Codable, Equatable, Sendable {
         if hostKeyPolicy != other.hostKeyPolicy { names.append("Unknown host keys") }
         if useControlMaster != other.useControlMaster { names.append("Shared connections") }
         if detectPasswordPrompts != other.detectPasswordPrompts { names.append("Password prompt detection") }
+        if rememberSignInPasswords != other.rememberSignInPasswords { names.append("Remember sign-in passwords") }
+        if forgetSignInPasswordsAfterHours != other.forgetSignInPasswordsAfterHours { names.append("Forget sign-in passwords after") }
+        if forgetSignInPasswordsOnLock != other.forgetSignInPasswordsOnLock { names.append("Forget sign-in passwords when locking") }
+        if keepConnectionsAfterQuit != other.keepConnectionsAfterQuit { names.append("Keep connections after quitting") }
         return names
     }
 

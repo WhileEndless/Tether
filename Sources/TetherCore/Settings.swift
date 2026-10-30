@@ -137,6 +137,51 @@ public enum TransferArchiveMode: String, Codable, CaseIterable, Identifiable, Se
     }
 }
 
+/// How a packed transfer's stream is compressed. It is compressed and uncompressed as it flows
+/// (no archive is written anywhere), so only stream formats are used — zip and 7z need a file to
+/// seek in. Both ends need the program; `auto` takes the fastest one both have.
+public enum TransferCompression: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto, zstd, lz4, gzip, xz, bzip2, off
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .auto: "Automatic (the fastest both ends have)"
+        case .zstd: "zstd (fast, good)"
+        case .lz4: "lz4 (fastest, lighter)"
+        case .gzip: "gzip (everywhere)"
+        case .xz: "xz (smallest, slow)"
+        case .bzip2: "bzip2 (small, slow)"
+        case .off: "Off"
+        }
+    }
+
+    /// The order `auto` tries them in (xz and bzip2 only when chosen: too slow to win).
+    public static let automaticOrder: [TransferCompression] = [.zstd, .lz4, .gzip]
+    /// Every program a stream can be compressed with.
+    public static let methods: [TransferCompression] = [.zstd, .lz4, .gzip, .xz, .bzip2]
+
+    /// The program's name (nil for `auto` and `off`).
+    public var program: String? {
+        switch self {
+        case .auto, .off: nil
+        default: rawValue
+        }
+    }
+
+    /// What to use, given the programs each end has; nil: not compressed. A method chosen that one
+    /// end lacks falls back to the fastest both have (rather than to nothing).
+    public func resolved(local: Set<String>, remote: Set<String>) -> TransferCompression? {
+        func both(_ m: TransferCompression) -> Bool { m.program.map { local.contains($0) && remote.contains($0) } ?? false }
+        switch self {
+        case .off: return nil
+        case .auto: return Self.automaticOrder.first(where: both)
+        default: return both(self) ? self : Self.automaticOrder.first(where: both)
+        }
+    }
+}
+
 /// Where a new tab appears in the tab bar.
 public enum NewTabPosition: String, Codable, CaseIterable, Identifiable, Sendable {
     case afterCurrent
@@ -269,6 +314,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Programs may erase the scrollback (`clear`, `ESC[3J`) as in other terminals. Off: output never
     /// erases the history on screen (the recording keeps everything either way).
     public var programsMayClearScrollback = false
+    /// Every frame a program redraws in place from the top of the screen (a build's progress, a
+    /// package manager) is kept in the scrollback; off, only what it leaves on screen.
+    public var keepRedrawnFrames = false
     /// "Browse" in a terminal of this Mac opens its folder in Finder (off: Tether's file manager).
     public var browseLocalInFinder = true
     /// Tabs not renamed by hand are named after the coding agent session in them (Claude Code,
@@ -306,6 +354,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var workingQuietDelay: Double = 3
     /// Coding agents get their own symbol on tabs and in the sidebar.
     public var showAgentIcons = true
+    /// Container tools in a terminal (Docker, Docker Compose, Podman) get their own symbol on the tab.
+    public var showToolIcons = true
+    /// Hosts (keys) where Tether no longer suggests installing tmux to keep shells running.
+    public var noTmuxSuggestion: [String] = []
+    /// File ▸ Save Session… (⌘S): what is chosen first, and the folder it opens in (empty: the
+    /// Downloads folder).
+    public var saveSessionContents: SaveSessionContents = .whole
+    public var saveSessionFolder = ""
     public var floatingBars = FloatingBarSettings()
     /// Secrets masked in recordings once their session is archived.
     public var secretRedaction = SecretRedactionSettings()
@@ -321,15 +377,39 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var autoReconnect = true
     public var maxReconnectAttempts = 0       // 0 = unlimited
     public var reconnectBaseDelay: Double = 2
-    public var reconnectMaxDelay: Double = 30
-    public var serverAliveInterval = 10
+    public var reconnectMaxDelay: Double = 120
+    /// Seconds a sign-in waits for an unreachable server before it counts as failed (ssh's
+    /// ConnectTimeout); the server's waiting tabs then try again together, further apart each time.
+    public var connectTimeout = 20
+    /// Keep-alives on the shared connection: 0 sends none, like plain `ssh` (the user's ssh_config
+    /// still applies). With them, a connection that misses `serverAliveCountMax` answers in a row
+    /// ends — also across a Wi-Fi hand-over or after sleep, which plain ssh survives.
+    public var serverAliveInterval = 0
     public var serverAliveCountMax = 3
     public var historyLinesOnReattach = 5_000
     /// Scrollback the server keeps for Tether's tmux/screen sessions, so output printed while
     /// disconnected can be fetched on reconnect.
     public var serverHistoryLines = 100_000
-    /// Seconds without any answer from the server before a session is considered disconnected.
-    public var stallTimeout: Double = 6
+    /// Seconds without any answer from the server (awake, with the network there) before a tmux
+    /// tab re-attaches through its shared connection and that connection is checked.
+    public var stallTimeout: Double = 15
+    /// How long the network may be away before tmux/screen tabs let go of their server sessions
+    /// (they re-attach when it is back). Shorter gaps go unnoticed, as with plain ssh.
+    public var networkLossGraceSeconds: Double = 20
+    /// How long a shared connection may stay without an answer while the network is there before it
+    /// counts as dead and is closed (its tabs then sign in again, once for the server).
+    public var deadAfterSeconds: Double = 20
+    /// Remember sign-in passwords typed (or unlocked from the keychain) while Tether runs, sealed by
+    /// a Secure Enclave key of this run, so one password signs in every connection the server needs.
+    public var rememberSignInPasswords = true
+    /// Remembered sign-in passwords are forgotten this many hours after they were typed (0: only
+    /// when Tether quits).
+    public var forgetSignInPasswordsAfterHours = 24
+    /// Also forget remembered sign-in passwords when the screen locks or the Mac sleeps.
+    public var forgetSignInPasswordsOnLock = false
+    /// Shared connections stay open after quitting (for `controlPersistSeconds`), so relaunching
+    /// signs in nobody; off: quitting ends them at once.
+    public var keepConnectionsAfterQuit = false
 
     // Recordings
     public var recordingEnabled = true
@@ -379,9 +459,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// When several files are packed into one tar stream instead of being sent one by one.
     public var transferArchiveMode: TransferArchiveMode = .auto
     /// `.auto` packs transfers with at least this many files.
-    public var transferArchiveThreshold = 20
-    /// Compress packed transfers on the wire (ssh -C). Helps on slow links, costs CPU on fast ones.
+    public var transferArchiveThreshold = 5
+    /// Compress packed transfers (before 0.9: a switch, read once into `transferCompression`).
     public var transferCompress = true
+    /// How packed transfers are compressed. Helps on slow links, costs CPU on fast ones.
+    public var transferCompression: TransferCompression = .auto
     /// Where files pasted or dropped into a terminal are uploaded (hold ⌥ to be asked anyway).
     public var uploadDestination: UploadDestination = .currentFolder
     /// After such an upload, type the uploaded paths into the terminal.
@@ -392,8 +474,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var askWhereToDownload = false
 
     // Updates
-    /// At launch, ask GitHub once whether a newer release exists (one request to api.github.com).
+    /// At launch (and once a day), ask GitHub whether a newer release exists (one request to api.github.com).
     public var checkForUpdates = true
+    /// A newer release is fetched and built in the background, and installed when Tether quits.
+    public var installUpdatesAutomatically = true
 
     // Passwords
     /// Ask for Touch ID (or the Mac's password) before a saved password is used.
@@ -427,7 +511,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     /// Bumped when defaults change in a way existing users should get too (see `migrate`).
     public var version = AppSettings.currentVersion
-    public static let currentVersion = 4
+    public static let currentVersion = 8
 
     public init() {}
 
@@ -443,6 +527,29 @@ public struct AppSettings: Codable, Equatable, Sendable {
         if version < 4 {
             // Option as Meta swallowed characters typed with Option (⌥Q → @ on Turkish keyboards).
             optionAsMeta = false
+        }
+        if version < 5 {
+            // Forced keep-alives (10 s × 3) and a 6 s stall limit ended connections that plain ssh
+            // keeps — after sleep, on a Wi-Fi hand-over — and every tab then asked for the password.
+            if serverAliveInterval == 10 && serverAliveCountMax == 3 { serverAliveInterval = 0 }
+            if stallTimeout == 6 { stallTimeout = 15 }
+            stallTimeout = min(max(stallTimeout, 5), 120)    // the range Settings offers now
+        }
+        if version < 6 {
+            // 45 s of silence before a connection counted as dead kept tabs waiting with no word
+            // after a network change; a live connection answers within seconds.
+            if deadAfterSeconds == 45 { deadAfterSeconds = 20 }
+        }
+        if version < 7 {
+            // Small files one by one cost a copy each: from 5 files on they go as one stream.
+            if transferArchiveThreshold == 20 { transferArchiveThreshold = 5 }
+            // The switch became a choice of method; off stays off.
+            transferCompression = transferCompress ? .auto : .off
+        }
+        if version < 8 {
+            // A server that cannot be reached was tried every 30 s by each of its tabs; now its
+            // tabs try together, further apart each time, up to 2 minutes.
+            if reconnectMaxDelay == 30 { reconnectMaxDelay = 120 }
         }
         version = Self.currentVersion
     }
@@ -505,6 +612,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.cursorBlink, &cursorBlink)
         d(.scrollbackLines, &scrollbackLines)
         d(.programsMayClearScrollback, &programsMayClearScrollback)
+        d(.keepRedrawnFrames, &keepRedrawnFrames)
         d(.browseLocalInFinder, &browseLocalInFinder)
         d(.tabTitleFromAgent, &tabTitleFromAgent)
         d(.rememberKeyPassphrases, &rememberKeyPassphrases)
@@ -524,6 +632,10 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.workingCPUThreshold, &workingCPUThreshold)
         d(.workingQuietDelay, &workingQuietDelay)
         d(.showAgentIcons, &showAgentIcons)
+        d(.showToolIcons, &showToolIcons)
+        d(.noTmuxSuggestion, &noTmuxSuggestion)
+        d(.saveSessionContents, &saveSessionContents)
+        d(.saveSessionFolder, &saveSessionFolder)
         d(.floatingBars, &floatingBars)
         d(.secretRedaction, &secretRedaction)
         d(.optionAsMeta, &optionAsMeta)
@@ -533,11 +645,18 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.maxReconnectAttempts, &maxReconnectAttempts)
         d(.reconnectBaseDelay, &reconnectBaseDelay)
         d(.reconnectMaxDelay, &reconnectMaxDelay)
+        d(.connectTimeout, &connectTimeout)
         d(.serverAliveInterval, &serverAliveInterval)
         d(.serverAliveCountMax, &serverAliveCountMax)
         d(.historyLinesOnReattach, &historyLinesOnReattach)
         d(.serverHistoryLines, &serverHistoryLines)
         d(.stallTimeout, &stallTimeout)
+        d(.networkLossGraceSeconds, &networkLossGraceSeconds)
+        d(.deadAfterSeconds, &deadAfterSeconds)
+        d(.rememberSignInPasswords, &rememberSignInPasswords)
+        d(.forgetSignInPasswordsAfterHours, &forgetSignInPasswordsAfterHours)
+        d(.forgetSignInPasswordsOnLock, &forgetSignInPasswordsOnLock)
+        d(.keepConnectionsAfterQuit, &keepConnectionsAfterQuit)
         d(.recordingEnabled, &recordingEnabled)
         d(.recordingQuotaMB, &recordingQuotaMB)
         d(.recordingRetentionDays, &recordingRetentionDays)
@@ -563,11 +682,13 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.transferArchiveMode, &transferArchiveMode)
         d(.transferArchiveThreshold, &transferArchiveThreshold)
         d(.transferCompress, &transferCompress)
+        d(.transferCompression, &transferCompression)
         d(.uploadDestination, &uploadDestination)
         d(.uploadTypesPaths, &uploadTypesPaths)
         d(.downloadFolder, &downloadFolder)
         d(.askWhereToDownload, &askWhereToDownload)
         d(.checkForUpdates, &checkForUpdates)
+        d(.installUpdatesAutomatically, &installUpdatesAutomatically)
         d(.appLockMode, &appLockMode)
         d(.lockOnSleep, &lockOnSleep)
         d(.unlockWithTouchID, &unlockWithTouchID)
@@ -608,8 +729,7 @@ public final class SettingsStore {
     public private(set) var tamperedSecuritySettings: [String] = []
 
     /// Separate defaults suite for tests (TETHER_DEFAULTS_SUITE), otherwise the app's own defaults.
-    private let defaults: UserDefaults = AppPaths.debugOverride("TETHER_DEFAULTS_SUITE")
-        .flatMap(UserDefaults.init(suiteName:)) ?? .standard
+    private let defaults: UserDefaults = AppPaths.defaults
 
     /// Settings were saved before this launch (false on the very first launch: the place to ask
     /// how Tether should look).
@@ -674,5 +794,23 @@ public final class SettingsStore {
         var fresh = AppSettings()
         SecuritySettings(settings).apply(to: &fresh)
         settings = fresh
+    }
+}
+
+/// What File ▸ Save Session… (⌘S) saves.
+public enum SaveSessionContents: String, Codable, CaseIterable, Sendable {
+    /// Everything the session has shown since it started (its recording), however long.
+    case whole
+    /// What the terminal holds now.
+    case terminal
+    /// The last command run in it: its line and all it printed.
+    case lastCommand
+
+    public var title: String {
+        switch self {
+        case .whole: "Whole session"
+        case .terminal: "What the terminal holds now"
+        case .lastCommand: "The last command and its output"
+        }
     }
 }

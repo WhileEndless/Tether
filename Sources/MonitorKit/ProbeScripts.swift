@@ -38,18 +38,21 @@ echo "@@conn"; echo "$SSH_CONNECTION"
 if [ "$OS" = Linux ]; then
   echo "@@uptime"; cut -d' ' -f1 /proc/uptime
   echo "@@load"; cut -d' ' -f1-3 /proc/loadavg
-  echo "@@ncpu"; getconf _NPROCESSORS_ONLN 2>/dev/null || grep -c ^processor /proc/cpuinfo
+  [ -n "$NCPU" ] || NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+  echo "@@ncpu"; echo "$NCPU"
   echo "@@cpu"; head -n1 /proc/stat
   if [ "$1" = 1 ]; then sleep 0.4 2>/dev/null || sleep 1; head -n1 /proc/stat; fi
   echo "@@meminfo"; grep -E '^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SReclaimable|SwapTotal|SwapFree):' /proc/meminfo
 elif [ "$OS" = Darwin ]; then
   echo "@@uptime"; b=$(sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/'); echo $(( $(date +%s) - b ))
   echo "@@load"; sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1, $2, $3}'
-  echo "@@ncpu"; sysctl -n hw.ncpu
+  [ -n "$NCPU" ] || NCPU=$(sysctl -n hw.ncpu)
+  echo "@@ncpu"; echo "$NCPU"
   echo "@@cpupct"; top -l 2 -n 0 -s 1 2>/dev/null | grep 'CPU usage' | tail -n1
   echo "@@darwinmem"; sysctl -n hw.memsize; vm_stat; echo "swap $(sysctl -n vm.swapusage)"
 fi
-echo "@@disk"; df -kP 2>/dev/null | tail -n +2
+# Disks change slowly, and df can be slow (network mounts): every half minute in a stream.
+if [ "${DISKNOW:-1}" = 1 ]; then echo "@@disk"; df -kP 2>/dev/null | tail -n +2; fi
 echo "@@netdev"
 if [ -r /proc/net/dev ]; then
   tail -n +3 /proc/net/dev | tr ':' ' ' | awk '{print $1, $2, $10}'
@@ -67,11 +70,13 @@ if [ "$1" = 1 ]; then
   if command -v ip >/dev/null 2>&1; then ip -o addr show 2>/dev/null | awk '{print $2, $4}'
   else ifconfig 2>/dev/null | awk '/^[a-z]/{i=$1; sub(":","",i)} /inet6? /{print i, $2}'; fi
 fi
-if [ -n "$HAS_NVIDIA" ]; then
+# GPU tools start their driver library on every call: every ten seconds or so in a stream.
+if [ "${GPUNOW:-1}" = 1 ] && [ -n "$HAS_NVIDIA" ]; then
   echo "@@nvidia"
   nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,uuid --format=csv,noheader,nounits 2>/dev/null
 fi
-if [ -n "$HAS_ROCM" ]; then
+if [ "${GPUNOW:-1}" != 1 ]; then :
+elif [ -n "$HAS_ROCM" ]; then
   echo "@@rocm"; rocm-smi --showproductname --showuse --showmeminfo vram --showtemp --showpower --json 2>/dev/null
 elif [ -n "$HAS_AMDSYSFS" ]; then
   echo "@@amdsysfs"
@@ -99,8 +104,18 @@ frame() {
 """# + "\n" + systemFrame + "\n" + #"""
 }
 interval="${1:-3}"
+case $interval in ''|*[!0-9]*) interval=3 ;; esac
+[ "$interval" -ge 1 ] || interval=1
+# Slow sections (disks, GPUs) only every few frames; the parser keeps their last values.
+kd=$(( (30 + interval - 1) / interval )); kg=$(( (10 + interval - 1) / interval ))
+n=0
 frame 1
-while sleep "$interval"; do frame 0 || exit 0; done
+while sleep "$interval"; do
+  n=$((n + 1))
+  DISKNOW=0; [ $((n % kd)) -eq 0 ] && DISKNOW=1
+  GPUNOW=0; [ $((n % kg)) -eq 0 ] && GPUNOW=1
+  frame 0 || exit 0
+done
 """#
 
     /// Single snapshot (used when streaming is not possible).
@@ -178,36 +193,58 @@ ps -eo pid=,user=,pcpu=,pmem=,rss=,etime=,args= 2>/dev/null || ps -eo pid,user,p
 kill -s "$1" "$2"
 """#
 
-    public static func logs(_ source: LogSource, lines: Int) -> (script: String, arguments: [String]) {
+    /// `$1` = lines, `$2` = all|warnings|errors, `$3` = the file (for a file). A level other than
+    /// all asks journalctl for that priority, `log show` for errors and faults, `dmesg` for its
+    /// levels, and looks for the usual words in plain files (in their last 200,000 lines).
+    public static func logs(_ source: LogSource, lines: Int, level: LogLevel = .all) -> (script: String, arguments: [String]) {
         let n = String(max(lines, 10))
+        let common = #"""
+export LC_ALL=C
+N=$1 L=$2
+P=; case $L in errors) P='-p err' ;; warnings) P='-p warning' ;; esac
+W='emerg|alert|crit|err|fail|fatal|panic|denied|refused|segfault|oom|killed process'
+[ "$L" = warnings ] && W="$W|warn"
+pick() { if [ "$L" = all ]; then tail -n "$N"; else tail -n 200000 | grep -iE "$W" | tail -n "$N"; fi; }
+journal() { command -v journalctl >/dev/null 2>&1 && journalctl -n 1 --no-pager "$@" >/dev/null 2>&1; }
+MACERR='messageType == error OR messageType == fault'
+"""#
         switch source {
         case .system:
-            return (#"""
-export LC_ALL=C
-if [ "$(uname -s)" = Darwin ]; then log show --last 10m --style syslog 2>/dev/null | tail -n "$1"; exit; fi
-if command -v journalctl >/dev/null 2>&1 && journalctl -n 1 --no-pager >/dev/null 2>&1; then journalctl -n "$1" --no-pager -o short-iso 2>&1; exit; fi
-for f in /var/log/syslog /var/log/messages; do if [ -r "$f" ]; then tail -n "$1" "$f"; exit; fi; done
+            return (common + "\n" + #"""
+if [ "$(uname -s)" = Darwin ]; then
+  if [ "$L" = all ]; then log show --last 10m --style syslog 2>/dev/null | tail -n "$N"
+  else log show --last 1h --style syslog --predicate "$MACERR" 2>/dev/null | tail -n "$N"; fi
+  exit; fi
+# shellcheck disable=SC2086
+if journal; then journalctl -n "$N" --no-pager -o short-iso $P 2>&1; exit; fi
+for f in /var/log/syslog /var/log/messages; do if [ -r "$f" ]; then pick < "$f"; exit; fi; done
 echo "No readable system log (journalctl, /var/log/syslog, /var/log/messages)." >&2; exit 1
-"""#, [n])
+"""#, [n, level.rawValue])
         case .auth:
-            return (#"""
-export LC_ALL=C
-if command -v journalctl >/dev/null 2>&1 && journalctl -n 1 --no-pager >/dev/null 2>&1; then
-  journalctl -n "$1" --no-pager -o short-iso _COMM=sshd 2>&1; exit; fi
-for f in /var/log/auth.log /var/log/secure; do if [ -r "$f" ]; then tail -n "$1" "$f"; exit; fi; done
-if [ "$(uname -s)" = Darwin ]; then log show --last 1h --style syslog --predicate 'process == "sshd"' 2>/dev/null | tail -n "$1"; exit; fi
+            return (common + "\n" + #"""
+# sshd-session: OpenSSH 9.8 and later.
+# shellcheck disable=SC2086
+if journal; then journalctl -n "$N" --no-pager -o short-iso _COMM=sshd _COMM=sshd-session $P 2>&1; exit; fi
+for f in /var/log/auth.log /var/log/secure; do if [ -r "$f" ]; then pick < "$f"; exit; fi; done
+if [ "$(uname -s)" = Darwin ]; then
+  Q='process == "sshd" OR process == "sshd-session"'
+  [ "$L" = all ] || Q="($Q) AND ($MACERR)"
+  log show --last 1h --style syslog --predicate "$Q" 2>/dev/null | tail -n "$N"; exit; fi
 echo "No readable authentication log (may require root)." >&2; exit 1
-"""#, [n])
+"""#, [n, level.rawValue])
         case .kernel:
-            return (#"""
-export LC_ALL=C
-if command -v journalctl >/dev/null 2>&1 && journalctl -k -n 1 --no-pager >/dev/null 2>&1; then journalctl -k -n "$1" --no-pager -o short-iso 2>&1; exit; fi
-dmesg 2>/dev/null | tail -n "$1" || { echo "Kernel log is not readable (may require root)." >&2; exit 1; }
-"""#, [n])
+            return (common + "\n" + #"""
+# shellcheck disable=SC2086
+if journal -k; then journalctl -k -n "$N" --no-pager -o short-iso $P 2>&1; exit; fi
+case $L in errors) D=emerg,alert,crit,err ;; warnings) D=emerg,alert,crit,err,warn ;; *) D= ;; esac
+if [ -n "$D" ] && dmesg --level="$D" >/dev/null 2>&1; then dmesg --level="$D" | tail -n "$N"; exit; fi
+if dmesg >/dev/null 2>&1; then dmesg | pick; exit; fi
+echo "Kernel log is not readable (may require root)." >&2; exit 1
+"""#, [n, level.rawValue])
         case .file(let path):
-            return (#"""
-if [ -r "$2" ]; then tail -n "$1" "$2"; else echo "Cannot read $2" >&2; exit 1; fi
-"""#, [n, path])
+            return (common + "\n" + #"""
+if [ -r "$3" ]; then pick < "$3"; else echo "Cannot read $3" >&2; exit 1; fi
+"""#, [n, level.rawValue, path])
         }
     }
 
@@ -233,7 +270,9 @@ echo "@@tmuxtitles"; [ -n "$panes" ] && tmux list-panes -a -F '#{pane_id}|#{host
 fg=
 if [ -n "$panes" ]; then
   TTYS=$(printf '%s\n' "$panes" | awk -F'|' '{ t = $7; sub(/^\/dev\//, "", t); sub(/^tty/, "", t); print t }')
-  fg=$(ps -A -o pid=,tty=,stat=,args= 2>/dev/null | TTYS="$TTYS" awk '
+  # Only the panes' terminals are asked for (not every process on the host); ps without -t: all.
+  TL=$(printf '%s\n' "$TTYS" | awk 'NF { printf "%s%s", s, $0; s = "," }')
+  fg=$( { ps -t "$TL" -o pid=,tty=,stat=,args= 2>/dev/null || ps -A -o pid=,tty=,stat=,args= 2>/dev/null; } | TTYS="$TTYS" awk '
     BEGIN { n = split(ENVIRON["TTYS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
     $3 ~ /\+/ { t = $2; sub(/^tty/, "", t); if (t in want) print }')
 fi

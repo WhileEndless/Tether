@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.8.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.9.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.8.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.9.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -35,7 +35,7 @@ Search across every terminal, the archive and recordings.
 - **Clear states.** *Online*, *Waiting* (connection lost: history stays visible, input is paused) and *Dead* (the remote session is confirmed gone: read-only and archived). A lost network is detected immediately, and a stalled server within seconds. Tabs reattach when the network returns, and also after the app is quit or crashes.
 - **Background sessions.** Close a tab and keep its session running in the background. Your own tmux sessions on a server are listed too, and you can attach to them. Leftover sessions can be cleaned up.
 - **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex and opencode show the name of their session — the one you gave it or the one the agent chose — on server sessions and on open tabs, and whether Claude Code is working. Tabs you have not renamed take the agent session's name. Names come from the agents' own files on the server (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
-- **Save a session** with ⌘S (*File ▸ Save Session…*): everything it has shown, including output no longer in memory (read from its recording), as plain text or as the raw output with colors. Tether remembers the folder and format you chose last.
+- **Save a session** with ⌘S (*File ▸ Save Session…*): the whole session — everything it has shown, including output no longer in memory (read from its recording) — what the terminal holds now, or just the last command and its output (say the `ls` you just ran), as plain text or as the raw output with colors. It opens in your Downloads folder; what it starts with and where are set in Settings ▸ Terminal ▸ Saving a Session.
 
 **Passwords, Touch ID and sudo**
 - Saving passwords is optional: tick *Remember in Keychain* when signing in (works for every jump host and for SSH key passphrases).
@@ -43,6 +43,7 @@ Search across every terminal, the archive and recordings.
 - A saved password only answers its own host: never a server's own prompt text naming another host, never a jump host asking for the target's password.
 - When a terminal asks for a password — `sudo`, `su`, `ssh` to another host, a key passphrase — a bar offers to fill a saved one (⌥⌘P) or to type one in a secure field and save it. Passwords are kept per user: sudo's for the user who runs it, su's for the account it switches to (also on macOS, where both just ask "Password:"). Only sudo is filled automatically, and only while sudo itself is waiting; a password is never typed into a shell (where it would land in the shell history and the recording). Secure Keyboard Entry is on while a terminal waits for a password.
 - A saved password that stops working (changed on the server) is not sent again: you are asked for the current one, which replaces it. Saved passwords can also be replaced or removed in Settings ▸ Passwords.
+- You sign in to a server once per run: a typed password also answers that connection's later sign-ins (same host, port, user and jump host) until Tether quits — encrypted by a Secure Enclave key that exists only while Tether runs, never written anywhere, never used for sudo or one-time codes, and switchable off. Saved passwords keep asking for Touch ID as set. Details in [docs/connections-and-passwords.md](docs/connections-and-passwords.md).
 
 **Security**
 - **App Lock** (off by default): Touch ID or the Mac password, or a separate Tether password. Every window is covered until Tether is unlocked; sessions keep running meanwhile. Coming back to Tether asks for Touch ID right away. Optionally locks when the Mac sleeps or its screen locks; ⌃⌘L or the toolbar's lock button locks at once.
@@ -57,7 +58,7 @@ Search across every terminal, the archive and recordings.
 **Terminal**
 - xterm-256color and true color, mouse reporting, alternate screen, Option as Meta (off by default, so Option types your layout's characters such as @), and key mappings. vim, htop, fzf and emacs work as expected.
 - Uses this Mac's Terminal.app profile (colors, font, translucency) by default.
-- Terminal.app navigation: ⌘↑/⌘↓ jump between commands, ⇧⌘↑/⇧⌘↓ select whole commands, and PageUp/PageDown/Home/End scroll.
+- Terminal.app navigation: ⌘↑/⌘↓ jump to the command above or below what is on screen (into the recording too), ⇧⌘↑/⇧⌘↓ select whole commands, and PageUp/PageDown/Home/End scroll.
 - Tab names follow the running command (or the current directory), and you can rename any tab.
 - Local terminals on this Mac. These are persistent too when tmux is installed locally.
 
@@ -80,10 +81,11 @@ Search across every terminal, the archive and recordings.
 - Jump host chains (ProxyJump), each hop with its own saved password.
 - *Identify by name* (HostKeyAlias), so an address reused on another network is not confused with your host.
 - Direct connections (user, host, port, jump host, password or key) without saving anything.
-- One authenticated connection per host (ControlMaster), shared by terminals, transfers, monitoring and port forwards.
+- One authenticated connection per host (ControlMaster), shared by terminals, transfers, monitoring and port forwards; one sign-in however many of them start at once. Hosts behind the same jump host share its connection.
+- Connections survive short outages, Wi-Fi changes, the screen locking and sleep, like plain ssh (no forced keep-alives; servers are not sent data while the Mac sleeps). See [docs/connections-and-passwords.md](docs/connections-and-passwords.md).
 - Passwords stay in the keychain and reach `ssh` via a private askpass bridge.
 - **SSH keys:** *Set Up SSH Key…* on a host creates a key (Ed25519, or RSA 4096 for older servers), with or without a passphrase (typed twice), adds it to the server's `authorized_keys`, checks that the key alone logs in, and sets it in your SSH config. An existing key can be used instead. Existing files are never replaced. It is offered only where key login doesn't already work.
-- **Keys with a passphrase:** when ssh asks for it, Tether answers with the passphrase it keeps in your keychain (after Touch ID, if you turned that on), or asks you and can remember it. Optionally new keys also go to the macOS ssh-agent for Terminal and git. Settings ▸ SSH ▸ Keys lists your keys and adds, changes or removes a passphrase.
+- **Keys with a passphrase:** when ssh asks for it, Tether answers with the passphrase it keeps in your keychain (after Touch ID, if you turned that on), or asks you and can remember it — once per key file, however many hosts and tabs use it (see [docs/connections-and-passwords.md](docs/connections-and-passwords.md#key-passphrases)). Optionally new keys also go to the macOS ssh-agent for Terminal and git. Settings ▸ SSH ▸ Keys lists your keys and adds, changes or removes a passphrase.
 - **Port forwarding:**
   - local, remote and SOCKS forwards saved per host, with auto-start
   - conflict checks with free-port suggestions
@@ -111,9 +113,10 @@ Search across every terminal, the archive and recordings.
 - Remote file browser as a tab, a panel or a full window, with drag and drop in both directions, Quick Look and details.
 - Directories you have visited open instantly from a cache and refresh in the background, keeping scroll position and selection.
 - *Browse Files Here* (the terminal's current directory) and *Open Terminal Here*. In a terminal of this Mac, Browse opens the folder in Finder (or Tether's file manager, Settings ▸ General).
-- Transfers show what went where, speed, amount transferred and ETA. Many files travel as one packed stream (tar on both ends, nothing written to disk in between); others are copied several at a time. Both are configurable.
-- **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): Tether asks for a destination (Return accepts `/tmp`), uploads, then types the remote path(s) at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead. In local terminals (this Mac) nothing is copied: the file's own path is typed (a pasted image is saved as a PNG first, and kept for a week).
-- Copy files in the file manager and paste them in Finder (and the other way round). Bulk move, copy, permissions, compress, rename and delete.
+- Transfers show what went where, speed, amount transferred and ETA. Many files (5 or more by default) travel as one packed stream (tar on both ends, nothing written to disk in between), compressed as it flows with zstd, lz4 or gzip — the fastest both ends have — or xz or bzip2; others are copied several at a time. All of it is configurable, compression can be turned off, and every transfer of a server shares its one sign-in.
+- **Drop or paste files into a terminal** to upload them — Finder files, the screenshot thumbnail, or an image on the clipboard (⌃⇧⌘4 screenshots are saved as PNG first): they go to the folder the terminal is in (Settings ▸ Transfers: or `/tmp`, or ask each time; hold ⌥ to be asked once), then the remote path(s) are typed at the prompt. Existing files are never overwritten — a free name such as `report-1.pdf` is chosen instead. In local terminals (this Mac) nothing is copied: the file's own path is typed (a pasted image is saved as a PNG first, and kept for a week).
+- **Copy and paste files anywhere:** ⌘C in the file manager, then ⌘V in another folder (copied on the server itself), in another server's file manager or terminal (through this Mac — the temporary copy is removed afterwards; into a terminal they go where Finder files would), in a terminal of the same server (the paths are typed), or in Finder. Dragging rows does the same. Files copied in Finder are uploaded. Folders and files can be mixed; many files travel as one packed stream. Nothing is ever replaced, and the file manager says how a paste went (pasted, renamed, what could not be downloaded) — with a macOS notification when Tether is in the background. Transfers (⌥⌘L) is in every file manager window's toolbar too. Bulk move, copy, permissions, compress, rename and delete.
+- **Search:** the search field (⌘F) filters the folder as you type; ↩ searches the folders below it on the server — names containing the text, a pattern such as `*.log`, or files containing the text — with only `find` and `grep` (PowerShell on Windows). Results show where they are; every file action works on them, and *Show in Enclosing Folder* goes there.
 
 **Search**
 - Search every open terminal, the archive and old recordings, with plain text or regex, case sensitivity and whole words.
@@ -128,7 +131,7 @@ Search across every terminal, the archive and recordings.
 - No limit on how long a session runs: memory keeps a set number of lines, and scrolling further reads earlier output back from disk without a visible break (view and selection stay in place).
 - Closing the window keeps Tether and every session running in the menu bar; the icon brings the window back with its tabs.
 - After quitting — or a crash — every window comes back with its tabs, selected tab, size, position and full-screen state.
-- Dozens of tabs to one host: logins are queued and terminals are spread over several shared connections (servers allow 10 sessions per connection by default).
+- Dozens of tabs to one host: one sign-in, and terminals are spread over several shared connections (servers allow 10 sessions per connection by default).
 - Monitoring pauses while no Tether window is visible, and recordings are written in large batches to spare the SSD.
 
 **Local backups.**
@@ -151,7 +154,7 @@ Anything with ⌘ belongs to the app. Everything else — Ctrl keys, Option (cha
 | Tab 1…8 / last tab · go to any session | ⌘1…⌘8 / ⌘9 · ⌘P |
 | Move tab to background / disconnect to background | ⇧⌘B / ⌥⇧⌘B |
 | Terminate session | ⌥⇧⌘W |
-| Save the whole session to a file | ⌘S |
+| Save the session (or the last command) to a file | ⌘S |
 | Fill a saved password (sudo, su, ssh prompt) | ⌥⌘P |
 | Lock Tether (with App Lock on) | ⌃⌘L |
 | Jump between commands / select a command's output | ⌘↑ ⌘↓ / ⇧⌘↑ ⇧⌘↓ |
@@ -193,9 +196,13 @@ Or `make run` to build and open it from `dist/` without installing. A build made
 
 ### Updating
 
-Quit Tether, then install the new version over the old one (`git pull && make install` from source). Settings, hosts, sessions and recordings are kept. Sessions that were open reattach on the next launch.
+Tether updates itself (Settings ▸ General ▸ Updates, on by default): at launch and once a day it asks GitHub whether a newer release exists, downloads that release's source into a temporary folder, builds it there in the background at low priority, and installs it with `make install` over the copy that runs when you quit Tether — or at once with *Restart to Update* (also in the Help menu and the sidebar). Help ▸ Check for Updates… asks right away and opens the Software Update window: the new version's release notes, the progress of the download and of the build (*Cancel* stops it), and *Restart to Update* once it is ready. After an update, Tether shows once what changed. Building needs Apple's command line tools (`xcode-select --install`); without them, or with *Download and install updates* off, Tether only says a new version exists and links to its release page. Turn the check off and nothing is asked at all.
 
-Tether is not signed with a developer certificate, so to the keychain every new version is a new app: the first time a new version uses a saved password (or the recording key), macOS asks whether Tether may use it. Choose *Always Allow*. Tether's own security settings are read without asking.
+By hand: quit Tether, then install the new version over the old one (`git pull && make install` from source). Either way settings, hosts, sessions and recordings are kept, and sessions that were open reattach on the next launch.
+
+Tether is not signed with a developer certificate. With the default ad-hoc signature every build is a new app to macOS: the first time a new version uses a saved password (or the recording key), macOS asks whether Tether may use it (choose *Always Allow*), and folder permissions (Documents, Downloads …) are asked for again. Building from source, run `make signing-identity` once: it creates a local, self-signed signing certificate in your login keychain, every later build is signed with it, and macOS keeps those permissions across updates. Tether's own security settings are read without asking either way.
+
+Programs you run in Tether's terminals (a build, `git`, a coding agent) reach macOS as Tether, as they would as Terminal.app: when one of them opens a file in Documents, macOS asks whether *Tether* may. A terminal (or tmux server) started by an older build still belongs to that build, so after updating, reopen local terminals once.
 
 ### Uninstalling
 

@@ -209,6 +209,8 @@ final class WindowState {
 
     /// Shows an existing session: selects its tab (in whichever window) or brings it here from the background.
     func show(_ session: TerminalSession) {
+        // Brought back to work in: it is no longer to be ended when connected.
+        model.sessions.keepRunning(session.id)
         session.resume()
         if !model.workspaces.focus(session.id) { present(session.id, mode: .tab) }
     }
@@ -230,8 +232,41 @@ final class WindowState {
     /// Ends a session and its shell on the server (tmux/screen session included), after one confirmation.
     func terminate(_ session: TerminalSession) {
         confirm("Terminate \u{201C}\(session.displayTitle)\u{201D}?",
-                "The shell and anything running in it on the server will be stopped.") { [model] in
+                "The shell and anything running in it on the server will be stopped.") { [weak self] in
+            self?.endOnServer(session)
+        }
+    }
+
+    /// Ends the session on the server. Not connected: the server is reached first (one sign-in for
+    /// it if needed); if it cannot be reached, the user chooses to keep the session disconnected or
+    /// to have it ended as soon as the server can be reached again.
+    private func endOnServer(_ session: TerminalSession) {
+        let persistent = session.persistence == .tmux || session.persistence == .screen
+        guard !session.phase.isOnline, persistent, !session.descriptor.target.isLocal else {
             model.sessions.close(session.id, killRemote: true)
+            return
+        }
+        Task { @MainActor [weak self, model] in
+            if await model.sessions.endOnServer(session.id) { return }
+            guard let self else { return }
+            let alert = NSAlert()
+            alert.messageText = "\(session.descriptor.target.displayName) cannot be reached"
+            alert.informativeText = "The session \u{201C}\(session.displayTitle)\u{201D} keeps running on the server until it can be ended there.\n\nEnd When Connected moves the tab to the background and ends the session as soon as the server can be reached (if the server asks for a password and none is remembered, it waits until you open one of its tabs). Keep in Background keeps it for you to close later. Opening it again takes the request back."
+            alert.addButton(withTitle: "End When Connected")
+            alert.addButton(withTitle: "Keep in Background")
+            alert.addButton(withTitle: "Cancel")
+            let handle: (NSApplication.ModalResponse) -> Void = { response in
+                switch response {
+                case .alertFirstButtonReturn:
+                    model.workspaces.detach(session.id)
+                    model.sessions.endWhenConnected(session.id)
+                case .alertSecondButtonReturn:
+                    self.disconnectToBackground(session)
+                default:
+                    break
+                }
+            }
+            if let window = self.window { alert.beginSheetModal(for: window, completionHandler: handle) } else { handle(alert.runModal()) }
         }
     }
 
@@ -244,6 +279,41 @@ final class WindowState {
             for s in open { model.sessions.close(s.id, killRemote: true) }
             Task { _ = await monitor.cleanUpOrphans(keeping: []) }
         }
+    }
+
+    /// Tether's sessions on a host that no tab here has open (detached): they may be tabs the last
+    /// run left behind, still running. Asked first, naming them: opened again as tabs, or ended.
+    func cleanUpLeftovers(on target: ConnectionTarget, done: @escaping () -> Void = {}) {
+        let monitor = model.monitor(for: target)
+        let open = Set(model.sessions.sessions(for: target.key).filter { !$0.phase.isDead }.map(\.descriptor.remoteSessionName))
+        let leftovers = monitor.remoteSessions.filter { $0.isTether && !open.contains($0.name) && !$0.attached }
+        guard !leftovers.isEmpty else { done(); return }
+        let alert = NSAlert()
+        alert.messageText = "\(leftovers.count) Tether session\(leftovers.count == 1 ? " is" : "s are") not open in any tab on \(target.displayName)"
+        let listed = leftovers.prefix(8).map { e -> String in
+            var line = "• " + e.name
+            if let at = e.lastActivity ?? e.created { line += " — last used " + at.formatted(date: .abbreviated, time: .shortened) }
+            if let w = e.windows, w > 1 { line += ", \(w) windows" }
+            return line
+        }
+        alert.informativeText = (listed + (leftovers.count > 8 ? ["and \(leftovers.count - 8) more"] : [])).joined(separator: "\n")
+            + "\n\nThey may still hold work (a tab the last run did not bring back). Open them as tabs, or end them and what runs in them."
+        alert.addButton(withTitle: "Open as Tabs")
+        alert.addButton(withTitle: "End Them")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[1].hasDestructiveAction = true
+        let answer: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            switch response {
+            case .alertFirstButtonReturn:
+                for e in leftovers { self?.connect(target, remoteSessionName: e.name, persistence: e.kind == .tmux ? .tmux : .screen) }
+                done()
+            case .alertSecondButtonReturn:
+                Task { _ = await monitor.cleanUpOrphans(keeping: open); done() }
+            default:
+                done()
+            }
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: answer) } else { answer(alert.runModal()) }
     }
 
     private func confirm(_ title: String, _ message: String, action: @escaping () -> Void) {
@@ -301,8 +371,16 @@ extension WindowState {
     /// tabs asks first: keep its tabs running in the background (the default — they stay connected and
     /// listed in the sidebar), or move them all to the other window. The last window just closes;
     /// Tether keeps everything and brings the window back from the menu bar.
+    /// Closes `window`, ending what is still shown over it (a sheet, a password panel) first.
+    static func close(_ window: NSWindow) {
+        while let sheet = window.attachedSheet { window.endSheet(sheet) }
+        window.close()
+    }
+
     func requestCloseWindow() {
         guard let window else { return }
+        // Already asking (a second click, ⇧⌘W again): one question at a time.
+        guard window.attachedSheet == nil else { NSSound.beep(); return }
         let store = model.workspaces
         let tabs = workspace.tabs
         guard !tabs.isEmpty, let other = store.otherOpenWorkspaces(than: workspaceID).first,
@@ -318,14 +396,18 @@ extension WindowState {
         alert.addButton(withTitle: "Move Tabs to Other Window")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { response in
+            // Closed once the sheet is gone: closing the window from inside the sheet's own ending
+            // could leave the window half closed — on screen, drawing nothing, not answering.
             switch response {
             case .alertFirstButtonReturn:
-                window.close()   // the workspace's sessions go to the background (WorkspaceStore.windowClosed)
+                DispatchQueue.main.async { Self.close(window) }   // its sessions go to the background (WorkspaceStore.windowClosed)
             case .alertSecondButtonReturn:
                 let selected = self.workspace.selected
                 for id in tabs { store.add(id, to: other, select: id == selected) }
-                window.close()
-                store.activate(other)
+                DispatchQueue.main.async {
+                    Self.close(window)
+                    store.activate(other)
+                }
             default:
                 break
             }

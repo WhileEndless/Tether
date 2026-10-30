@@ -95,7 +95,9 @@ public enum ProbeParser {
             snap.memUsed = used * pageSize
             snap.memAvailable = max(snap.memTotal - snap.memUsed, 0)
         }
-        snap.gpus = gpus(nvidia: s["nvidia"], rocm: s["rocm"], amdSysfs: s["amdsysfs"])
+        // A stream reads GPUs and disks every few frames only: in between, the last values stay.
+        let gpuFrame = s["nvidia"] != nil || s["rocm"] != nil || s["amdsysfs"] != nil
+        snap.gpus = gpuFrame || previous == nil ? gpus(nvidia: s["nvidia"], rocm: s["rocm"], amdSysfs: s["amdsysfs"]) : previous!.gpus
         snap.interfaces = interfaces(counters: s["netdev"], info: s["netinfo"], addresses: s["netaddr"],
                                      previous: previous, now: snap.timestamp)
         if s["conn"] != nil || s["ips"] != nil {
@@ -131,6 +133,7 @@ public enum ProbeParser {
         // macOS (APFS): "/" is the read-only system snapshot, a few GB of its own; the volumes of a
         // container share its space, so what is used is everything that is not free (as Finder shows).
         let apfs = s["darwinmem"] != nil
+        if s["disk"] == nil, let previous { snap.disks = previous.disks; return snap }
         snap.disks = (s["disk"] ?? []).compactMap(disk).map { d in
             guard apfs, d.sizeKB > d.availableKB else { return d }
             var d = d

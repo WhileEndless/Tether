@@ -10,9 +10,21 @@ struct WorkspaceWindow: View {
     @Environment(\.openWindow) private var openWindow
     let workspaceID: UUID
     @State private var state: WindowState
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @SceneStorage("showInspector") private var showInspector = true
-    @AppStorage("inspectorWidth") private var inspectorWidth = 420.0
+    @State private var columnVisibility: NavigationSplitViewVisibility
+    /// Each window keeps its own sidebar and host panel (shown or not, widths, the panel's tab),
+    /// saved with its layout and brought back after relaunching (`WindowLayout.Panels`; a scene's
+    /// own storage is not kept for windows Tether reopens). A new window opens with them as they
+    /// were last left in any window (these defaults).
+    @AppStorage("showSidebar") private var lastShowSidebar = true
+    @AppStorage("showInspector") private var lastShowInspector = true
+    @AppStorage("inspectorWidth") private var lastInspectorWidth = 420.0
+    @AppStorage("sidebarWidth") private var lastSidebarWidth = 260.0
+    @State private var showInspector: Bool
+    @State private var inspectorWidth: Double
+    /// Kept while the sidebar is hidden (shown again, it comes back at this width).
+    @State private var sidebarWidth: Double?
+    /// The sidebar's width when the window opened (set on the split view once it is laid out).
+    private let sidebarStartWidth: Double
     @State private var detailWidth: CGFloat = 1200
 
     /// Shown when wanted and when the terminal still gets at least 380 points beside it.
@@ -25,7 +37,23 @@ struct WorkspaceWindow: View {
 
     init(workspaceID: UUID) {
         self.workspaceID = workspaceID
-        _state = State(initialValue: WindowState(workspaceID: workspaceID))
+        let defaults = AppPaths.defaults
+        let saved = WindowLayout.savedPanels(for: workspaceID)
+        let state = WindowState(workspaceID: workspaceID)
+        if let tab = saved?.inspectorTab.flatMap(InspectorTab.init(rawValue:)) { state.inspectorTab = tab }
+        _state = State(initialValue: state)
+        let sidebar = saved?.sidebar ?? defaults.object(forKey: "showSidebar") as? Bool ?? true
+        _columnVisibility = State(initialValue: sidebar ? .all : .detailOnly)
+        _showInspector = State(initialValue: saved?.inspector ?? defaults.object(forKey: "showInspector") as? Bool ?? true)
+        _inspectorWidth = State(initialValue: min(max(saved?.inspectorWidth ?? defaults.object(forKey: "inspectorWidth") as? Double ?? 420, 340), 640))
+        let width = saved?.sidebarWidth ?? defaults.object(forKey: "sidebarWidth") as? Double ?? 260
+        sidebarStartWidth = min(max(width, 220), 380)
+        _sidebarWidth = State(initialValue: sidebarStartWidth)
+    }
+
+    private var panels: WindowLayout.Panels {
+        WindowLayout.Panels(sidebar: columnVisibility != .detailOnly, sidebarWidth: sidebarWidth, inspector: showInspector,
+                            inspectorWidth: inspectorWidth, inspectorTab: state.inspectorTab.rawValue)
     }
 
     var body: some View {
@@ -34,6 +62,10 @@ struct WorkspaceWindow: View {
             SidebarView()
                 // Content never dictates the column's minimum size (see the detail column below).
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                .onGeometryChange(for: Double.self) { $0.size.width.rounded() } action: { w in
+                    // Only while shown (a hidden column measures nothing useful).
+                    if w >= 220, columnVisibility != .detailOnly { sidebarWidth = w }
+                }
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
         } detail: {
             // The host panel is drawn here rather than as a split-view inspector column: AppKit's
@@ -73,6 +105,7 @@ struct WorkspaceWindow: View {
             model.workspaces.register(window, for: workspaceID, state: state)
             WindowLayout.apply(to: window, workspace: workspaceID)
             WindowLayout.watch(window, workspace: workspaceID)
+            WindowLayout.applySidebarWidth(sidebarStartWidth, in: window)
         })
         .sheet(isPresented: $state.showQuickConnect) { QuickConnectView().appLockCover() }
         .sheet(item: $state.hostEditor) { HostEditorView(request: $0).appLockCover() }
@@ -117,6 +150,11 @@ struct WorkspaceWindow: View {
             if let session = state.session { model.sessionShown(session) } else { model.refreshPromptPanel() }
         }
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
+        .onChange(of: columnVisibility) { _, visibility in lastShowSidebar = visibility != .detailOnly }
+        .onChange(of: showInspector) { _, shown in lastShowInspector = shown }
+        .onChange(of: inspectorWidth) { _, w in lastInspectorWidth = w }
+        .onChange(of: sidebarWidth) { _, w in if let w { lastSidebarWidth = w } }
+        .onChange(of: panels, initial: true) { _, p in WindowLayout.update(p, for: workspaceID) }
         .onChange(of: state.toggleInspector) {
             withAnimation(.smooth) {
                 // Wanted but stepped aside for lack of room: make room by hiding the sidebar.
@@ -187,8 +225,9 @@ struct WorkspaceToolbar: ToolbarContent {
             Button {
                 state.showTransfers.toggle()
             } label: {
-                Label("Transfers", systemImage: "arrow.up.arrow.down.circle")
-                    .symbolEffect(.pulse, isActive: model.transfers.activeCount > 0)
+                // Still: a looping symbol effect in the toolbar redraws the window on every frame
+                // for as long as a transfer runs (the badge says how many run).
+                Label("Transfers", systemImage: model.transfers.activeCount > 0 ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down.circle")
             }
             .badge(model.transfers.activeCount)
             .help("File transfers (⌥⌘L)")

@@ -55,3 +55,62 @@ import Testing
         #expect(slice.count <= 10_000 && String(decoding: slice, as: UTF8.self).contains("line 19999"))
     }
 }
+
+/// Recordings no archived session refers to remember which secret rules they were looked through
+/// with, also once compressed.
+@Suite struct RedactionMarkTests {
+    @Test func markSurvivesCompression() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tether-mark-\(UUID().uuidString.prefix(6))")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("a.log")
+        try Data("hello\n".utf8).write(to: url)
+        #expect(RecordingStore.redactionMark(of: url) == nil)
+        RecordingStore.setRedactionMark("abc123", on: url)
+        #expect(RecordingStore.redactionMark(of: url) == "abc123")
+        let compressed = try RecordingCompression.compress(url, key: nil, encryptPlain: false)
+        #expect(RecordingStore.redactionMark(of: compressed) == "abc123")
+    }
+}
+
+/// Compressing waits for an idle Mac; a pass compresses what waits, one file at a time, and stops
+/// between files when asked to.
+@Suite struct IdleCompressionTests {
+    func setUp() throws -> (dir: URL, old: URL, recent: URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-idle-\(UUID())")
+        let host = dir.appendingPathComponent("host")
+        try FileManager.default.createDirectory(at: host, withIntermediateDirectories: true)
+        let text = Data((0..<5_000).map { "line \($0)\r\n" }.joined().utf8)
+        let old = host.appendingPathComponent("old.\(RecordingStore.fileExtension)")
+        let recent = host.appendingPathComponent("new.\(RecordingStore.fileExtension)")
+        try text.write(to: old)
+        try text.write(to: recent)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-40 * 86_400)], ofItemAtPath: old.path)
+        return (dir, old, recent)
+    }
+
+    @Test func aPassCompressesOldRecordingsOnly() async throws {
+        let (dir, old, recent) = try setUp()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(IdleCompression.candidates(in: dir, now: Date(), olderThanDays: 30).map(\.lastPathComponent) == [old.lastPathComponent])
+        #expect(await IdleCompression.run(in: dir) { true })
+        #expect(RecordingStore.resolve(old.path).map(RecordingCompression.isCompressed) == true)
+        #expect(FileManager.default.fileExists(atPath: recent.path))
+        #expect(IdleCompression.candidates(in: dir, now: Date(), olderThanDays: 30).isEmpty)
+    }
+
+    @Test func aPassStopsWhenTheMacIsUsed() async throws {
+        let (dir, old, _) = try setUp()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(await IdleCompression.run(in: dir) { false } == false)
+        #expect(FileManager.default.fileExists(atPath: old.path), "nothing compressed")
+    }
+
+    /// The storage limit alone no longer compresses: that waits for an idle Mac.
+    @Test func aQuotaPassWithRoomLeftDoesNotCompress() throws {
+        let (dir, old, _) = try setUp()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        _ = RecordingStore.enforceQuota(in: dir)
+        #expect(FileManager.default.fileExists(atPath: old.path))
+    }
+}

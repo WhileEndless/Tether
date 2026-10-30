@@ -351,7 +351,7 @@ struct NetworkSourceNote: View {
 /// Formatting shared by the command views.
 enum CommandFormat {
     static func percent(_ v: Double) -> String {
-        v >= 10 || v == 0 ? "\(Int(v.rounded()))%" : String(format: "%.1f%%", v)
+        !v.isFinite ? "–" : v >= 10 || v == 0 ? "\(Int(v.rounded()))%" : String(format: "%.1f%%", v)
     }
 
     /// CPU readings scaled for a sparkline (one full core = the top, more cores go beyond).

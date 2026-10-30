@@ -1,6 +1,7 @@
 import SwiftUI
 import MonitorKit
 import TetherCore
+import SSHTransport
 import RecordingKit
 import TerminalUI
 
@@ -35,12 +36,22 @@ private struct GeneralSettings: View {
         Form {
             Section {
                 Toggle("Re-attach persistent sessions on launch", isOn: $store.settings.restoreSessionsOnLaunch)
-                Toggle("Check for a new version at launch", isOn: $store.settings.checkForUpdates)
                 Toggle("Keep running in the menu bar when the window is closed", isOn: $store.settings.keepRunningInMenuBar)
             } header: {
                 Text("Startup")
             } footer: {
-                Text("In the menu bar, closing the window hides Tether from the Dock while every session keeps running; click the menu bar icon to open it again with its tabs. ⌘Q quits (persistent sessions re-attach next time). The update check is one request to GitHub at launch; nothing is downloaded or sent.")
+                Text("In the menu bar, closing the window hides Tether from the Dock while every session keeps running; click the menu bar icon to open it again with its tabs. ⌘Q quits (persistent sessions re-attach next time).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Check for a new version at launch and once a day", isOn: $store.settings.checkForUpdates)
+                Toggle("Download and install updates", isOn: $store.settings.installUpdatesAutomatically)
+                    .onChange(of: store.settings.installUpdatesAutomatically) { _, on in if !on { Updater.shared.stop() } }
+                UpdateStatusPanel(compact: true)
+            } header: {
+                Text("Updates")
+            } footer: {
+                Text("The check is one request to GitHub; nothing about you is sent. A newer release's source is downloaded into a temporary folder and built there in the background (a few minutes, at low priority; it needs Apple's command line tools — without them you get the release page), then installed with make install when Tether quits, or now with Restart to Update. Tabs in tmux or screen re-attach after the restart.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Tabs & Windows") {
@@ -161,6 +172,9 @@ private struct TerminalSettings: View {
                         value: $store.settings.scrollbackLines, in: 1_000...200_000, step: 5_000)
                 Text("Older output stays in the session recording on disk: it is still searchable and can be opened with “Open Full History” when you scroll to the top. Fewer lines in memory keep long sessions light.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("Keep every frame a program redraws in place", isOn: $store.settings.keepRedrawnFrames)
+                Text("Off: a build's progress (docker compose build, npm install) leaves in the history what it shows at the end, not each update on the way. On: every update is kept, as it was drawn.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Programs may clear the scrollback", isOn: $store.settings.programsMayClearScrollback)
                 Text("Off: `clear`, and programs that redraw everything (Claude Code), clear the screen but never erase the history above it. On: they erase it as in other terminals. Either way the recording keeps everything, for search, export and the transcript, where repeated redraws appear once.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -187,6 +201,7 @@ private struct TerminalSettings: View {
             }
             Section("Tabs") {
                 Toggle("Show coding agents' symbols (Claude Code, Codex, …)", isOn: $store.settings.showAgentIcons)
+                Toggle("Show container tools' symbols (Docker, Docker Compose, Podman)", isOn: $store.settings.showToolIcons)
                 Toggle("Mark programs that are open but idle (vim, less)", isOn: $store.settings.markIdlePrograms)
                 Picker("A quiet command is working above", selection: $store.settings.workingCPUThreshold) {
                     Text("2 % CPU").tag(2.0)
@@ -222,6 +237,32 @@ private struct TerminalSettings: View {
                     ForEach(FindJumpEffect.allCases) { Text($0.title).tag($0) }
                 }
                 Text("⌘F finds in the terminal, ↩ / ⌘G goes to the next match, ⇧↩ / ⇧⌘G to the previous one. The bar shows which match you are on and how many there are; the marks beside the scroller show where they are in the whole history. With Reduce Motion on, matches do not bounce or blink.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Saving a Session") {
+                Picker("⌘S saves first", selection: $store.settings.saveSessionContents) {
+                    ForEach(SaveSessionContents.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                LabeledContent("Save into") {
+                    HStack {
+                        Text(store.settings.saveSessionFolder.isEmpty ? "Downloads"
+                             : (store.settings.saveSessionFolder as NSString).abbreviatingWithTildeInPath)
+                            .lineLimit(1).truncationMode(.middle)
+                            .foregroundStyle(.secondary)
+                        Button("Choose…") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseDirectories = true
+                            panel.canChooseFiles = false
+                            panel.canCreateDirectories = true
+                            panel.directoryURL = SessionSave.folder
+                            if panel.runModal() == .OK, let url = panel.url { store.settings.saveSessionFolder = url.path }
+                        }
+                        if !store.settings.saveSessionFolder.isEmpty {
+                            Button("Use Downloads") { store.settings.saveSessionFolder = "" }
+                        }
+                    }
+                }
+                Text("File ▸ Save Session… (⌘S) asks what to save — the whole session, what the terminal holds now, or the last command and its output — and where; this is what it starts with.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Floating Bars") {
@@ -408,11 +449,13 @@ private struct TransferSettings: View {
                     Stepper("Pack when a transfer has \(store.settings.transferArchiveThreshold) or more files",
                             value: $store.settings.transferArchiveThreshold, in: 2...10_000, step: 5)
                 }
-                Toggle("Compress packed transfers", isOn: $store.settings.transferCompress)
+                Picker("Compress packed transfers", selection: $store.settings.transferCompression) {
+                    ForEach(TransferCompression.allCases) { Text($0.title).tag($0) }
+                }
             } header: {
                 Text("Many Files")
             } footer: {
-                Text("Packed transfers are made with tar on one side and unpacked on the other in a single stream — no temporary archive is written, and nothing at the destination is overwritten. This is much faster than copying many small files one by one. Compression helps on slow connections; turn it off on fast local networks. The server needs tar (it almost always has it). You can also choose per upload.")
+                Text("Packed transfers are made with tar on one side and unpacked on the other in a single stream — no temporary archive is written, and nothing at the destination is overwritten. This is much faster than copying many small files one by one; Always packs single files too. The stream is compressed as it flows with a program both ends have: automatically the fastest (zstd, then lz4, then gzip); xz and bzip2 are smaller but slow. zip and 7z cannot work this way (they need a whole archive file to be written first). Compression helps on slow connections; turn it off on fast local networks. The server needs tar (it almost always has it). You can also choose per upload.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -448,27 +491,45 @@ private struct SessionSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Persistence") }
 
-            Section("Reconnecting") {
+            Section {
                 Toggle("Reconnect automatically", isOn: $store.settings.autoReconnect)
                 Stepper(store.settings.maxReconnectAttempts == 0 ? "Attempts: unlimited"
                         : "Attempts: \(store.settings.maxReconnectAttempts)",
                         value: $store.settings.maxReconnectAttempts, in: 0...100)
+                Stepper("Wait \(store.settings.connectTimeout) s for a server to answer",
+                        value: $store.settings.connectTimeout, in: 5...120, step: 5)
                 Stepper("First retry after \(Int(store.settings.reconnectBaseDelay)) s",
                         value: $store.settings.reconnectBaseDelay, in: 1...30)
                 Stepper("Longest wait between retries: \(Int(store.settings.reconnectMaxDelay)) s",
-                        value: $store.settings.reconnectMaxDelay, in: 5...300, step: 5)
+                        value: $store.settings.reconnectMaxDelay, in: 5...600, step: 5)
+            } header: {
+                Text("Reconnecting")
+            } footer: {
+                Text("A server that does not answer is tried once for all its tabs, however many there are: they wait together, twice as long after each failed try, up to the longest wait. Reconnect on a tab tries at once, and so does every waiting tab when the network comes back or another tab to that server connects.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                Stepper("Keep-alive every \(store.settings.serverAliveInterval) s",
-                        value: $store.settings.serverAliveInterval, in: 5...120, step: 5)
-                Stepper("Drop after \(store.settings.serverAliveCountMax) missed keep-alives",
-                        value: $store.settings.serverAliveCountMax, in: 1...10)
-                Stepper("Treat as disconnected after \(Int(store.settings.stallTimeout)) s without an answer",
-                        value: $store.settings.stallTimeout, in: 3...60)
+                Toggle("Send keep-alives", isOn: Binding(
+                    get: { store.settings.serverAliveInterval > 0 },
+                    set: { store.settings.serverAliveInterval = $0 ? 30 : 0 }))
+                if store.settings.serverAliveInterval > 0 {
+                    Stepper("Keep-alive every \(store.settings.serverAliveInterval) s",
+                            value: $store.settings.serverAliveInterval, in: 5...300, step: 5)
+                    Stepper("End the connection after \(store.settings.serverAliveCountMax) missed keep-alives",
+                            value: $store.settings.serverAliveCountMax, in: 1...60)
+                }
+                Stepper("Re-attach a tmux tab after \(Int(store.settings.stallTimeout)) s without an answer",
+                        value: $store.settings.stallTimeout, in: 5...120, step: 5)
+                Stepper(store.settings.networkLossGraceSeconds == 0
+                        ? "Detach tmux and screen tabs as soon as the network is gone"
+                        : "Detach tmux and screen tabs when the network is gone for \(Int(store.settings.networkLossGraceSeconds)) s",
+                        value: $store.settings.networkLossGraceSeconds, in: 0...300, step: 5)
+                Stepper("Close a connection that stays silent for \(Int(store.settings.deadAfterSeconds)) s",
+                        value: $store.settings.deadAfterSeconds, in: 10...600, step: 5)
             } header: {
                 Text("Connection Health")
             } footer: {
-                Text("tmux sessions are checked every 2 s, so a dead connection shows up within about \(Int(store.settings.stallTimeout)) s. Other sessions rely on keep-alives (about \(store.settings.serverAliveInterval * store.settings.serverAliveCountMax) s). Losing the network is detected immediately.")
+                Text("Like plain ssh, a connection is not given up because the network went away for a moment or the Mac slept: it usually survives, and nobody has to sign in again. Without keep-alives (the default) your ssh_config decides; when on, these values replace its ServerAliveInterval. Before the Mac sleeps, tmux and screen tabs detach from their server sessions (they keep running) so the server sends nothing; after waking, each connection is checked over its own link and closed only if it is dead. The silence and dead-connection times count only while the Mac is awake and online.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -504,7 +565,7 @@ private struct RecordingSettings: View {
                     Text("Never").tag(0)
                     ForEach([8, 16, 32, 64], id: \.self) { mb in Text("Every \(Int64(mb * 1024 * 1024).byteString)").tag(mb) }
                 }
-                .help("A session's earlier output is compressed in pieces of this size while it runs; the latest output stays as it is, so scrolling back stays fast")
+                .help("A session's earlier output is moved aside in pieces of this size while it runs and compressed when the Mac is idle; the latest output stays as it is, so scrolling back stays fast")
                 Toggle("When space runs out, shorten the largest session first", isOn: $store.settings.recordingShortenLargestFirst)
                     .help("A session holding more than half of the storage limit loses its oldest output before any other recording is removed (sessions compressed while they run, in pieces; not with Never above)")
                 VStack(alignment: .leading, spacing: 4) {
@@ -513,6 +574,7 @@ private struct RecordingSettings: View {
                     Text("\(total.byteString) of \(quota.byteString) used · old recordings are compressed (about 5–10× smaller), then the oldest are removed")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                CompressionStatusRow()
             } header: {
                 Text("Session Backups")
             } footer: {
@@ -547,7 +609,52 @@ private struct RecordingSettings: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { recordings = RecordingStore.all() }
+        // On the maintenance queue, in order with "Delete All": a listing never comes back after it.
+        .task { recordings = await RecordingStore.perform { RecordingStore.all() } }
+    }
+}
+
+/// What compression does: it runs while the Mac is idle (`IdleMaintenance`), so it says when it
+/// last ran, what waits and why it waits.
+private struct CompressionStatusRow: View {
+    @State private var status = IdleCompression.status
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if status.running {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("Compress Now") { IdleMaintenance.shared.compressNow() }
+                    .disabled(status.waiting == 0)
+                    .help("Compress what waits now instead of when the Mac is idle")
+            }
+        }
+        .task { await IdleCompression.countWaiting() }
+        .onReceive(NotificationCenter.default.publisher(for: IdleCompression.statusChanged).receive(on: RunLoop.main)) { _ in
+            status = IdleCompression.status
+        }
+    }
+
+    private var headline: String {
+        if status.running { return "Compressing… \(status.waiting) left" }
+        if status.waiting == 0 { return "Nothing waits to be compressed" }
+        return "\(status.waiting) recording file\(status.waiting == 1 ? "" : "s") wait\(status.waiting == 1 ? "s" : "") to be compressed"
+    }
+
+    private var detail: String {
+        var parts = ["Done while the Mac is idle (keyboard and mouse left alone for 2 minutes), at once only when the storage limit is reached"]
+        if let reason = status.waitingBecause, !status.running, status.waiting > 0 { parts.append("waiting: \(reason)") }
+        if let last = status.lastRun {
+            var text = "last run \(last.formatted(date: .abbreviated, time: .shortened))"
+            if status.done > 0 { text += ", \(status.done) compressed, \(status.saved.byteString) saved" }
+            parts.append(text)
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -687,12 +794,18 @@ private struct SSHSettings: View {
             }
             Section {
                 Toggle("Share one connection per host (ControlMaster)", isOn: $store.settings.useControlMaster)
-                Stepper("Keep shared connection for \(store.settings.controlPersistSeconds / 60) min after last use",
+                Toggle("Keep connections open after quitting",
+                       isOn: model.guardedSetting(\.keepConnectionsAfterQuit, reason: "keep signed-in connections open after Tether quits") { _, new in new })
+                    .disabled(!store.settings.useControlMaster)
+                Stepper(store.settings.keepConnectionsAfterQuit
+                        ? "Close them \(store.settings.controlPersistSeconds / 60) min after quitting"
+                        : "If Tether ends unexpectedly, close them after \(store.settings.controlPersistSeconds / 60) min",
                         value: $store.settings.controlPersistSeconds, in: 60...3600, step: 60)
+                    .disabled(!store.settings.useControlMaster)
             } header: {
                 Text("Multiplexing")
             } footer: {
-                Text("Terminals, file transfers and monitoring reuse one authenticated connection, so you log in (and pass jump hosts) only once.")
+                Text("Terminals, file transfers, port forwards and monitoring reuse one signed-in connection per server, so you sign in (and pass jump hosts) only once, however many tabs are open. It stays open while Tether runs. Quitting closes it (the sessions on the server keep running), unless you keep it open: then relaunching within that time signs in nobody.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             SSHKeysSection()
@@ -734,6 +847,7 @@ private struct PasswordSettings: View {
                 Text("Saving is always optional: tick “Remember in Keychain” when signing in, or save a password from the bar that appears when a terminal asks for one. Passwords stay in your login keychain, encrypted by macOS, and are sent only to the host they belong to.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            SignInMemorySection()
             Section {
                 Toggle("Offer to fill passwords in terminals", isOn: $store.settings.detectPasswordPrompts)
                 Toggle("Fill saved passwords automatically",
@@ -827,5 +941,65 @@ private struct FeatureToggle: View {
                 Text(feature.detail).font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+/// Settings ▸ Passwords: sign-in passwords remembered while Tether runs (see `SealedPasswordCache`).
+private struct SignInMemorySection: View {
+    @Environment(AppModel.self) private var model
+    @State private var items: [SealedPasswordCache.Item] = []
+
+    var body: some View {
+        @Bindable var store = model.settingsStore
+        let cache = model.passwordCache
+        Section {
+            Toggle("Remember sign-in passwords while Tether runs",
+                   isOn: model.guardedSetting(\.rememberSignInPasswords, reason: "remember sign-in passwords while Tether runs") { _, new in new })
+                .disabled(!cache.isAvailable)
+            if store.settings.rememberSignInPasswords && cache.isAvailable {
+                Picker("Forget them", selection: model.guardedSetting(\.forgetSignInPasswordsAfterHours, reason: "keep remembered sign-in passwords longer") { old, new in
+                    (old != 0 && new == 0) || (new > old && old != 0)
+                }) {
+                    Text("After 1 hour").tag(1)
+                    Text("After 8 hours").tag(8)
+                    Text("After 1 day").tag(24)
+                    Text("Only when Tether quits").tag(0)
+                }
+                Toggle("Also forget them when the screen locks or the Mac sleeps", isOn: model.guardedSetting(\.forgetSignInPasswordsOnLock, reason: "keep remembered sign-in passwords when the screen locks") { _, new in !new })
+            }
+            if !cache.isAvailable {
+                Text("This Mac has no Secure Enclave, so nothing is remembered.").font(.caption).foregroundStyle(.secondary)
+            } else if !cache.sshChecked {
+                Text("Checking the ssh program…").font(.caption).foregroundStyle(.secondary)
+            } else if !cache.sshNamesItsQuestions {
+                Text("The ssh program is older than OpenSSH 8.4, so nothing is remembered.").font(.caption).foregroundStyle(.secondary)
+            } else if items.isEmpty {
+                Text("None remembered now.").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(items) { item in
+                HStack {
+                    Image(systemName: "lock.fill").foregroundStyle(.secondary).frame(width: 20)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.login)
+                        Text((item.fromKeychain ? "Saved password, " : "Typed, ") + "since " + item.since.formatted(date: .omitted, time: .shortened))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Forget") { cache.forget(item.id); items = cache.items() }
+                }
+            }
+            if items.count > 1 {
+                HStack {
+                    Spacer()
+                    Button("Forget All") { cache.removeAll(); items = cache.items() }
+                }
+            }
+        } header: {
+            Text("Signing In Again")
+        } footer: {
+            Text("A password the server accepted signs that connection in again while Tether runs — another connection for many tabs, a reconnect after the connection really ended — without asking. It is sealed by a Secure Enclave key that exists only while Tether runs, never written anywhere, and never used for sudo or one-time codes. It is forgotten when refused, when Tether locks, and as set above. Details in docs/connections-and-passwords.md.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear { items = cache.items() }
     }
 }

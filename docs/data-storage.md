@@ -29,30 +29,73 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
 
 | What | Where (`~/Library/Application Support/Tether`) | Limit, and what goes first |
 | --- | --- | --- |
-| Session recordings (terminal output) | `Recordings/<host>/` | Storage limit (1 GB by default). In this order: old recordings are compressed (after 7 days by default); recordings past the optional number of days to keep are removed; the largest session loses its oldest parts while it holds more than half of the space (only a session kept in parts, see below); then the oldest recordings go. |
+| Session recordings (terminal output) | `Recordings/<host>/` | Storage limit (1 GB by default). Old recordings are compressed while the Mac is idle (after 7 days by default; see below). When the limit is reached, in this order: whatever waits to be compressed is compressed; recordings past the optional number of days to keep are removed; the largest session loses its oldest parts while it holds more than half of the space (only a session kept in parts, see below); then the oldest recordings go. |
 | Command history | `Command History/` | 90 days and 50 MB by default, at most 500 commands per host. The oldest finished commands go first. |
 | Hosts, groups, tags | `hosts.json` | — |
 | Archive of ended sessions | `archive.json` | 500 entries |
-| Open sessions, windows, file tabs | `open-sessions.json`, `workspaces.json`, `window-layout.json`, `file-tabs.json` | Only what is open |
+| Open sessions, windows (frames and side panels), file tabs | `open-sessions.json`, `workspaces.json`, `window-layout.json`, `file-tabs.json` | Only what is open |
 | Settings | the app's preferences | — |
 | Passwords, key passphrases and the recording key | the macOS keychain (service "Tether SSH Password"; a key's passphrase is the item `passphrase:<key file>`) | Removed with the host, the password or the passphrase |
+| Sign-in passwords remembered for this run (Settings ▸ Passwords ▸ Signing In Again) | Tether's memory only, encrypted by a Secure Enclave key that is never saved — nothing on disk (see [connections-and-passwords.md](connections-and-passwords.md)) | Gone when Tether quits or locks (App Lock), when the server refuses one, with *Forget*, when the setting is turned off, after the time chosen, on screen lock if chosen; saved passwords remembered this way also go when the screen locks or the Mac sleeps if Touch ID is required |
 
 Temporary files outside this folder:
 - Connection sockets and askpass: `/tmp/tether-<uid>/`, private to you. ssh removes its own sockets.
-- ssh logs of a connection attempt: also there. Removed when the attempt ends, or after a day.
+- ssh logs of a connection attempt: also there. The name is removed when the sign-in ends; a connection's log is emptied every few minutes while it runs.
 - Previews of remote files (Quick Look, dragging out): the system's temporary folder, removed after a day.
+- Hang records: when Tether stops answering for a few seconds or takes long to quit, macOS's `sample`
+  of the process (function names only, nothing a terminal showed) in `~/Library/Logs/Tether/`; the
+  last five are kept, at most one in ten minutes.
+- An update being prepared (Settings ▸ General ▸ Updates): the release's source, its build and `update.log` in `tether-update-work` in your temporary folder (private to you), removed once the update is installed.
 
 ## Recordings in detail
 
 - **What is recorded:** the bytes a terminal received, exactly as received (escape sequences
   included). Replaying them through a terminal shows what the screen showed.
-- **Writing:** in batches (512 KB, or 15 s after the first unwritten byte), so a busy terminal does
-  not wear the disk. A crash loses at most those 15 s. The terminal still showed them.
+- **Writing:** in batches of 512 KB, so a busy terminal does not wear the disk; a quiet terminal's
+  output is written 30 s after its first unwritten byte (5 minutes inside tmux, whose history on
+  the server holds it too if Tether stops and gives it back on re-attach; within 5 s for a minute
+  after a command in a shell nothing else keeps — a plain or local shell, Windows), and at once
+  when the connection drops, the Mac goes to sleep, a tab closes or Tether quits. Scrolling back,
+  finding, searching and copying read what is not written yet from memory: they never make the
+  recorder write early. The storage limit is checked at most once a minute while output flows.
+- **After a relaunch:** a restored tmux or screen tab goes on with its recording (up to 128 MB of
+  output; a larger one stays as it is and a new one starts). The tab first shows the end of it, as
+  it was when Tether quit (modes a program had set then, such as mouse reporting, are not kept), then adds only what the server printed meanwhile; the recording holds
+  nothing twice, and scrolling back reaches past the relaunch. The recording is read through once,
+  in the background, to know where its lines and commands are. A continued recording is kept in
+  the archive even if the tab is closed before it connects.
+- **Catching up after a reconnect (tmux):** the last rows the screen showed are looked up in what
+  the server kept, 1,000 rows first, then 10,000, then everything it keeps. A line that was still
+  being written when the connection dropped (a prompt, a progress bar) is completed in place rather
+  than shown twice. When those rows are not there at all (the screen was cleared, or more was
+  printed than the server keeps), everything it keeps is added under a note that earlier lines may
+  repeat — rather than lose any of it.
 - **Long sessions:** every 16 MB of output by default (Settings ▸ Recordings), the file is moved aside
-  as a numbered part and compressed in the background. Recording goes on in a fresh file.
+  as a numbered part (compressed later, see below). Recording goes on in a fresh file.
   - The latest output is never compressed, so scrolling back stays fast.
-  - Scrolling back reads at most 16 MB at a time, and keeps at most 250,000 lines in memory.
+  - Scrolling back past memory shows the recording, read in the background, in a view over the
+    terminal (which is not touched). That view holds at most about 64 MB of lines; scrolling
+    further moves it through the recording a chunk at a time. It is let go of 30 s after leaving it.
+  - While a session runs, Tether keeps in memory where every 256th line (at least 64 KB apart) and
+    every command (with its time) is in the recording, so the scroller, ⌘↑/⌘↓ and find reach any part without reading it
+    all. Commands are also noted in the recording itself with an invisible marker
+    (`ESC ] 7771 ; mark=<milliseconds since 1970> BEL`, next to the terminal size marker), and
+    so are a Ctrl+L, each further Return of a paste and Tether's own redraw on a re-attach
+    (`ESC ] 7771 ; typed BEL`). Shown again, a recording keeps the same screens in the scrollback
+    as the terminal did: a clear right after typing keeps the screen above it, one a program makes
+    on its own (a progress display, `docker stats`) does not.
+  - A tab off screen for a minute keeps only its last 2,000 lines in memory; the rest is read back
+    from its recording when it is scrolled to. Tabs without a recording keep their whole scrollback.
   - Search, export and playback read the parts and the file as one recording.
+- **Compression** (LZFSE, about 5–10× smaller; encrypted recordings stay encrypted) reads and
+  rewrites every byte, so it waits until the Mac is idle: macOS's background scheduler offers a
+  moment about every 10 minutes, and Tether takes it only when the keyboard and mouse have been
+  left alone for 2 minutes, Low Power Mode is off, the Mac is not hot and Tether is unlocked. It
+  compresses one file at a time — the parts of long sessions, then recordings older than the set
+  number of days — and stops between files as soon as someone uses the Mac or macOS asks it to.
+  Only when the storage limit is reached is it done at once, before anything is removed.
+  Settings ▸ Recordings shows how many files wait, why they wait, when it last ran and what it
+  saved, with *Compress Now*.
 - **When the disk is full:** recording pauses and goes on once there is space again. The recording
   then says how much output is missing.
 - **The terminal's size** is noted in the recording when it changes (and every megabyte), with an
@@ -61,11 +104,19 @@ Temporary files outside this folder:
 - **While Tether is locked:** new recordings (and new parts) are sealed to the public half of the
   recording key (HPKE: X25519, HKDF-SHA256, ChaCha20-Poly1305). The private half is derived from
   the recording key and never stored. The public half is kept in the keychain, next to the key,
-  and read only the first time something is sealed while locked.
+  and read only the first time something is sealed while locked. Locking also lets go of earlier
+  output each terminal read back from its recording (it is read again when scrolled to after
+  unlocking), and a restored tab continues an encrypted recording only once Tether is unlocked;
+  with encryption on, a recording in plain text is never added to (a new, encrypted one starts).
 - **After the Tether password is reset:** recordings still being written with the old key stop
   and remove themselves; the others encrypted with it are removed, as nothing could read them.
   Only files built like encrypted ones are removed: plain output that merely starts the same way
   is the user's text and stays.
+- **Secrets in the archive** (Settings ▸ Security): archived sessions' recordings are masked once
+  they end. Recordings no archived session refers to (left by a crash, or by quitting with
+  restoring turned off) are masked too; each notes the rules it was looked through with in an
+  extended attribute of its file (`io.github.whileendless.tether.masked`, a fingerprint of the
+  rules), so it is read again only when the rules change.
 - **Encrypted recordings:** AES-256-GCM, frame by frame. A frame cut short by a crash is dropped when
   the recording is opened again, so everything written after it stays readable.
 
@@ -74,8 +125,13 @@ Temporary files outside this folder:
 - **What is kept:** each command line (secrets masked), when it ran, and its lowest, average and
   peak use. Also the processes it ran and the connections it had, up to 50 of each. Never the
   command's output.
-- **Writing:** a second after a change, and every 30 s while a command runs. Files are compressed,
-  and sealed when encryption is on.
+- **Writing:** a second after a command starts or ends, and every 5 minutes while one runs. Changes
+  are added to a small journal next to the host's file (`<file>.journal`, each entry compressed
+  and sealed on its own); the file is written whole only when commands are removed or the journal
+  has grown (256 KB, or larger than the file), and the journal then goes. An entry cut short (Tether
+  stopped while adding it) is skipped when read and the host's next write is the whole file, which
+  removes the journal; one that could not be added completely (a full disk) is cut off at once. Files are compressed, and sealed when encryption
+  is on.
 - **While Tether is locked** (encryption on): history is sealed to the public half of the key, like
   recordings. A host's file that cannot be opened is never overwritten: commands recorded meanwhile
   go to `<file>.pending-<run>.json` next to it, and are merged into it (and the pending file removed)
