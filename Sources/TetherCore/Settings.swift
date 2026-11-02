@@ -275,6 +275,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     // General
     public var restoreSessionsOnLaunch = true
     public var confirmCloseOnlineSessions = true
+    /// Quitting asks first when it would end something: plain shells, transfers, port forwards.
+    public var confirmQuitWhenWorkWouldEnd = true
     public var openNewSessionsInWindow = false
     public var newTabDirectory: NewTabDirectory = .current
     public var newTabPosition: NewTabPosition = .afterCurrent
@@ -358,6 +360,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var showToolIcons = true
     /// Hosts (keys) where Tether no longer suggests installing tmux to keep shells running.
     public var noTmuxSuggestion: [String] = []
+    /// Servers (`SharedConnections` identity, or the host key) whose "no tmux here" notice was shown:
+    /// once per server, ever.
+    public var tmuxNoticeShown: [String] = []
+    /// Port forwards that were running (or waiting for their connection) when Tether last ran: those
+    /// listening only on this Mac come back by themselves, the others are asked about.
+    public var openForwards: [UUID] = []
     /// File ▸ Save Session… (⌘S): what is chosen first, and the folder it opens in (empty: the
     /// Downloads folder).
     public var saveSessionContents: SaveSessionContents = .whole
@@ -381,11 +389,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// Seconds a sign-in waits for an unreachable server before it counts as failed (ssh's
     /// ConnectTimeout); the server's waiting tabs then try again together, further apart each time.
     public var connectTimeout = 20
-    /// Keep-alives on the shared connection: 0 sends none, like plain `ssh` (the user's ssh_config
-    /// still applies). With them, a connection that misses `serverAliveCountMax` answers in a row
-    /// ends — also across a Wi-Fi hand-over or after sleep, which plain ssh survives.
-    public var serverAliveInterval = 0
-    public var serverAliveCountMax = 3
+    /// Keep-alives on the shared connection, so firewalls and NAT routers do not forget an idle
+    /// one: every 60 s, and patient — a connection ends only after about ten minutes without any
+    /// answer (`SSHOptions.keepAliveTolerance`), so a Wi-Fi hand-over or waking from sleep does not
+    /// end it. An interval set in ssh_config is kept (only its count raised). 0 sends none.
+    public var serverAliveInterval = 60
+    public var serverAliveCountMax = 10
     public var historyLinesOnReattach = 5_000
     /// Scrollback the server keeps for Tether's tmux/screen sessions, so output printed while
     /// disconnected can be fetched on reconnect.
@@ -423,6 +432,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// When the storage limit is reached, a session holding more than half of it loses its oldest
     /// output first, before any other recording is removed.
     public var recordingShortenLargestFirst = true
+    /// Recordings never fill the disk: below this much free space (GB) on its volume, the oldest
+    /// closed recordings go — also while Tether is locked with encryption on, when they cannot be
+    /// compressed (then at most twice the storage limit is kept for the unlock).
+    public var recordingProtectFreeSpace = true
+    public var recordingMinFreeGB = 5
 
     // Monitoring
     public var monitorRefreshInterval: Double = 5
@@ -511,7 +525,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
     /// Bumped when defaults change in a way existing users should get too (see `migrate`).
     public var version = AppSettings.currentVersion
-    public static let currentVersion = 8
+    public static let currentVersion = 9
 
     public init() {}
 
@@ -551,6 +565,12 @@ public struct AppSettings: Codable, Equatable, Sendable {
             // tabs try together, further apart each time, up to 2 minutes.
             if reconnectMaxDelay == 30 { reconnectMaxDelay = 120 }
         }
+        if version < 9 {
+            // No keep-alives let firewalls and NAT routers forget idle connections; patient ones
+            // (60 s, ending only after ten minutes without an answer) keep them without ending any
+            // on a short outage.
+            if serverAliveInterval == 0 && serverAliveCountMax == 3 { serverAliveInterval = 60; serverAliveCountMax = 10 }
+        }
         version = Self.currentVersion
     }
 
@@ -581,6 +601,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         version = (try? c.decode(Int.self, forKey: .version)) ?? 1
         d(.restoreSessionsOnLaunch, &restoreSessionsOnLaunch)
         d(.confirmCloseOnlineSessions, &confirmCloseOnlineSessions)
+        d(.confirmQuitWhenWorkWouldEnd, &confirmQuitWhenWorkWouldEnd)
         d(.openNewSessionsInWindow, &openNewSessionsInWindow)
         d(.newTabDirectory, &newTabDirectory)
         d(.newTabPosition, &newTabPosition)
@@ -634,6 +655,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.showAgentIcons, &showAgentIcons)
         d(.showToolIcons, &showToolIcons)
         d(.noTmuxSuggestion, &noTmuxSuggestion)
+        d(.tmuxNoticeShown, &tmuxNoticeShown)
+        d(.openForwards, &openForwards)
         d(.saveSessionContents, &saveSessionContents)
         d(.saveSessionFolder, &saveSessionFolder)
         d(.floatingBars, &floatingBars)
@@ -663,6 +686,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.compressRecordingsAfterDays, &compressRecordingsAfterDays)
         d(.recordingPartMB, &recordingPartMB)
         d(.recordingShortenLargestFirst, &recordingShortenLargestFirst)
+        d(.recordingProtectFreeSpace, &recordingProtectFreeSpace)
+        d(.recordingMinFreeGB, &recordingMinFreeGB)
         d(.monitorRefreshInterval, &monitorRefreshInterval)
         d(.monitorAutoLoad, &monitorAutoLoad)
         d(.showStatusStrip, &showStatusStrip)

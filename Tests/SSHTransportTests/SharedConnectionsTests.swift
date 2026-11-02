@@ -194,7 +194,8 @@ import TestSupport
         #expect(FakeSharedSSH.logins(in: dir).filter { $0 == "start" }.count == 3, "the jump host once, then each host")
         let calls = (try? String(contentsOf: dir.appendingPathComponent("ssh-calls.log"), encoding: .utf8)) ?? ""
         let masters = calls.split(separator: "\n").filter { $0.contains("ControlMaster=yes") && ($0.hasSuffix(a) || $0.hasSuffix(b)) }
-        #expect(masters.count == 2 && masters.allSatisfy { $0.contains("ProxyCommand=") && $0.contains("cm-\(jump.replacingOccurrences(of: "-", with: "_"))") && $0.contains("-W") })
+        let jumpSocket = await SharedConnections.shared.socket(for: .alias(jump), options: o) ?? "?"
+        #expect(masters.count == 2 && masters.allSatisfy { $0.contains("ProxyCommand=") && $0.contains(jumpSocket) && $0.contains("-W") })
         await finish()
     }
 
@@ -236,11 +237,56 @@ import TestSupport
         #expect(!args.contains { $0.hasPrefix("ServerAlive") }, "clients send no keep-alives")
         let master = o.masterArguments(target: target, controlPath: "/tmp/example-socket", logFile: nil, proxyCommand: nil)
         #expect(master.contains("ControlMaster=yes") && master.contains("-N") && master.contains("-J"))
-        #expect(master.contains("ServerAliveInterval=30"))
+        #expect(master.contains("ServerAliveInterval=30") && master.contains("ServerAliveCountMax=20"), "patient: ten minutes")
         var plain = SSHOptions(useControlMaster: true)
         plain.controlPath = "/tmp/example-socket"
         #expect(!plain.masterArguments(target: target, controlPath: "/tmp/s", logFile: nil, proxyCommand: nil).contains { $0.hasPrefix("ServerAlive") },
-                "no keep-alives unless asked for, like plain ssh")
+                "none when turned off")
+    }
+
+    /// Keep-alives that never end a connection on a short outage: a user's interval is kept (it is
+    /// usually there for a firewall that forgets idle connections fast), only the count raised to
+    /// last ten minutes; devices get none from Tether.
+    @Test func patientKeepAlives() {
+        var o = SSHOptions(useControlMaster: true, serverAliveInterval: 60, serverAliveCountMax: 10)
+        func alive(_ config: UserConfig, device: Bool = false) -> [String] {
+            o.masterArguments(target: .alias("web"), controlPath: "/tmp/s", logFile: nil, proxyCommand: nil, config: config, device: device)
+                .filter { $0.hasPrefix("ServerAlive") }
+        }
+        #expect(alive(UserConfig()) == ["ServerAliveInterval=60", "ServerAliveCountMax=10"])
+        #expect(alive(UserConfig(serverAliveInterval: 15, serverAliveCountMax: 2)) == ["ServerAliveInterval=15", "ServerAliveCountMax=40"])
+        #expect(alive(UserConfig(serverAliveInterval: 300, serverAliveCountMax: 3)) == ["ServerAliveInterval=300", "ServerAliveCountMax=3"])
+        #expect(alive(UserConfig(), device: true).isEmpty)
+        o.serverAliveInterval = 0
+        #expect(alive(UserConfig()).isEmpty, "turned off in Settings")
+    }
+
+    /// What the user's ssh_config sets is respected where Tether adds its own options.
+    @Test func userConfigIsRespected() {
+        let o = SSHOptions(useControlMaster: true)
+        let own = o.masterArguments(target: .alias("web"), controlPath: "/tmp/s", logFile: nil, proxyCommand: nil, config: UserConfig(setsConnectTimeout: true))
+        #expect(!own.contains { $0.hasPrefix("ConnectTimeout=") }, "the user's ConnectTimeout is kept")
+        #expect(own.contains("ExitOnForwardFailure=no") && !own.contains("ClearAllForwardings=yes"))
+        var second = o
+        second.controlSlot = 1
+        #expect(second.masterArguments(target: .alias("web"), controlPath: "/tmp/s-1", logFile: nil, proxyCommand: nil).contains("ClearAllForwardings=yes"),
+                "a further connection does not set up ssh_config's forwards again")
+        var client = o
+        client.controlPath = "/tmp/s"
+        #expect(client.batchArguments(target: .alias("web"), remoteCommand: "true").contains("RemoteCommand=none"))
+        #expect(client.interactiveArguments(target: .alias("web"), remoteCommand: "tmux").contains("RemoteCommand=none"))
+        let parsed = UserConfig.parse("serveraliveinterval 15\nserveralivecountmax 2\nconnecttimeout none\nremotecommand tmux new -A\n")
+        #expect(parsed == UserConfig(serverAliveInterval: 15, serverAliveCountMax: 2, setsConnectTimeout: false, remoteCommand: true))
+    }
+
+    /// Tether names a connection's socket after the server, not after this Mac's host name (which
+    /// ssh's `%C` includes and which changes with the network): short, and the same every run.
+    @Test func socketNamesFollowTheServer() {
+        let dir = URL(fileURLWithPath: "/tmp/tether-501")
+        let a = SharedConnections.socketName(for: "example.com\u{0}22\u{0}user\u{0}\u{0}", in: dir)
+        #expect(a == SharedConnections.socketName(for: "example.com\u{0}22\u{0}user\u{0}\u{0}", in: dir))
+        #expect(a != SharedConnections.socketName(for: "example.com\u{0}2222\u{0}user\u{0}\u{0}", in: dir))
+        #expect((a + "-100.XXXXXXXXXXXXXXXX").utf8.count < 104)
     }
 
     @Test func throughTheJumpHostsOwnConnection() {
@@ -256,6 +302,24 @@ import TestSupport
         let parsed = SharedConnections.parseResolution("hostname example.com\ncontrolpath /tmp/x/abc\nproxyjump a.example.com,b.example.com\n")
         #expect(parsed?.socket == "/tmp/x/abc" && parsed?.jump == nil, "a chain of jump hosts keeps ssh's own hop")
         #expect(SharedConnections.parseResolution("controlpath none\n") == nil)
+    }
+
+    /// A remembered password belongs to the server ssh goes to, not to the socket name: ssh's `%C`
+    /// also hashes this Mac's own host name, which can change with the network (waking from sleep).
+    @Test func aConnectionIsTheSameServerWhateverTheMacIsCalled() {
+        let output = "hostname 192.0.2.23\nport 22\nuser user\ncontrolpath /tmp/x/%@\n"
+        let before = SharedConnections.parseDestination(output.replacingOccurrences(of: "%@", with: "aaa"))
+        let after = SharedConnections.parseDestination(output.replacingOccurrences(of: "%@", with: "bbb"))
+        #expect(before != nil && before == after)
+        let a = SharedConnections.Resolution(socket: "/tmp/x/aaa", expires: 0, destination: before)
+        let b = SharedConnections.Resolution(socket: "/tmp/x/bbb", expires: 0, destination: after)
+        #expect(a.identity == b.identity)
+        #expect(SharedConnections.parseDestination(output.replacingOccurrences(of: "port 22", with: "port 2222")) != before, "another port")
+        #expect(SharedConnections.parseDestination(output.replacingOccurrences(of: "user user", with: "user admin")) != before, "another user")
+        let behind = SharedConnections.Resolution(socket: "/tmp/x/ccc", route: "jump.example.com", expires: 0, destination: before)
+        #expect(behind.identity != a.identity, "another jump host")
+        #expect(SharedConnections.parseDestination("controlpath /tmp/x/aaa\n") == nil)
+        #expect(SharedConnections.Resolution(socket: "/tmp/x/aaa", expires: 0).identity.hasPrefix("/tmp/x/aaa"), "without a host name: the socket")
     }
 }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import SSHTransport
 import os
 import TetherCore
 import SessionKit
@@ -227,12 +228,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quitting would end something that does not come back (a plain shell, a transfer, a port
+        // forward): asked first — not when macOS logs out, restarts or shuts down (an alert would
+        // hold that up), nor for Restart to Update (it asked already).
+        let systemQuit = NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil
+        let decision: NSApplication.TerminateReply = MainActor.assumeIsolated {
+            guard !systemQuit, !Self.quitAlreadyConfirmed, AppModel.shared.settings.confirmQuitWhenWorkWouldEnd,
+                  let lost = AppModel.shared.workEndingOnQuit() else { return .terminateNow }
+            let alert = NSAlert()
+            alert.messageText = "Quit Tether?"
+            alert.informativeText = lost.description + ". Tabs in tmux or screen keep running on their servers and come back next time."
+            alert.addButton(withTitle: "Quit")
+            if lost.transfers > 0 { alert.addButton(withTitle: "Quit When Transfers Finish") }
+            alert.addButton(withTitle: "Cancel")
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Don't ask again"
+            let answer = alert.runModal()
+            let quitNow = answer == .alertFirstButtonReturn
+            let quitLater = lost.transfers > 0 && answer == .alertSecondButtonReturn
+            // "Don't ask again" counts only with a choice to quit.
+            if (quitNow || quitLater), alert.suppressionButton?.state == .on {
+                AppModel.shared.settings.confirmQuitWhenWorkWouldEnd = false
+            }
+            if quitLater {
+                // Not `.terminateLater`: AppKit would wait in a modal run loop (no timers, a window
+                // that cannot be used). Tether goes on as it was and quits once they are done.
+                Self.quitWhenTransfersFinish()
+                return .terminateCancel
+            }
+            return quitNow ? .terminateNow : .terminateCancel
+        }
+        guard decision == .terminateNow else { return decision }
         Self.endIfQuittingHangs()
         return MainActor.assumeIsolated {
             WindowLayout.saveOpenWindows()
             AppModel.shared.isTerminating = true
             return .terminateNow
         }
+    }
+
+    /// Set when quitting was already confirmed (Restart to Update asks itself).
+    nonisolated(unsafe) static var quitAlreadyConfirmed = false
+
+    /// Quits once no transfer runs any more (checked every second; Cancel in Transfers counts).
+    @MainActor static func quitWhenTransfersFinish() {
+        ConnectionLog.shared.info("Tether quits once the transfers have finished", .app)
+        let timer = Timer(timeInterval: 1, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                guard AppModel.shared.transfers.activeCount == 0 else { return }
+                timer.invalidate()
+                Self.quitAlreadyConfirmed = true
+                NSApp.terminate(nil)
+            }
+        }
+        // Also while a menu or an alert is open.
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Quitting never hangs: if Tether has not ended 10 s after it was asked to (something on the

@@ -116,7 +116,7 @@ private struct PassphraseSheet: View {
         var current = old
         if hasOld && savedOld {
             // The kept passphrase is used, after Touch ID when that is on.
-            guard await SecretGate.shared.authorize("change the passphrase of \(key.name)"),
+            guard await SecretGate.shared.authorize("change the passphrase of \(key.name)", byUser: true),
                   let saved = await PasswordVault.passwordOffThread(for: account) else { error = "The saved passphrase could not be used."; return }
             current = saved
         }
@@ -124,8 +124,8 @@ private struct PassphraseSheet: View {
             _ = try await KeySetup.changePassphrase(key, old: current, new: new)
             // Saved under the key's own name (an item an earlier version named differently goes).
             let item = CredentialKey.passphrase(keyPath: key.privateKeyURL.path), earlier = account
-            if earlier != item { PasswordVault.deletePassword(for: earlier) }
-            if remember && !new.isEmpty { PasswordVault.setPassword(new, for: item) } else { PasswordVault.deletePassword(for: item) }
+            if earlier != item { Credentials.remove(earlier) }
+            if remember && !new.isEmpty { Credentials.save(new, for: item) } else { Credentials.remove(item) }
             // The old passphrase remembered for this run opens nothing any more.
             model.passwordCache.forget(login: earlier)
             model.passwordCache.forget(login: item)

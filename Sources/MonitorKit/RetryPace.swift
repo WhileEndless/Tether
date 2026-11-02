@@ -1,4 +1,5 @@
 import Foundation
+import SSHTransport
 
 /// How long a host panel's stream waits before it starts again after ending without data: a
 /// server that does not answer is asked less and less often (twice as long each time, up to
@@ -14,7 +15,7 @@ public struct RetryPace: Sendable {
     /// The wait after one more stream that ended without data.
     @MainActor mutating func next(first: Double) -> Double {
         failures += 1
-        return min(first * pow(2, Double(min(failures - 1, 12))), max(Self.longest, first))
+        return Backoff.delay(base: first, doublings: failures - 1, longest: max(Self.longest, first), maxDoublings: 12)
     }
 
     mutating func reset() { failures = 0 }

@@ -10,6 +10,10 @@ import Foundation
 /// - `-O check` / `-O exit`: answer from the marker / end the fake master.
 /// - A client (`ControlMaster=no`) fails like real ssh when the connection is not there, otherwise
 ///   runs its last argument with `sh` here (tmux in a private `TMUX_TMPDIR`, `TMUX` unset).
+/// - `cutLink(socket:)`: the master stays, its link is gone — clients and probes get no answer
+///   (as over a network that went away without anything noticing).
+/// - A `noroute-<destination>` file: the jump host answers but cannot reach the destination (ssh's
+///   words for it, then status 255).
 public enum FakeSharedSSH {
     public static func install(in directory: URL) throws -> URL {
         let url = directory.appendingPathComponent("ssh")
@@ -39,12 +43,20 @@ public enum FakeSharedSSH {
           check) if [ -e "$cp.alive" ]; then echo "Master running" >&2; exit 0; fi
                  echo "Control socket connect($cp): No such file or directory" >&2; exit 255;;
           exit) if [ -f "$cp.pid" ]; then kill "$(cat "$cp.pid")" 2>/dev/null; fi
-                rm -f "$cp.alive" "$cp.pid" "$cp"; echo "Exit request sent." >&2; exit 0;;
+                rm -f "$cp.alive" "$cp.pid" "$cp.linkdead" "$cp"; echo "Exit request sent." >&2; exit 0;;
           "") ;;
           *) exit 0;;
         esac
         if [ -n "$master" ]; then
           echo "start" >> "$D/logins.log"
+          if [ -e "$D/noroute-$(printf '%s' "$last" | tr -c 'A-Za-z0-9' '_')" ]; then
+            echo "end noroute" >> "$D/logins.log"
+            echo "channel 0: open failed: connect failed: No route to host" >&2
+            echo "stdio forwarding failed" >&2
+            echo "kex_exchange_identification: Connection closed by remote host" >&2
+            echo "Connection closed by UNKNOWN port 65535" >&2
+            exit 255
+          fi
           if [ -e "$D/hang-$(printf '%s' "$last" | tr -c 'A-Za-z0-9' '_')" ]; then exec sleep 120; fi
           sleep "${FAKE_LOGIN_DELAY:-0.3}"
           if [ -e "$D/refuse" ]; then echo "end refused" >> "$D/logins.log"; echo "user@example.com: Permission denied (password)." >&2; exit 255; fi
@@ -59,6 +71,7 @@ public enum FakeSharedSSH {
         if [ -n "$cp" ] && [ "$cp" != "none" ] && [ ! -e "$cp.alive" ]; then
           echo "Connection closed by UNKNOWN port 65535" >&2; exit 255
         fi
+        if [ -n "$cp" ] && [ -e "$cp.linkdead" ]; then exec sleep 120; fi
         export TMUX_TMPDIR="$D"
         unset TMUX
         export SHELL=/bin/sh
@@ -88,11 +101,21 @@ public enum FakeSharedSSH {
         }
     }
 
+    /// The master at `socket` stays, but its link is gone: nothing gets an answer over it.
+    public static func cutLink(socket: String) {
+        FileManager.default.createFile(atPath: socket + ".linkdead", contents: nil)
+    }
+
+    /// The link of the master at `socket` works again.
+    public static func restoreLink(socket: String) {
+        try? FileManager.default.removeItem(atPath: socket + ".linkdead")
+    }
+
     /// Ends a fake master as if its connection died (no `-O exit`): the marker and socket go.
     public static func killMaster(socket: String) {
         if let text = try? String(contentsOfFile: socket + ".pid", encoding: .utf8), let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
             kill(pid, SIGTERM)
         }
-        for suffix in [".alive", ".pid", ""] { try? FileManager.default.removeItem(atPath: socket + suffix) }
+        for suffix in [".alive", ".pid", ".linkdead", ""] { try? FileManager.default.removeItem(atPath: socket + suffix) }
     }
 }

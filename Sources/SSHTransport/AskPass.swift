@@ -39,7 +39,7 @@ public struct AskPassRequest: Sendable {
         keyPath = path
         var isDir: ObjCBool = false
         namesLocalKeyFile = path.map { FileManager.default.fileExists(atPath: ($0 as NSString).expandingTildeInPath, isDirectory: &isDir) && !isDir.boolValue } == true
-            && p.prefixMatch(of: #/\([^@\s()]+@[^)\s]+\) /#) == nil
+            && p.prefixMatch(of: Self.serverPrefix) == nil
     }
 
     /// A notice ssh shows while it waits (a security key's "Confirm user presence"): no answer is
@@ -58,6 +58,44 @@ public struct AskPassRequest: Sendable {
 
     public var isPasswordPrompt: Bool { prompt.lowercased().contains("password") }
 
+    /// ssh's `(user@host) ` before a keyboard-interactive question. The user part may hold "@" (a
+    /// directory account such as `user@corp.example.com`); the host never does.
+    static let serverPrefix = #/\(([^\s()]+)@([^@)\s]+)\) /#
+
+    /// What the server asks after ssh's `(user@host) ` prefix; nil without the prefix.
+    public var serverQuestion: String? {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = p.prefixMatch(of: Self.serverPrefix) else { return nil }
+        return String(p[m.range.upperBound...])
+    }
+
+    /// Words of a question for something other than the account's password: a one-time code, a
+    /// second factor, a new or changed password. Matched as whole words, case-insensitively.
+    static let notLoginWords: Set<String> = ["otp", "onetime", "new", "current", "old", "verification", "verify", "code",
+                                             "token", "passcode", "confirm", "retype", "repeat", "again", "temporary",
+                                             "expired", "2fa", "mfa", "totp", "pin", "challenge", "yubikey", "sms",
+                                             "push", "second", "factor", "duo"]
+
+    /// A password question for the account's own password — ssh's `user@host's password:`, or a
+    /// server's question that asks for a password and for nothing else (not a one-time code, not a
+    /// new password). Only these are filled from the keychain, counted as refused when asked again,
+    /// and saved.
+    public var isLoginPasswordPrompt: Bool {
+        guard askpassKind == nil, isPasswordPrompt else { return false }
+        if isOwnPasswordQuestion { return true }
+        var text = (serverQuestion ?? prompt).lowercased()
+        // "Password for user@REALM:" names an account, whose name says nothing about the question.
+        text = text.replacing(#/ for [^\s:]+/#, with: "")
+        if text.contains("one-time") || text.contains("one time") { return false }
+        let words = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        return !words.contains { Self.notLoginWords.contains($0) }
+    }
+
+    /// ssh's own `user@host's password:` (password authentication: never server text).
+    private var isOwnPasswordQuestion: Bool {
+        prompt.trimmingCharacters(in: .whitespacesAndNewlines).wholeMatch(of: #/[^\s'()]+@[^@'\s()]+'s password:/#) != nil
+    }
+
     /// A password question from an ssh that does not mark a server's questions (before OpenSSH 8.4,
     /// or one that could not be checked — a ProxyCommand may run another ssh): a jump host could
     /// have written it. Never answered by itself, from the keychain or from memory.
@@ -66,21 +104,31 @@ public struct AskPassRequest: Sendable {
     /// ssh's own password question (`user@host's password:`, or keyboard-interactive's plain
     /// `(user@host) Password:`) — not a one-time code or "New password:" a server asks for, which
     /// must never be remembered or replayed.
+    ///
+    /// Also `(user@host) password:` in any case and `(user@host) Password for <account>:`, as PAM
+    /// stacks word it.
     public var isPlainPasswordPrompt: Bool {
-        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p.wholeMatch(of: #/[^@\s'()]+@[^'\s()]+'s password:/#) != nil
-            || p.wholeMatch(of: #/\([^@\s()]+@[^)\s]+\) Password:/#) != nil
+        if isOwnPasswordQuestion { return true }
+        guard let question = serverQuestion else { return false }
+        return question.wholeMatch(of: #/password(?: for [^\s:]+)?:/#.ignoresCase()) != nil
     }
 
     /// ssh puts `(user@host) ` before every keyboard-interactive prompt: what follows was written by
     /// the server, so it is never treated as ssh's own key-passphrase or host-key question.
     public var isServerText: Bool {
-        prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefixMatch(of: #/\([^@\s()]+@[^)\s]+\) /#) != nil
+        prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefixMatch(of: Self.serverPrefix) != nil
     }
 
     /// `Enter passphrase for key '/path/to/key':` exactly as ssh writes it (never server text), for a
     /// key file that exists on this Mac, asked by an ssh that marks a server's questions.
     public var isPassphrasePrompt: Bool { askpassKind == nil && namesLocalKeyFile && askerNamesItsQuestions }
+
+    /// The account's own password or a key's passphrase: what a saved or remembered answer may be
+    /// sent to, counted as refused when asked again, and saved (never a one-time code or a new password).
+    public var isSecretOfTheAccount: Bool { isLoginPasswordPrompt || isPassphrasePrompt }
+
+    /// What a remembered answer is filled into: ssh's plain password question or a key's passphrase.
+    public var takesRememberedAnswer: Bool { isPlainPasswordPrompt || isPassphrasePrompt }
 
     /// Worded as ssh's question for a key on this Mac, but asked by an ssh that does not mark a
     /// server's questions (before OpenSSH 8.4, or one that could not be checked): the server may
@@ -129,8 +177,8 @@ public struct AskPassRequest: Sendable {
     /// The user and host ssh names in the prompt (same rules as `sshNamedHost`).
     public var sshNamedLogin: (user: String, host: String)? {
         let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let m = p.wholeMatch(of: #/([^@\s'()]+)@([^'\s()]+)'s password:/#) { return (String(m.1), String(m.2)) }
-        if let m = p.prefixMatch(of: #/\(([^@\s()]+)@([^)\s]+)\) /#) { return (String(m.1), String(m.2)) }
+        if let m = p.wholeMatch(of: #/([^\s'()]+)@([^@'\s()]+)'s password:/#) { return (String(m.1), String(m.2)) }
+        if let m = p.prefixMatch(of: Self.serverPrefix) { return (String(m.1), String(m.2)) }
         return nil
     }
 }
@@ -163,6 +211,10 @@ public final class AskPassBridge: @unchecked Sendable {
         var pids: Set<pid_t> = []
         /// Questions sent to the app that have no answer yet.
         var asking = 0
+        /// The question waiting now was put in front of the user (see `waitsOnUser`).
+        var presented = false
+        /// Answers sent back (also those given at once, from memory or the keychain).
+        var answers = 0
     }
 
     private let lock = NSLock()
@@ -207,31 +259,13 @@ public final class AskPassBridge: @unchecked Sendable {
     /// Registers a new token for one ssh process and returns the environment to give it.
     /// - Parameter mode: "force" for non-interactive processes, "prefer" to answer even with a TTY.
     public func environment(targetKey: String, purpose: String, mode: String = "force", sessionID: UUID? = nil) -> [String: String] {
-        guard isAvailable, let helperPath else { return [:] }
-        let token = UUID().uuidString
-        lock.lock(); contexts[token] = Context(targetKey: targetKey, purpose: purpose, count: 0, sessionID: sessionID); lock.unlock()
-        return [
-            "SSH_ASKPASS": helperPath,
-            "SSH_ASKPASS_REQUIRE": mode,
-            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
-            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
-            "TETHER_ASKPASS_TOKEN": token,
-        ]
+        register(Context(targetKey: targetKey, purpose: purpose, count: 0, sessionID: sessionID), mode: mode)
     }
 
     /// For quiet background work: every prompt is refused at once. BatchMode on the command line
     /// does not reach the ssh that ProxyJump starts for the jump host; this does.
     public func refusingEnvironment(targetKey: String, purpose: String) -> [String: String] {
-        guard isAvailable, let helperPath else { return [:] }
-        let token = UUID().uuidString
-        lock.lock(); contexts[token] = Context(targetKey: targetKey, purpose: purpose, count: 0, answerFor: { _ in nil }); lock.unlock()
-        return [
-            "SSH_ASKPASS": helperPath,
-            "SSH_ASKPASS_REQUIRE": "force",
-            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
-            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
-            "TETHER_ASKPASS_TOKEN": token,
-        ]
+        register(Context(targetKey: targetKey, purpose: purpose, count: 0, answerFor: { _ in nil }))
     }
 
     /// The askpass environment for an ssh with this purpose (quiet work refuses every prompt).
@@ -243,31 +277,38 @@ public final class AskPassBridge: @unchecked Sendable {
     /// An environment whose prompts are all answered with `answer` (for ssh-keygen and ssh-add, so a
     /// passphrase never appears in a process's arguments). Revoke it when the process has finished.
     public func environment(answering answer: String, purpose: String) -> [String: String] {
+        register(Context(targetKey: "", purpose: purpose, count: 0, fixedAnswer: answer))
+    }
+
+    /// An environment whose prompts are answered by `answer(prompt)` (several different passphrases
+    /// for one process, such as `ssh-keygen -p`). Revoke it when the process has finished.
+    public func environment(answers answer: @escaping @Sendable (String) -> String?, purpose: String) -> [String: String] {
+        register(Context(targetKey: "", purpose: purpose, count: 0, answerFor: answer))
+    }
+
+    /// A new token for `context`, and the environment that makes ssh ask through it.
+    private func register(_ context: Context, mode: String = "force") -> [String: String] {
         guard isAvailable, let helperPath else { return [:] }
         let token = UUID().uuidString
-        lock.lock(); contexts[token] = Context(targetKey: "", purpose: purpose, count: 0, fixedAnswer: answer); lock.unlock()
+        lock.withLock { contexts[token] = context }
         return [
             "SSH_ASKPASS": helperPath,
-            "SSH_ASKPASS_REQUIRE": "force",
+            "SSH_ASKPASS_REQUIRE": mode,
             "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
             "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
             "TETHER_ASKPASS_TOKEN": token,
         ]
     }
 
-    /// An environment whose prompts are answered by `answer(prompt)` (several different passphrases
-    /// for one process, such as `ssh-keygen -p`). Revoke it when the process has finished.
-    public func environment(answers answer: @escaping @Sendable (String) -> String?, purpose: String) -> [String: String] {
-        guard isAvailable, let helperPath else { return [:] }
-        let token = UUID().uuidString
-        lock.lock(); contexts[token] = Context(targetKey: "", purpose: purpose, count: 0, answerFor: answer); lock.unlock()
-        return [
-            "SSH_ASKPASS": helperPath,
-            "SSH_ASKPASS_REQUIRE": "force",
-            "DISPLAY": ProcessInfo.processInfo.environment["DISPLAY"] ?? "tether:0",
-            "TETHER_ASKPASS_SOCKET": AppPaths.askPassSocket.path,
-            "TETHER_ASKPASS_TOKEN": token,
-        ]
+    /// Whether any question for this target waits for an answer right now.
+    public func isAsking(targetKey: String) -> Bool {
+        isAsking { $0 == targetKey }
+    }
+
+    /// Whether any question for a target `matches` accepts waits for an answer right now.
+    public func isAsking(where matches: (String) -> Bool) -> Bool {
+        let asking = lock.withLock { contexts.values.filter { $0.asking > 0 }.map(\.targetKey) }
+        return asking.contains(where: matches)
     }
 
     /// Whether a question of the ssh given this environment waits for an answer right now.
@@ -275,6 +316,66 @@ public final class AskPassBridge: @unchecked Sendable {
         guard let token = env["TETHER_ASKPASS_TOKEN"] else { return false }
         lock.lock(); defer { lock.unlock() }
         return (contexts[token]?.asking ?? 0) > 0
+    }
+
+    // MARK: Waiting on the user
+
+    /// Touch ID (or the Mac's password) being asked for now: it answers every question waiting.
+    private var userChecks = 0
+
+    /// The question waiting for `token` was put in front of the user (its panel shown). It counts as
+    /// such until it is answered, also while the panel hides because another app is in front (the
+    /// user may be copying the password from a password manager).
+    public func notePresented(token: String) {
+        lock.withLock { if (contexts[token]?.asking ?? 0) > 0 { contexts[token]?.presented = true } }
+    }
+
+    /// Touch ID (or the Mac's password) is being asked for; call `endUserCheck` once it is answered.
+    public func beginUserCheck() { lock.withLock { userChecks += 1 } }
+    public func endUserCheck() { lock.withLock { userChecks = max(0, userChecks - 1) } }
+
+    /// The one answer to "is a person being asked, so waiting is right?" for every watchdog: a
+    /// question waits *and* the user can see it (or Touch ID is up). A question nobody was shown —
+    /// held back for a tab in the background, or waiting for Tether to be unlocked — does not stop
+    /// timeouts: what waits for it ends and tries again when the user comes back, instead of a
+    /// connection hanging on "Connecting" with nothing on screen.
+    public func waitsOnUser(environment env: [String: String]) -> Bool {
+        guard let token = env["TETHER_ASKPASS_TOKEN"] else { return false }
+        return lock.withLock {
+            guard let ctx = contexts[token], ctx.asking > 0 else { return false }
+            return ctx.presented || userChecks > 0
+        }
+    }
+
+    /// Whether a question in front of the user is one this tab's sign-in waits for — also a jump
+    /// host's on its way (`SignInInterest`), which is asked under the jump host's name.
+    public func waitsOnUser(forSession id: UUID) -> Bool {
+        presentedTokens().contains { SignInInterest.waiting(for: $0)?.sessions.contains(id) == true }
+    }
+
+    /// The same for work without a tab (a file listing, a transfer, a check): a question in front
+    /// of the user that such work waits for.
+    public func waitsOnUserForWorkWithoutTab() -> Bool {
+        presentedTokens().contains { SignInInterest.waiting(for: $0)?.unowned == true }
+    }
+
+    private func presentedTokens() -> [String] {
+        lock.withLock { contexts.filter { $0.value.asking > 0 && ($0.value.presented || userChecks > 0) }.map(\.key) }
+    }
+
+    /// `waitsOnUser` for any question of a target `matches` accepts.
+    public func waitsOnUser(where matches: (String) -> Bool) -> Bool {
+        let waiting = lock.withLock {
+            contexts.values.filter { $0.asking > 0 && ($0.presented || userChecks > 0) }.map(\.targetKey)
+        }
+        return waiting.contains(where: matches)
+    }
+
+    /// How many answers the ssh given this environment has been sent so far.
+    public func answerCount(environment env: [String: String]) -> Int {
+        guard let token = env["TETHER_ASKPASS_TOKEN"] else { return 0 }
+        lock.lock(); defer { lock.unlock() }
+        return contexts[token]?.answers ?? 0
     }
 
     /// Whether an answer for this token can still reach its ssh (not revoked, helper still there).
@@ -426,7 +527,12 @@ public final class AskPassBridge: @unchecked Sendable {
         request.askerPID = Self.parentPID(of: peer) ?? 0
         if let kind = obj["kind"], ["confirm", "none"].contains(kind) { request.askpassKind = kind }
         lock.lock(); contexts[token]?.asking += 1; lock.unlock()
-        defer { lock.lock(); contexts[token]?.asking -= 1; lock.unlock() }
+        defer {
+            lock.lock()
+            contexts[token]?.asking -= 1
+            if contexts[token]?.asking == 0 { contexts[token]?.presented = false }
+            lock.unlock()
+        }
         let semaphore = DispatchSemaphore(value: 0)
         let box = AnswerBox()
         let asked = request
@@ -454,7 +560,10 @@ public final class AskPassBridge: @unchecked Sendable {
                 cancel?(token)
             }
         }
-        if !withdrawn { reply(fd, box.value) }
+        if !withdrawn {
+            if box.value != nil { lock.lock(); contexts[token]?.answers += 1; lock.unlock() }
+            reply(fd, box.value)
+        }
     }
 
     /// The helper closed its end (it never writes after its request, so readable means closed).

@@ -29,13 +29,25 @@ import TetherCore
     /// Forced keep-alives and the 6 s stall limit go once (they ended connections plain ssh keeps);
     /// values the user chose stay.
     @Test func keepAlivesOffAndStallLimitLongerOnce() throws {
+        // (Forced 10 s keep-alives went in version 5; version 9 then brings patient ones instead.)
         let old = try decode(#"{"version":4,"serverAliveInterval":10,"serverAliveCountMax":3,"stallTimeout":6}"#)
-        #expect(old.serverAliveInterval == 0 && old.stallTimeout == 15)
+        #expect(old.serverAliveInterval == 60 && old.serverAliveCountMax == 10 && old.stallTimeout == 15)
         let chosen = try decode(#"{"version":4,"serverAliveInterval":60,"serverAliveCountMax":3,"stallTimeout":9}"#)
         #expect(chosen.serverAliveInterval == 60 && chosen.stallTimeout == 9)
         let later = try decode(#"{"version":5,"serverAliveInterval":10,"serverAliveCountMax":3,"stallTimeout":6}"#)
         #expect(later.serverAliveInterval == 10 && later.stallTimeout == 6)
-        #expect(AppSettings().serverAliveInterval == 0 && AppSettings().rememberSignInPasswords)
+        #expect(AppSettings().serverAliveInterval == 60 && AppSettings().rememberSignInPasswords)
+    }
+
+    /// Patient keep-alives once (every 60 s, ending only after ten minutes without an answer), so
+    /// firewalls and NAT routers do not forget idle connections; a choice made since stays.
+    @Test func patientKeepAlivesOnce() throws {
+        let off = try decode(#"{"version":8,"serverAliveInterval":0,"serverAliveCountMax":3}"#)
+        #expect(off.serverAliveInterval == 60 && off.serverAliveCountMax == 10)
+        let chosen = try decode(#"{"version":8,"serverAliveInterval":15,"serverAliveCountMax":4}"#)
+        #expect(chosen.serverAliveInterval == 15 && chosen.serverAliveCountMax == 4)
+        let later = try decode(#"{"version":9,"serverAliveInterval":0,"serverAliveCountMax":3}"#)
+        #expect(later.serverAliveInterval == 0)
     }
 
     /// Many small files go as one stream from 5 on (was 20) unless chosen otherwise; compression,

@@ -21,7 +21,8 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
    unlocked with encryption on; before that, nothing is recorded while locked.) Nothing is ever
    written in plain text.
 5. **Nothing is left behind.** Temporary files are removed when done, or at the next launch.
-6. **Private tabs** keep nothing: no recording, no archive entry, no command history.
+6. **Private tabs** keep nothing: no recording, no archive entry, no command history, and their own
+   tmux or screen session on the server is ended when the tab closes or Tether quits.
 7. **One Tether at a time.** A second copy started with the same data folder brings the first one to
    the front and quits, before it touches anything.
 
@@ -29,19 +30,21 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
 
 | What | Where (`~/Library/Application Support/Tether`) | Limit, and what goes first |
 | --- | --- | --- |
-| Session recordings (terminal output) | `Recordings/<host>/` | Storage limit (1 GB by default). Old recordings are compressed while the Mac is idle (after 7 days by default; see below). When the limit is reached, in this order: whatever waits to be compressed is compressed; recordings past the optional number of days to keep are removed; the largest session loses its oldest parts while it holds more than half of the space (only a session kept in parts, see below); then the oldest recordings go. |
+| Session recordings (terminal output) | `Recordings/<host>/` | Storage limit (1 GB by default). Old recordings are compressed while the Mac is idle (after 7 days by default; see below). When the limit is reached, in this order: whatever waits to be compressed is compressed; recordings past the optional number of days to keep are removed; the largest session loses its oldest parts while it holds more than half of the space (only a session kept in parts, see below); then the oldest recordings go. Recordings never fill the disk (Settings ▸ Recordings ▸ *Keep free space on the disk*, on by default, 5 GB): with less free than that on the disk, the same steps run below the limit until that much is free again — recordings still being written are never removed, only the largest one's oldest parts. |
 | Command history | `Command History/` | 90 days and 50 MB by default, at most 500 commands per host. The oldest finished commands go first. |
 | Hosts, groups, tags | `hosts.json` | — |
 | Archive of ended sessions | `archive.json` | 500 entries |
 | Open sessions, windows (frames and side panels), file tabs | `open-sessions.json`, `workspaces.json`, `window-layout.json`, `file-tabs.json` | Only what is open |
 | Settings | the app's preferences | — |
 | Passwords, key passphrases and the recording key | the macOS keychain (service "Tether SSH Password"; a key's passphrase is the item `passphrase:<key file>`) | Removed with the host, the password or the passphrase |
-| Sign-in passwords remembered for this run (Settings ▸ Passwords ▸ Signing In Again) | Tether's memory only, encrypted by a Secure Enclave key that is never saved — nothing on disk (see [connections-and-passwords.md](connections-and-passwords.md)) | Gone when Tether quits or locks (App Lock), when the server refuses one, with *Forget*, when the setting is turned off, after the time chosen, on screen lock if chosen; saved passwords remembered this way also go when the screen locks or the Mac sleeps if Touch ID is required |
+| Sign-in passwords remembered for this run (Settings ▸ Passwords ▸ Signing In Again) | Tether's memory only, encrypted by a Secure Enclave key that is never saved — nothing on disk (see [connections-and-passwords.md](connections-and-passwords.md)) | Gone when Tether quits, when the server refuses one, when its saved password is changed or removed, with *Forget*, when the setting is turned off, after the time chosen, on screen lock if chosen; kept but unused while Tether is locked (App Lock); a saved password, once read with Touch ID, is kept the same way. A typed password is also handed to the same connection's other sign-ins for one minute (also with the setting off) |
 
 Temporary files outside this folder:
 - Connection sockets and askpass: `/tmp/tether-<uid>/`, private to you. ssh removes its own sockets.
 - ssh logs of a connection attempt: also there. The name is removed when the sign-in ends; a connection's log is emptied every few minutes while it runs.
-- Previews of remote files (Quick Look, dragging out): the system's temporary folder, removed after a day.
+- Previews of remote files (Quick Look, dragging out) and remote files copied with ⌘C (for pasting in Finder): `TetherPreview` and `TetherClipboard` in the system's temporary folder, removed after a day (looked at when Tether starts and once a day while it runs). A copy replaced by a newer ⌘C stops downloading.
+- Images pasted into a terminal (saved as PNG first) and file promises dropped on one: `Tether Pasted Files` in the system's temporary folder, readable by you only, removed after a week (looked at when Tether starts, once a day, and when something is pasted).
+- Port forwards that were running when Tether quit (their ids, in the preferences), so they can come back; servers whose "no tmux" notice was shown (a short hash of the server, or of the host's name when its connection is not known, in the preferences), so it is shown once.
 - Hang records: when Tether stops answering for a few seconds or takes long to quit, macOS's `sample`
   of the process (function names only, nothing a terminal showed) in `~/Library/Logs/Tether/`; the
   last five are kept, at most one in ten minutes.
@@ -60,7 +63,8 @@ Temporary files outside this folder:
   recorder write early. The storage limit is checked at most once a minute while output flows.
 - **After a relaunch:** a restored tmux or screen tab goes on with its recording (up to 128 MB of
   output; a larger one stays as it is and a new one starts). The tab first shows the end of it, as
-  it was when Tether quit (modes a program had set then, such as mouse reporting, are not kept), then adds only what the server printed meanwhile; the recording holds
+  it was when Tether quit, then adds only what the server printed meanwhile and sets the terminal
+  modes the program has there again (mouse reporting, bracketed paste); the recording holds
   nothing twice, and scrolling back reaches past the relaunch. The recording is read through once,
   in the background, to know where its lines and commands are. A continued recording is kept in
   the archive even if the tab is closed before it connects.
@@ -108,6 +112,9 @@ Temporary files outside this folder:
   output each terminal read back from its recording (it is read again when scrolled to after
   unlocking), and a restored tab continues an encrypted recording only once Tether is unlocked;
   with encryption on, a recording in plain text is never added to (a new, encrypted one starts).
+  Recordings over the storage limit then wait for the unlock to be compressed (compressing needs
+  the key) rather than being removed — with *Keep free space on the disk* on, up to twice the
+  limit and never into the free space kept; past that the oldest go, as when unlocked.
 - **After the Tether password is reset:** recordings still being written with the old key stop
   and remove themselves; the others encrypted with it are removed, as nothing could read them.
   Only files built like encrypted ones are removed: plain output that merely starts the same way

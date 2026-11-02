@@ -29,7 +29,8 @@ extension AppModel {
 
     /// Types the saved password into the prompt, after Touch ID (if required). The password is
     /// only sent if the same prompt is still waiting afterwards.
-    func fillSavedPassword(in session: TerminalSession) {
+    /// `byUser`: a click or ⌥⌘P (not the automatic fill).
+    func fillSavedPassword(in session: TerminalSession, byUser: Bool = true) {
         guard let prompt = session.passwordPrompt else { return }
         Task {
             let key = await currentCredentialKey(for: prompt, in: session)
@@ -39,7 +40,7 @@ extension AppModel {
             guard await !refuseIfShell(prompt, in: session) else { return }
             let localKey = Self.isLocalKeyPassphrase(key)
             if localKey, await refuseUnlessReadingLocally(prompt, in: session) { return }
-            guard await SecretGate.shared.authorize("enter the \(Self.label(prompt)) on \(host)") else { return }
+            guard await SecretGate.shared.authorize("enter the \(Self.label(prompt)) on \(host)", byUser: byUser) else { return }
             // Touch ID can take a while: check again that a shell has not come to the foreground meanwhile.
             if localKey, await refuseUnlessReadingLocally(prompt, in: session) { return }
             guard session.passwordPrompt == prompt, await !refuseIfShell(prompt, in: session),
@@ -79,7 +80,7 @@ extension AppModel {
             return
         }
         autoFilled[session.id] = (key, Date())
-        fillSavedPassword(in: session)
+        fillSavedPassword(in: session, byUser: false)
     }
 
     /// What would receive a password typed into the terminal now.
@@ -158,7 +159,7 @@ extension AppModel {
         let prompt = session.passwordPrompt
         Task {
             if let prompt, await refuseIfShell(prompt, in: session) { return }
-            if save, let prompt { PasswordVault.setPassword(password, for: await currentCredentialKey(for: prompt, in: session)) }
+            if save, let prompt { Credentials.save(password, for: await currentCredentialKey(for: prompt, in: session)) }
             session.send(Array((password + "\r").utf8)[...])
         }
     }

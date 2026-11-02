@@ -10,7 +10,8 @@ import TerminalUI
 @Observable
 final class FileBrowserModel {
     let target: ConnectionTarget
-    let fs: RemoteFileSystem
+    /// Replaced when the ssh settings change (`FileTabStore.settingsChanged`).
+    var fs: RemoteFileSystem
     private(set) var directory = ""
     private(set) var files: [RemoteFile] = [] { didSet { recomputeVisible() } }
     /// Sorted and filtered list, recomputed only when the files or the filter change.
@@ -52,7 +53,56 @@ final class FileBrowserModel {
     init(target: ConnectionTarget, fs: RemoteFileSystem) {
         self.target = target
         self.fs = fs
+        Self.live.add(self)
     }
+
+    /// Every file view open now (tabs, the inspector, Files windows), held weakly.
+    @ObservationIgnored nonisolated(unsafe) static let live = NSHashTable<FileBrowserModel>.weakObjects()
+    /// The folder last asked for (nil: the home folder), loaded again when the first listing failed.
+    @ObservationIgnored private var requested: String?
+
+    /// The server is reachable again (signed in, the network back): a listing that failed loads again —
+    /// also a first one, which has no folder yet. `host`: only views of that server (any of its names).
+    /// Only views on screen with no listing on its way: one in the background loads when it is
+    /// shown again (`shown`), and a flapping network does not pile up listings.
+    static func reloadFailed(host: String? = nil) {
+        for b in live.allObjects where b.error != nil && b.shownCount > 0 && !b.loading && !b.refreshing {
+            if let host, !HostLinks.sameServer(b.target.key, host) { continue }
+            Task { await b.load(b.directory.isEmpty ? b.requested : b.directory, pushHistory: false) }
+        }
+    }
+
+    /// How many views show this browser now (a tab, the inspector).
+    @ObservationIgnored private(set) var shownCount = 0
+    /// A view shows it: a listing that failed while it was in the background tries again.
+    func shown() {
+        shownCount += 1
+        if shownCount == 1, error != nil || directory.isEmpty, !loading, !refreshing {
+            Task { await load(directory.isEmpty ? requested : directory, pushHistory: false) }
+        }
+    }
+    func hidden() { shownCount = max(0, shownCount - 1) }
+
+    /// The listing on its way: replaced by the next one asked for, and stopped (on the server too)
+    /// when the view goes away.
+    @ObservationIgnored private var listing: Task<Listing, Error>?
+    private struct Listing: Sendable {
+        var directory: String
+        var files: [RemoteFile]
+        /// The folder asked for was not there; this is the nearest one that is.
+        var insteadOf: String?
+    }
+
+    /// Stops what this browser has under way on the server.
+    func stopWork() {
+        listing?.cancel()
+        listing = nil
+        searchTask?.cancel()
+        searchTask = nil
+    }
+
+    /// A folder asked for that is not there (any more): the banner offers the nearest one.
+    private(set) var missingFolder: String?
 
     private func recomputeVisible() {
         if let search {
@@ -129,6 +179,7 @@ final class FileBrowserModel {
     /// Shows a directory: instantly from the cache when it was visited before, then refreshed in the
     /// background. A refresh keeps the selection and scroll position (rows keep their identity).
     func load(_ path: String?, pushHistory: Bool = true) async {
+        if directory.isEmpty { requested = path }
         loadToken += 1
         let token = loadToken
         let previous = directory
@@ -141,8 +192,31 @@ final class FileBrowserModel {
         defer {
             if token == loadToken { loading = false; refreshing = false }
         }
+        missingFolder = nil
+        // The view's first listing (a folder restored from the last run, or remembered) and the
+        // folder shown going away (deleted on the server): the nearest folder that is there is
+        // shown instead. A folder the user asked for just now is not replaced by another: they are
+        // told, and offered the nearest.
+        let fallBack = previous.isEmpty || path == previous
+        listing?.cancel()
+        let fs = self.fs
+        // One piece of work, stopped as a whole (also on the server) when another folder is asked
+        // for or the view goes away.
+        let work = Task { () throws -> Listing in
+            do {
+                let r = try await fs.list(path, stopOnCancel: true)
+                return Listing(directory: r.directory, files: r.files)
+            } catch let missing as RemoteFileSystem.MissingDirectory where fallBack {
+                let near = try await fs.nearestExisting(missing.path, stopOnCancel: true)
+                try Task.checkCancellation()
+                let r = try await fs.list(near, stopOnCancel: true)
+                return Listing(directory: r.directory, files: r.files, insteadOf: missing.path)
+            }
+        }
+        listing = work
         do {
-            let r = try await fs.list(path)
+            let r = try await work.value
+            if let missing = r.insteadOf, token == loadToken { note(movedFrom: missing, to: r.directory) }
             // Bounded: a listing of a big folder can be megabytes, and every folder visited on every
             // host would otherwise stay for as long as Tether runs.
             if Self.cache.count > 64 { Self.cache.removeAll() }
@@ -153,8 +227,34 @@ final class FileBrowserModel {
             show(r.directory, r.files, from: previous, pushHistory: pushHistory && directory != r.directory)
             error = nil
             AppModel.shared.updateMetadata(for: target.key) { $0.lastRemoteDirectory = r.directory }
+        } catch is CancellationError {
         } catch {
-            if token == loadToken { self.error = error.localizedDescription }
+            guard token == loadToken else { return }
+            if Task.isCancelled { return }
+            if let missing = error as? RemoteFileSystem.MissingDirectory { missingFolder = missing.path }
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// Said once below the path: the folder asked for was not there, another is shown.
+    private(set) var moved: (from: String, to: String)?
+    private func note(movedFrom from: String, to: String) {
+        moved = (from, to)
+        let shownMove = (from, to)
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            if let self, self.moved?.from == shownMove.0, self.moved?.to == shownMove.1 { self.moved = nil }
+        }
+    }
+
+    /// Opens the nearest existing folder to the one that was not there.
+    func openNearest() async {
+        guard let missing = missingFolder else { return }
+        do {
+            let near = try await fs.nearestExisting(missing)
+            await load(near)
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 
@@ -262,14 +362,22 @@ struct FileBrowserView: View {
         }
         .onAppear {
             if let external {
-                if external.directory.isEmpty { Task { await external.load(initialPath) } }
+                if external.directory.isEmpty, external.error == nil, !external.loading { Task { await external.load(initialPath) } }
+                external.shown()
                 return
             }
-            guard own == nil else { return }
+            guard own == nil else { own?.shown(); return }
             let b = FileBrowserModel(target: target, fs: RemoteFileSystem(executor: model.executor(for: target)))
             own = b
+            b.shown()
             let requested = model.fileBrowserRequests.removeValue(forKey: target.key)
             Task { await b.load(initialPath ?? requested) }   // nil: the home folder
+        }
+        .onDisappear {
+            browser?.hidden()
+            // A view of its own that goes away stops its work on the server (a tab's browser is
+            // kept for when the tab is shown again; `FileTabStore.close` stops it).
+            if external == nil { own?.stopWork() }
         }
         .onChange(of: model.fileBrowserRequests[target.key]) { _, path in
             guard let path, let browser else { return }
@@ -333,7 +441,10 @@ struct FileBrowserView: View {
             Button("Rename") {
                 if let f = renaming {
                     let dest = (f.path as NSString).deletingLastPathComponent + "/" + renameText
-                    Task { try? await b.fs.rename(f.path, to: dest); await b.load(b.directory, pushHistory: false) }
+                    Task {
+                        do { try await b.fs.rename(f.path, to: dest) } catch { show("Could not rename \"\(f.name)\": \(error.localizedDescription)", isError: true) }
+                        await b.load(b.directory, pushHistory: false)
+                    }
                 }
             }
             Button("Cancel", role: .cancel) {}
@@ -417,8 +528,18 @@ struct FileBrowserView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let error = b.error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.red)
+                HStack(spacing: 8) {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.red)
+                    if b.missingFolder != nil {
+                        Button("Open Nearest Folder") { Task { await b.openNearest() } }
+                            .controlSize(.small)
+                    }
+                    Spacer(minLength: 0)
+                }
+            } else if let moved = b.moved {
+                Label("\u{2018}\(moved.from)\u{2019} no longer exists \u{2014} showing \u{2018}\(moved.to)\u{2019}", systemImage: "folder.badge.questionmark")
+                    .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -1138,7 +1259,11 @@ struct FileDetailView: View {
                 .padding(12)
                 .task(id: f.id) {
                     details = (nil, nil)
-                    details = await browser.fs.details(f)
+                    // A moment first: moving over rows with the arrow keys asks the server nothing.
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard !Task.isCancelled else { return }
+                    let found = await browser.fs.details(f)
+                    if !Task.isCancelled { details = found }
                 }
             } else if files.count > 1 {
                 VStack(spacing: 10) {

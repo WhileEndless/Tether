@@ -627,6 +627,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         shrinkWhileHidden = nil
         if shown {
             flushHiddenOutput()
+            session?.terminalShown()
             // Output that came while hidden, and the scrollback made smaller meanwhile: all of it again.
             if let findSession {
                 findSession.changedFrom = nil
@@ -1760,7 +1761,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // the window or the history view takes the keyboard): only what the user typed or pasted
         // brings the live terminal back and counts as a command.
         guard !replayingEarlier else { return }       // answers to queries in earlier output
-        guard isUserInput else { session?.send(data); return }
+        guard isUserInput else { session?.sendAutomatic(data); return }
         returnToLive()          // typing while scrolled back into the recording: the live end again
         clearCommandSelection()
         historyJump = nil

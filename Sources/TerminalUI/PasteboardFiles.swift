@@ -57,9 +57,17 @@ public enum PasteboardFiles {
             url = dir.appendingPathComponent("pasted-image-\(f.string(from: now))-\(n).png")
         }
         do {
-            try data.write(to: url)
+            // Readable by this user only (also once uploaded: scp keeps the mode, and a shared /tmp
+            // would show it to everyone).
+            // Created with that mode (never readable by others, not even for a moment), and never over
+            // a file that appeared meanwhile.
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            guard fd >= 0 else { return nil }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try handle.write(contentsOf: data)
             return url
         } catch {
+            try? FileManager.default.removeItem(at: url)
             return nil
         }
     }
@@ -91,6 +99,16 @@ public enum PasteboardFiles {
         return true
     }
 
+    /// Removes what was pasted or dropped more than a week ago (also at launch and once a day).
+    public static func removeOldFiles(now: Date = Date()) {
+        let fm = FileManager.default
+        let cutoff = now.addingTimeInterval(-7 * 24 * 3600)
+        for item in (try? fm.contentsOfDirectory(at: stagingDirectory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+            let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let date, date < cutoff { try? fm.removeItem(at: item) }
+        }
+    }
+
     /// Creates the staging directory and removes week-old leftovers.
     private static func prepareStaging() -> URL? {
         let dir = stagingDirectory
@@ -100,11 +118,7 @@ public enum PasteboardFiles {
         } catch {
             return nil
         }
-        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
-        for item in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
-            let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-            if let date, date < cutoff { try? fm.removeItem(at: item) }
-        }
+        removeOldFiles()
         return dir
     }
 }

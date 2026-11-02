@@ -447,22 +447,14 @@ struct HostChildren: View {
                     model.sessions.reorder(ids + list.dropFirst(shown.count).map(\.id))
                 } : nil)
             ForEach(model.fileTabs.tabs(for: key)) { FileTabRow(tab: $0) }
-            let all = serverSessions
-            // Tether sessions left on the server (after a crash, or a tab that never connected)
-            // are summed up in one row with a clean-up button instead of a row each.
-            let leftovers = all.filter { $0.isTether && !$0.attached }
-            let server = all.filter { !($0.isTether && !$0.attached) }
+            // Sessions on the server no tab here shows are listed one by one, ready to open again:
+            // first those tabs closed on this Mac left running (under their tabs' names), then other
+            // Tether sessions (another Mac's, or another person's on a shared account), then the
+            // user's own. Opening or ending this Mac's in one go is in the host's menu.
+            let server = serverSessions
             let shownServer = expanded ? server : Array(server.prefix(Self.serverLimit))
             ForEach(shownServer) { entry in
                 ServerSessionRow(entry: entry, target: target, monitor: model.monitor(for: target))
-            }
-            if !leftovers.isEmpty {
-                LeftoverSessionsRow(count: leftovers.count, target: target)
-                if expanded {
-                    ForEach(leftovers) { entry in
-                        ServerSessionRow(entry: entry, target: target, monitor: model.monitor(for: target))
-                    }
-                }
             }
             let hidden = (list.count - shown.count) + (server.count - shownServer.count)
             if hidden > 0 {
@@ -477,39 +469,25 @@ struct HostChildren: View {
     private var serverSessions: [RemoteSessionEntry] {
         guard !target.isLocal else { return [] }
         let open = Set(model.sessions.sessions(for: target.key).map(\.descriptor.remoteSessionName))
-        return model.monitor(for: target).remoteSessions.filter { !open.contains($0.name) }
+        let key = target.key
+        return RemoteSessionEntry.listOrder(model.monitor(for: target).remoteSessions.filter { !open.contains($0.name) }) {
+            model.sessions.leftSession(on: key, named: $0.name) != nil
+        }
     }
 }
 
-/// "3 leftover sessions on the server" with a button that ends them.
-private struct LeftoverSessionsRow: View {
+/// "Open or End 3 Detached Sessions…" in a host's menu, while Tether sessions run on the server
+/// with no tab open on them (asks first, naming them).
+private struct DetachedSessionsMenuItem: View {
     @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
-    @Environment(\.sidebarLook) private var look
-    let count: Int
     let target: ConnectionTarget
-    @State private var cleaning = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "tray.full").uiFont(size: 10).foregroundStyle(.secondary)
-                .frame(width: 16 * look.scale, height: 16 * look.scale)
-            Text("\(count) leftover session\(count == 1 ? "" : "s") on the server")
-                .uiFont(.callout).foregroundStyle(.secondary).lineLimit(1)
-            Spacer(minLength: 4)
-            if cleaning {
-                Image(systemName: "hourglass").uiFont(.caption).foregroundStyle(.secondary)
-            } else {
-                Button("Clean Up…") {
-                    cleaning = true
-                    state.cleanUpLeftovers(on: target) { cleaning = false }
-                }
-                .buttonStyle(.borderless)
-                .uiFont(.caption)
-                .help("Open as tabs, or end, the Tether sessions on this server that are not open in any tab (asks first; your own tmux sessions are not touched)")
-            }
+        let count = state.detachedSessions(on: target).count
+        if count > 0 {
+            Button("Open or End \(count) Detached Session\(count == 1 ? "" : "s")…") { state.cleanUpLeftovers(on: target) }
         }
-        .padding(.leading, look.childIndent + 4)
     }
 }
 
@@ -556,6 +534,7 @@ final class SidebarFolding {
 
 /// One server-side session: click it (or Attach) to open it in a tab.
 private struct ServerSessionRow: View {
+    @Environment(AppModel.self) private var model
     @Environment(WindowState.self) private var state
     @Environment(\.sidebarLook) private var look
     let entry: RemoteSessionEntry
@@ -571,8 +550,17 @@ private struct ServerSessionRow: View {
                 .frame(width: 16 * look.scale, height: 16 * look.scale)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
-                    Text(entry.isTether ? "Detached session" : entry.name)
+                    Text(label)
                         .lineLimit(1)
+                    if let tag = left?.color.color {
+                        Circle().fill(tag).frame(width: 6, height: 6)
+                    }
+                    if let used = entry.lastActivity ?? entry.created {
+                        Text(used, format: .relative(presentation: .named, unitsStyle: .narrow))
+                            .uiFont(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
                     Text(entry.kind.rawValue)
                         .uiFont(.caption2)
                         .padding(.horizontal, 4)
@@ -588,9 +576,7 @@ private struct ServerSessionRow: View {
                 ProgressView().controlSize(.mini)
             } else if look.buttons {
                 RowAction(symbol: "arrow.right.circle", help: "Attach in a new tab", action: attach)
-                RowAction(symbol: "xmark.circle", help: "Kill this session on the server") {
-                    Task { await monitor.killRemoteSession(entry) }
-                }
+                RowAction(symbol: "xmark.circle", help: "Kill this session on the server", action: kill)
             }
         }
         .padding(.leading, look.childIndent)
@@ -600,12 +586,39 @@ private struct ServerSessionRow: View {
         .contextMenu {
             Button("Attach in New Tab", action: attach)
             Divider()
-            Button("Kill on Server", role: .destructive) { Task { await monitor.killRemoteSession(entry) } }
+            Button("Kill on Server", role: .destructive, action: kill)
+        }
+    }
+
+    /// The note kept when a tab closed here left this session running (its name and color).
+    private var left: LeftSession? { model.sessions.leftSession(on: target.key, named: entry.name) }
+
+    /// The tab's name for a session a tab closed here left running; else what it is. Names from the
+    /// server are shown made safe (`DisplayText`).
+    private var label: String {
+        if let left { return left.title.map { DisplayText.clean($0, limit: 80) } ?? "Closed tab" }
+        if entry.isTether { return entry.attached ? "Tether session" : "Detached session" }
+        let name = DisplayText.clean(entry.name, limit: 80)
+        return name.isEmpty ? "Unnamed session" : name
+    }
+
+    private func kill() {
+        let key = target.key, name = entry.name
+        Task {
+            if await monitor.killRemoteSession(entry) { model.sessions.forgetLeftSession(on: key, named: name) }
         }
     }
 
     private var helpText: String {
-        var text = "\(entry.kind.rawValue) session “\(entry.name)” on the server\(entry.attached ? " (attached elsewhere)" : "") — click to open it in a tab"
+        var text = "\(entry.kind.rawValue) session “\(DisplayText.clean(entry.name, limit: 80))” on the server\(entry.attached ? " (attached elsewhere)" : "") — click to open it in a tab"
+        if left != nil {
+            text += "\nLeft running by a tab closed on this Mac"
+        } else if entry.isTether {
+            text += "\nNot left by a tab of this Mac: perhaps another Mac's, or someone else's who uses this account"
+        }
+        if let used = entry.lastActivity ?? entry.created {
+            text += "\nLast used " + used.formatted(date: .abbreviated, time: .shortened)
+        }
         let windows = entry.panes.filter(\.paneActive)
         if !windows.isEmpty {
             text += "\n" + windows.map { "\($0.windowIndex): \($0.windowName) — \($0.summary)" }.joined(separator: "\n")
@@ -1062,9 +1075,19 @@ struct SessionRow: View {
                         .lineLimit(1)
                         .foregroundStyle(session.phase.isDead || elsewhere != nil || (inBackground && !look.extras) ? .secondary : .primary)
                     if let elsewhere { OtherWindowBadge(name: elsewhere) }
-                    if session.endWhenConnected {
-                        Text("Ends when connected").uiFont(.caption2).foregroundStyle(.orange)
-                            .help("Tether ends this session on the server as soon as it can reach it. Open it in a tab, or choose Don't End, to keep it.")
+                    if session.closedWhileOffline {
+                        let host = session.descriptor.target.displayName
+                        switch session.offlineCheck {
+                        case .waitingForServer:
+                            Text("Closed while offline").uiFont(.caption2).foregroundStyle(.orange)
+                                .help("You closed this tab while \(host) could not be reached. Its session may still run there: once \(host) can be reached, Tether tells you, and you decide. Nothing is ended without you.")
+                        case .stillRunning:
+                            Text("Still running on server").uiFont(.caption2).foregroundStyle(.orange)
+                                .help("You closed this tab while \(host) could not be reached, and its session is still running there. Open it, end it (End on Server), or keep it (Keep Running).")
+                        case .needsSignIn:
+                            Text("Closed while offline").uiFont(.caption2).foregroundStyle(.orange)
+                                .help("\(host) answers, but asking about this session needs a sign-in: it is checked the next time you sign in to \(host).")
+                        }
                     } else if inBackground && !session.phase.isSuspended && look.extras {
                         Text("background").uiFont(.caption2).foregroundStyle(.secondary)
                     }
@@ -1173,6 +1196,7 @@ struct HostContextMenu: View {
         }
         SessionSortMenu()
         Divider()
+        DetachedSessionsMenuItem(target: .alias(alias))
         Button("Terminate All Sessions on This Host…", role: .destructive) { state.terminateAll(on: .alias(alias)) }
         Button("Remove from SSH Config…", role: .destructive) {
             let alert = NSAlert()
@@ -1209,8 +1233,9 @@ struct SessionContextMenu: View {
     var body: some View {
         let inBackground = model.sessions.background.contains(session.id)
         Button(session.phase.isSuspended ? "Reconnect" : inBackground ? "Open in Tab" : "Show") { state.show(session) }
-        if session.endWhenConnected {
-            Button("Don't End") { model.sessions.keepRunning(session.id) }
+        if session.closedWhileOffline {
+            Button("End on Server…") { state.terminate(session) }
+            Button("Keep Running") { model.sessions.keepRunning(session.id) }
         }
         if let elsewhere = model.workspaces.otherWindowName(of: session.id, here: state.workspaceID) {
             Button("Move from \(elsewhere) to This Window") {
@@ -1313,6 +1338,7 @@ struct SidebarItemMenu: View {
             } else {
                 Button("New Session") { state.connect(model.target(forKey: key)) }
                 Button("Open Files in a Tab") { state.openFiles(model.target(forKey: key)) }
+                DetachedSessionsMenuItem(target: model.target(forKey: key))
                 Button("Terminate All Sessions…", role: .destructive) { state.terminateAll(on: model.target(forKey: key)) }
             }
         case .session(let id):

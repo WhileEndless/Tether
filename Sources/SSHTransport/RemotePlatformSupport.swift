@@ -177,13 +177,15 @@ extension RemoteExecutor {
         return .posix
     }
 
-    /// One short command; nil when the host could not be reached (asked again later).
+    /// One short command; nil when the host could not be reached (asked again later). Without
+    /// sharing, this ssh signs in by itself: as its connection, so a password typed for it answers
+    /// the tab's own login right after (and is remembered once one of them works).
     private func ask(_ command: String, quiet: Bool) async -> String? {
-        let args = options.batchArguments(target: target, remoteCommand: command, quiet: quiet)
-        let env = AskPassBridge.shared.environment(for: target.key, purpose: quiet ? "platform" : "connect")
-        defer { AskPassBridge.shared.revoke(environment: env) }
-        let r = await ProcessRunner.run(options.sshBinary, arguments: args, environment: env, input: Data(), timeout: 20)
-        if quiet, !options.usesSharedConnection { BackgroundSignIn.shared.noteQuietResult(target.key, status: r.status, stderr: r.errorOutput) }
+        let channel = RemoteChannel(target: target, options: options, purpose: quiet ? "platform" : "connect")
+        await channel.began()
+        let r = await ProcessRunner.run(options.sshBinary, arguments: channel.command(command), environment: channel.askPass,
+                                        input: Data(), timeout: 20, waitWhile: channel.questionWait)
+        channel.ended(status: r.status, stderr: r.errorOutput, stopped: r.timedOut)
         guard !r.timedOut, r.status != 255 else { return nil }
         return r.output + "\n" + r.errorOutput
     }

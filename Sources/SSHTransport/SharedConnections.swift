@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import os
 import TetherCore
 
 /// The signed-in shared connections (ControlMaster), one per machine and slot, and the only place
@@ -49,10 +51,17 @@ public actor SharedConnections {
         /// The jump host(s) as ssh reported them (also a chain), for `identity`.
         var route: String?
         var expires: TimeInterval
+        /// Where ssh goes, as `ssh -G` puts it (host name, port, user, ProxyCommand); nil when it
+        /// did not say.
+        var destination: String? = nil
+        /// What the user's ssh_config sets that Tether's own options take into account.
+        var config = UserConfig()
 
-        /// What a remembered password belongs to: the socket name (host name, port, user and, in
-        /// recent OpenSSH, the jump host) plus the jump route itself, for older ssh versions.
-        var identity: String { socket + "\u{0}" + (route ?? "") }
+        /// What a remembered password belongs to: the server ssh goes to (host name, port, user,
+        /// ProxyCommand) and the jump route. Not the socket name: ssh's `%C` also hashes this Mac's
+        /// own host name, which can change with the network (a new address, waking from sleep), and
+        /// the password typed for a server must still be found afterwards.
+        var identity: String { (destination ?? socket) + "\u{0}" + (route ?? "") }
 
         func socket(slot: Int) -> String { slot == 0 ? socket : socket + "-\(slot)" }
     }
@@ -73,6 +82,11 @@ public actor SharedConnections {
         var finished = false
         /// The jump host's connection this sign-in is waiting for, if any.
         var waitingOn: String?
+        /// The network changed or the Mac woke while it signed in: a failure is the network's.
+        var networkChanged = false
+        /// It failed in a way its waiters must not each try again (the user cancelled, the server
+        /// refused): they get its result instead of starting sign-ins of their own, one after another.
+        var stopsWaiters = false
         init(quiet: Bool) { self.quiet = quiet }
     }
 
@@ -106,9 +120,28 @@ public actor SharedConnections {
     public func useSocketDirectory(_ url: URL) { customSocketDirectory = url }
     /// The `-v` logs of the connections this run signed in (see `MasterLauncher.Result.success`).
     private var logs: [String: FileHandle] = [:]
+    /// The last things each connection's ssh said (its errors, not its steps), kept when its log is
+    /// emptied: when the connection ends, they say why.
+    private var lastWords: [String: [String]] = [:]
     private var trimming = false
+
+    /// A connection's own last words: what its log holds now after what was kept from before.
+    private func lastWords(of socket: String) -> [String] {
+        var words = lastWords[socket] ?? []
+        if let handle = logs[socket] {
+            try? handle.seek(toOffset: 0)
+            if let data = try? handle.readToEnd() {
+                words += String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).map(String.init)
+                    .filter { !$0.hasPrefix("debug") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            }
+            _ = try? handle.seekToEnd()
+        }
+        return Array(words.suffix(8))
+    }
     /// When each connection this run signed in was opened (wall clock: sleep included), for the log.
     private var openedAt: [String: Date] = [:]
+    /// When each connection this run signed in was opened (system uptime, like `confirmed`).
+    private var openedUptime: [String: TimeInterval] = [:]
 
     public static var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
@@ -121,14 +154,24 @@ public actor SharedConnections {
         return "\(Int(t) / 3_600) h \(Int(t) % 3_600 / 60) min"
     }
 
-    /// Told the askpass token of a sign-in that succeeded / did not (the app keeps a password typed
-    /// for it only after it worked, see `SealedPasswordCache`).
-    /// `refused`: it failed because the server turned the password down.
-    nonisolated(unsafe) public static var onSignInResult: (@Sendable (_ token: String, _ succeeded: Bool, _ refused: Bool) -> Void)?
-    /// Told which connection a sign-in's askpass token is for (its socket for slot 0, which ssh
-    /// derives from the local host, host name, port, user and jump host): a password typed for it
-    /// is remembered for exactly that connection.
-    nonisolated(unsafe) public static var onSignInStarted: (@Sendable (_ token: String, _ connection: String) -> Void)?
+    /// How a failed sign-in ended for what it was answered with (`SignInEnd`), from ssh's last
+    /// lines: the network's doing or a stop by Tether is not judged by the server.
+    /// `killed`: ssh was ended by a signal — by Tether (a late answer, a question left in the
+    /// background) when `status` does not say otherwise.
+    nonisolated static func end(status: MasterLauncher.Stop?, killed: Bool, networkChanged: Bool, cancelledByUser: Bool,
+                                log: [String]) -> SignInEnd {
+        let last = log.suffix(3).joined(separator: "\n")
+        if networkChanged || cancelledByUser || SSHFailure.isNetwork(last) { return .notJudged }
+        switch status {
+        case .unanswered: return .unanswered
+        case .stopped: return .notJudged
+        case nil: if killed { return .notJudged }
+        }
+        // The jump host's connection (a ProxyCommand through it) ended under it: the target never
+        // got as far as judging anything.
+        if SSHFailure.isLostSharedConnection(last) { return .notJudged }
+        return .failed
+    }
 
     // MARK: Preparing
 
@@ -157,11 +200,18 @@ public actor SharedConnections {
         // the password typed there is then remembered (Signing In Again) and answers this one too,
         // instead of a second question while the first is still being answered.
         if options.controlSlot > 0, let first = logins[resolution.socket], !first.finished {
-            _ = await wait(on: first, socket: resolution.socket, for: signIn)
+            let r = await wait(on: first, socket: resolution.socket, for: signIn)
             if isReady(socket) { return .ready(o, reused: true) }
+            if first.stopsWaiters { return r }
         }
         // Whoever asked is gone (a tab closed while this was being worked out): no sign-in for it.
         if Task.isCancelled { return .failed("The sign-in was stopped", log: []) }
+        // You cancelled this server's sign-in a moment ago: what followed by itself (the next
+        // queued transfer, a file window, a forward) does not ask again. A tab's Reconnect, a Retry
+        // or a sign-in that worked starts over.
+        if let signIn, signIn.sessionID == nil, await !HostLinks.shared.mayAskByItself(target.key) {
+            return .failed(Self.cancelledMessage, log: [])
+        }
         let quiet = signIn == nil
         // A background attempt (no questions) in progress: wait for it; if it found that the user
         // is needed, a sign-in that may ask follows.
@@ -179,9 +229,12 @@ public actor SharedConnections {
         // sends it again; a password typed there is remembered and answers this one too.
         if !quiet {
             while let other = signingIn(besides: socket, of: resolution) {
-                _ = await wait(on: other.login, socket: other.socket, for: signIn)
+                let r = await wait(on: other.login, socket: other.socket, for: signIn)
                 if Task.isCancelled { return .failed("The sign-in was stopped", log: []) }
                 if isReady(socket) { return .ready(o, reused: true) }
+                // Refused or cancelled there: the same question here would only be refused or
+                // cancelled again. A failure of the network, or a stop by Tether, lets this one try.
+                if other.login.stopsWaiters { return r }
             }
             if let login = logins[socket], !login.quiet { return await wait(on: login, socket: socket, for: signIn) }
         }
@@ -268,12 +321,31 @@ public actor SharedConnections {
         for cont in waiters.values { cont.resume(returning: outcome) }
     }
 
+    public static let cancelledMessage = "Sign-in cancelled"
+
     private func establish(_ login: Login, socket: String, target: ConnectionTarget, options: SSHOptions,
                            resolution: Resolution, signIn: SignIn?, chain: Set<String>) async {
         // Already there (made before this run of the app, or a moment ago): use it. A second
         // master would sign in once more and then hang ("ControlSocket … already exists").
         if Self.isSocket(socket) {
-            switch await Self.check(socket, ssh: options.sshBinary) {
+            var state = await Self.check(socket, ssh: options.sshBinary)
+            // One this run did not open (kept from the last run, the Mac slept since), or one whose
+            // master does not answer: is its link still there? Asked once, quickly.
+            // Opened by this run before the network changed (or suspected since), kept from the
+            // last run (the Mac slept since), or a master that does not answer a local check: is
+            // its link still there? The shared check decides (one for every tab waiting): a busy
+            // connection is kept, a slow one too, and only one found dead is closed.
+            let fromEarlierRun = openedUptime[socket] == nil
+            if state == .noAnswer || (state == .alive && (fromEarlierRun || predatesNetworkChange(socket))) {
+                let why = fromEarlierRun ? "it was kept from before" : "the network changed, or a tab stopped hearing from it, since it last answered"
+                if await verifyLink(socket, ssh: options.sshBinary, deadAfter: staleLinkDeadAfter, why: why) == false {
+                    ConnectionLog.shared.notice("The connection already open no longer reaches its server; signing in afresh", host: target.key)
+                    state = .gone
+                } else if state == .noAnswer {
+                    state = .alive
+                }
+            }
+            switch state {
             case .alive:
                 ConnectionLog.shared.info("Using the connection already open", host: target.key)
                 confirmed[socket] = Self.uptime
@@ -343,18 +415,29 @@ public actor SharedConnections {
             return
         }
         let quiet = signIn == nil
+        // Nothing is asked for while Tether is locked: the sign-in starts once it is unlocked.
+        if !quiet {
+            await SignInEvents.shared.mayStart()
+            guard !login.waiters.isEmpty, !Task.isCancelled else {
+                finish(login, socket: socket, .failed("The sign-in was stopped", log: []))
+                return
+            }
+        }
         let env = quiet ? AskPassBridge.shared.refusingEnvironment(targetKey: target.key, purpose: "connect")
                         : AskPassBridge.shared.environment(targetKey: target.key, purpose: signIn?.purpose ?? "connect",
                                                            mode: "force", sessionID: signIn?.sessionID)
         // Its log sits next to its socket (Tether's private socket folder).
         let launcher = MasterLauncher(directory: URL(fileURLWithPath: socket).deletingLastPathComponent())
         login.launcher = launcher
-        if !quiet, let token = env["TETHER_ASKPASS_TOKEN"] { Self.onSignInStarted?(token, resolution.identity) }
+        if !quiet, let token = env["TETHER_ASKPASS_TOKEN"] { SignInEvents.shared.post(.started(token: token, connection: resolution.identity)) }
         login.token = env["TETHER_ASKPASS_TOKEN"]
         login.environment = env
         login.startedAt = Self.uptime
         publishInterest()
-        var args = options.masterArguments(target: target, controlPath: socket, logFile: launcher.logPath, proxyCommand: proxyCommand)
+        var args = options.masterArguments(target: target, controlPath: socket, logFile: launcher.logPath, proxyCommand: proxyCommand,
+                                           config: resolution.config, device: PlatformCache.shared.isDevice(target.key))
+        ConnectionLog.shared.info("Connection settings", .signIn, host: target.key,
+                                  detail: Self.describe(arguments: args))
         if quiet { args.insert(contentsOf: ["-o", "BatchMode=yes"], at: 0) }
         ConnectionLog.shared.info((quiet ? "Signing in without asking (background work)" : "Signing in")
                                   + (options.controlSlot > 0 ? " (connection \(options.controlSlot + 1))" : "")
@@ -364,9 +447,14 @@ public actor SharedConnections {
         AskPassBridge.shared.revoke(environment: env)
         if let token = env["TETHER_ASKPASS_TOKEN"] {
             switch result {
-            case .success: Self.onSignInResult?(token, true, false)
-            case .failure(_, let log):
-                Self.onSignInResult?(token, false, BackgroundSignIn.reasonFor(stderr: log.joined(separator: "\n")) == .password)
+            case .success: SignInEvents.shared.post(.ended(token: token, end: .succeeded))
+            case .failure(let message, let log):
+                let cancelled = SignInEvents.shared.takeCancelled(token: token)
+                let end = Self.end(status: launcher.stop, killed: message == MasterLauncher.stoppedMessage,
+                                   networkChanged: login.networkChanged, cancelledByUser: cancelled, log: log)
+                if cancelled || end == .failed { login.stopsWaiters = true }
+                if cancelled { await HostLinks.shared.noteCancelled(target.key) }
+                SignInEvents.shared.post(.ended(token: token, end: end))
             }
         }
         login.launcher = nil
@@ -375,6 +463,8 @@ public actor SharedConnections {
             generations[socket, default: 0] += 1
             targets[socket] = target
             openedAt[socket] = Date()
+            openedUptime[socket] = Self.uptime
+            jumpSockets[socket] = proxyCommand != nil ? jumpSocket : nil
             let steps = launcher.milestones
             ConnectionLog.shared.notice("Signed in" + (options.controlSlot > 0 ? " (connection \(options.controlSlot + 1))" : "")
                                         + (DiagnosticText.signInMethod(steps).map { " with \($0)" } ?? "")
@@ -383,7 +473,12 @@ public actor SharedConnections {
             if let log { logs[socket] = log }
             trimLogsSoon()
             BackgroundSignIn.shared.clear(target.key)
+            HostLinks.post(.signedIn(target.key))
             confirmed[socket] = Self.uptime
+            // A new connection gets its silent channel again (an earlier one may have given way to
+            // a tab when the server's session limit was reached for a moment).
+            withoutSentinel.remove(socket)
+            sentinelRestarts[socket] = nil
             finish(login, socket: socket, .ready(options, reused: false))
             startSentinel(target: target, options: options)
         case .failure(let message, let log):
@@ -419,7 +514,8 @@ public actor SharedConnections {
     }
 
     /// The server refused a tab a session while the silent channel held one (a server that allows
-    /// a single session per connection): the channel gives way, for good, on this connection.
+    /// a single session per connection, or its limit reached for a moment): the channel gives way
+    /// on this connection — until it is signed in again.
     /// Whether there was one to give way.
     public func yieldSentinel(for target: ConnectionTarget, options: SSHOptions) async -> Bool {
         guard let socket = await socket(for: target, options: options) else { return false }
@@ -434,7 +530,10 @@ public actor SharedConnections {
     /// user are started again (one begun on the old network would hang until TCP gives up).
     public func restartStalledSignIns(startedBefore moment: TimeInterval) {
         for (socket, login) in logins where !login.finished && login.startedAt < moment {
-            guard let launcher = login.launcher, !AskPassBridge.shared.isAsking(environment: login.environment) else { continue }
+            // One waiting for the user goes on (its question is answered on the new network); a
+            // later refusal there is the server's, not the network's.
+            guard let launcher = login.launcher, !AskPassBridge.shared.waitsOnUser(environment: login.environment) else { continue }
+            login.networkChanged = true
             ConnectionLog.shared.info("Restarted a sign-in begun before the network changed", .signIn, host: targets[socket]?.key)
             launcher.cancel()
         }
@@ -453,19 +552,51 @@ public actor SharedConnections {
 
     /// Ready without asking anyone: the socket is there and either its silent channel still runs
     /// (it ends the moment the connection does) or it answered a moment ago.
+    ///
+    /// Not after the way out to the network changed: a connection made over the old one keeps its
+    /// silent channel running while its link is gone (nothing is sent on it, so nothing notices) —
+    /// trusted, every tab would wait on it for minutes while a fresh `ssh` works at once. Such a
+    /// connection is checked first (`establish`).
     private func isReady(_ socket: String) -> Bool {
-        guard logins[socket] == nil, Self.isSocket(socket) else { return false }
+        guard logins[socket] == nil, Self.isSocket(socket), !predatesNetworkChange(socket) else { return false }
         if let s = sentinels[socket], s.process.isRunning { return true }
         if let at = confirmed[socket], Self.uptime - at < 20 { return true }
         return false
     }
+
+    /// Whether `socket` must be checked before it is used again: last known to work before the way
+    /// out to the network last changed, or something using it stopped hearing from the server.
+    private func predatesNetworkChange(_ socket: String) -> Bool {
+        // Only the server answering over the link counts here (`verifyLink`, a sign-in): a local
+        // `-O check` (`confirmed`) asks the master process on this Mac, which a dead link keeps alive.
+        let known = max(linkVerified[socket] ?? 0, openedUptime[socket] ?? 0)
+        if let at = suspected[socket], known < at { return true }
+        guard networkChangedAt > 0 else { return false }
+        return known < networkChangedAt
+    }
+
+    /// When each connection's link last answered (`verifyLink`, or the probe of one kept from the
+    /// last run), in system uptime.
+    private var linkVerified: [String: TimeInterval] = [:]
+
+    /// When something using each connection last stopped hearing from its server.
+    private var suspected: [String: TimeInterval] = [:]
+
+    /// Something using `socket` stopped hearing from its server (a tab's attempt that made no
+    /// progress, a tab gone silent): it is not used again before it was checked (`verifyLink`).
+    public func suspect(_ socket: String) { suspected[socket] = Self.uptime }
 
     /// Whether `target`'s shared connection is up (checking it if needed), without signing in.
     public func isUp(_ target: ConnectionTarget, options: SSHOptions) async -> Bool {
         guard options.useControlMaster, !target.isLocal, let r = await resolve(target, options: options) else { return false }
         let socket = r.socket(slot: options.controlSlot)
         if isReady(socket) { return true }
-        guard Self.isSocket(socket), case .alive = await Self.check(socket, ssh: options.sshBinary) else { return false }
+        guard Self.isSocket(socket), logins[socket] == nil else { return false }
+        // Made before the network changed (or suspected): only the server answering says it is up.
+        if predatesNetworkChange(socket) {
+            return await verifyLink(socket, ssh: options.sshBinary, deadAfter: staleLinkDeadAfter, why: "it was asked for after the network changed") == true
+        }
+        guard case .alive = await Self.check(socket, ssh: options.sshBinary) else { return false }
         confirmed[socket] = Self.uptime
         return true
     }
@@ -518,13 +649,46 @@ public actor SharedConnections {
                 ConnectionLog.shared.problem("ssh could not work out where this host's connection lives", host: target.key, detail: r.errorOutput)
                 return nil
             }
-            return Resolution(socket: parsed.socket, jump: parsed.jump, route: parsed.route, expires: Self.uptime + 300)
+            ResolvedNames.note(target.key, Self.parseNames(r.output))
+            if let destination = Self.parseDestination(r.output) { ResolvedNames.noteServer(target.key, destination) }
+            let config = UserConfig.parse(r.output)
+            if config.remoteCommand { ResolvedNames.noteRemoteCommand(target.key) }
+            var resolution = Resolution(socket: parsed.socket, jump: parsed.jump, route: parsed.route, expires: Self.uptime + 300,
+                                        destination: Self.parseDestination(r.output), config: config)
+            // Tether names the socket itself, after the server (`identity`): ssh's `%C` also hashes
+            // this Mac's own host name, which can change with the network — and then a second
+            // connection would sign in next to the first.
+            resolution.socket = Self.socketName(for: resolution.identity, in: URL(fileURLWithPath: parsed.socket).deletingLastPathComponent())
+            return resolution
         }
         resolving[key] = task
         let resolution = await task.value
         resolving[key] = nil
         if let resolution { resolutions[key] = resolution }
         return resolution
+    }
+
+    /// The options of a sign-in worth knowing when a connection drops (keep-alives, timeouts), for
+    /// the Connection Log: no host, path or command.
+    nonisolated static func describe(arguments args: [String]) -> String {
+        var interval: String?, count: String?, timeout: String?, persist: String?
+        for (i, a) in args.enumerated() where a == "-o" && i + 1 < args.count {
+            let o = args[i + 1]
+            if o.hasPrefix("ServerAliveInterval=") { interval = String(o.dropFirst(20)) }
+            if o.hasPrefix("ServerAliveCountMax=") { count = String(o.dropFirst(20)) }
+            if o.hasPrefix("ConnectTimeout=") { timeout = String(o.dropFirst(15)) }
+            if o.hasPrefix("ControlPersist=") { persist = String(o.dropFirst(15)) }
+        }
+        let keepAlive = interval.map { "keep-alive every \($0) s, given up after \(count ?? "3") unanswered" } ?? "keep-alive as in ssh_config (none by default)"
+        return [keepAlive, "connect timeout " + (timeout.map { "\($0) s" } ?? "as in ssh_config"),
+                persist.map { "kept \($0) s after its last user" } ?? ""].filter { !$0.isEmpty }.joined(separator: "; ")
+    }
+
+    /// The socket for a connection identity, inside `directory`: short (Unix socket paths are limited
+    /// to 104 bytes, and ssh adds a temporary suffix while it creates one), the same in every run.
+    nonisolated static func socketName(for identity: String, in directory: URL) -> String {
+        let digest = SHA256.hash(data: Data(identity.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("c-" + digest).path
     }
 
     /// The socket and the single jump host from `ssh -G` output.
@@ -545,6 +709,47 @@ public actor SharedConnections {
         // A chain of jump hosts, or the user's own ProxyCommand: ssh's own hop is kept.
         if proxyCommand || jump?.contains(",") == true || jump?.lowercased() == "none" { jump = nil }
         return (socket, jump, route)
+    }
+
+    /// Where ssh goes, from `ssh -G` output: host name, port, user and ProxyCommand (nil without a
+    /// host name). The same server however this Mac is named (see `Resolution.identity`).
+    nonisolated static func parseDestination(_ output: String) -> String? {
+        var fields: [String: String] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let name = parts[0].lowercased()
+            if ["hostname", "port", "user", "proxycommand"].contains(name), fields[name] == nil { fields[name] = parts[1] }
+        }
+        guard let host = fields["hostname"] else { return nil }
+        return [host, fields["port"] ?? "", fields["user"] ?? "", fields["proxycommand"] ?? ""].joined(separator: "\u{0}")
+    }
+
+    /// The names ssh uses for the server and the jump hosts on the way, from `ssh -G` output: the
+    /// host name (after `%h`, wildcard and Match blocks), a HostKeyAlias, and each jump host.
+    nonisolated static func parseNames(_ output: String) -> (names: Set<String>, hasJumps: Bool) {
+        var names: Set<String> = [], jumps = false
+        for line in output.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            switch parts[0].lowercased() {
+            case "hostname", "hostkeyalias": names.insert(parts[1])
+            case "proxyjump" where parts[1].lowercased() != "none":
+                jumps = true
+                for hop in parts[1].split(separator: ",") {
+                    var name = String(hop).trimmingCharacters(in: .whitespaces)
+                    if name.hasPrefix("ssh://") { name.removeFirst(6) }
+                    if let at = name.lastIndex(of: "@") { name = String(name[name.index(after: at)...]) }
+                    if name.hasPrefix("["), let close = name.firstIndex(of: "]") { name = String(name[name.index(after: name.startIndex)..<close]) }
+                    else if name.filter({ $0 == ":" }).count == 1, let colon = name.firstIndex(of: ":") { name = String(name[..<colon]) }
+                    if !name.isEmpty { names.insert(name) }
+                }
+            case "proxycommand" where parts[1].lowercased() != "none":
+                jumps = true
+            default: break
+            }
+        }
+        return (names, jumps)
     }
 
     /// The jump host as a destination: `user@host:port` or a host / ssh_config name.
@@ -617,14 +822,18 @@ public actor SharedConnections {
         p.executableURL = URL(fileURLWithPath: options.sshBinary)
         let command = platform.isWindows ? PowerShell.launcher : "exec cat >/dev/null"
         p.arguments = options.commonOptions() + ["-T", "-o", "BatchMode=yes"] + options.destination(target) + [command]
-        p.environment = ChildEnvironment.base.merging(AskPassBridge.shared.refusingEnvironment(targetKey: target.key, purpose: "sentinel")) { $1 }
+        let askPass = AskPassBridge.shared.refusingEnvironment(targetKey: target.key, purpose: "sentinel")
+        p.environment = ChildEnvironment.base.merging(askPass) { $1 }
         let input = Pipe()
         p.standardInput = input
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         let sentinel = Sentinel(process: p, input: input)
-        p.terminationHandler = { _ in Task { await self.sentinelEnded(socket, id: sentinel.id, target: target, options: options) } }
-        do { try p.run() } catch { return }
+        p.terminationHandler = { _ in
+            AskPassBridge.shared.revoke(environment: askPass)
+            Task { await self.sentinelEnded(socket, id: sentinel.id, target: target, options: options) }
+        }
+        do { try p.run() } catch { AskPassBridge.shared.revoke(environment: askPass); return }
         if platform.isWindows {
             // The launcher reads its script from the first line; ReadToEnd then waits for the end
             // of input, which never comes while Tether runs.
@@ -647,7 +856,13 @@ public actor SharedConnections {
         }
         confirmed[socket] = nil
         let lived = openedAt.removeValue(forKey: socket).map { " after " + Self.seconds(Date().timeIntervalSince($0)) } ?? ""
-        ConnectionLog.shared.notice("The connection ended" + lived, host: target.key)
+        // Why, in ssh's own words when it said any ("Timeout, server not responding", "Connection
+        // reset", "Received disconnect …").
+        let words = lastWords(of: socket)
+        lastWords[socket] = nil
+        ConnectionLog.shared.notice("The connection ended" + lived, host: target.key,
+                                    detail: words.isEmpty ? "ssh said nothing about why" : words.joined(separator: "\n"))
+        HostLinks.post(.connectionEnded(target.key))
     }
 
     /// Empties the connections' logs every few minutes and lets go of those whose connection ended.
@@ -664,7 +879,10 @@ public actor SharedConnections {
 
     private func trimLogs() -> Bool {
         for (socket, handle) in logs {
-            if Self.isSocket(socket) { try? handle.truncate(atOffset: 0) } else { try? handle.close(); logs[socket] = nil }
+            if Self.isSocket(socket) {
+                lastWords[socket] = lastWords(of: socket)
+                try? handle.truncate(atOffset: 0)
+            } else { try? handle.close(); logs[socket] = nil }
         }
         if logs.isEmpty { trimming = false }
         return !logs.isEmpty
@@ -674,7 +892,12 @@ public actor SharedConnections {
 
     /// Tether quits: every shared connection ends now (sessions on the servers keep running). Does
     /// not wait — `ssh -O exit` finishes on its own after the app is gone.
-    public nonisolated static func closeAllNow(ssh: String) {
+    /// `gently`: no new users, but what runs on them goes on until it ends (`ssh -O stop`: plain
+    /// shells, transfers and forwards are not cut off — connection sharing was turned off).
+    /// Tether quits: sign-ins under way stop, and none starts any more.
+    public nonisolated static func stopSigningIn() { MasterLauncher.stopAllForQuit() }
+
+    public nonisolated static func closeAllNow(ssh: String, gently: Bool = false) {
         let dir = AppPaths.controlSocketDirectory
         let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
         for name in names where name != AppPaths.askPassSocket.lastPathComponent {
@@ -682,7 +905,7 @@ public actor SharedConnections {
             guard isSocket(path) else { continue }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: ssh)
-            p.arguments = ["-F", "/dev/null", "-o", "ControlPath=\(path)", "-O", "exit", "tether-master"]
+            p.arguments = controlArguments(gently ? .stop : .exit, socket: path)
             p.standardInput = FileHandle.nullDevice
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
@@ -697,11 +920,117 @@ public actor SharedConnections {
         confirmed = [:]
         sentinelRestarts = [:]
         closing = false
+        networkChangedAt = 0
+        jumpSockets = [:]
+        linkChecks = [:]
+        openedUptime = [:]
+        suspected = [:]
+        linkVerified = [:]
+        staleLinkDeadAfter = 10
+        signsOfLife = { _, _ in false }
+        canJudge = { true }
     }
 
     private func stopSentinels() {
         for s in sentinels.values where s.process.isRunning { s.process.terminate() }
         sentinels = [:]
+    }
+
+    // MARK: Link health
+
+    /// When the way out to the network last changed (system uptime; 0: not since launch).
+    private var networkChangedAt: TimeInterval = 0
+    /// The jump host's connection each connection goes through (its ProxyCommand rides on it).
+    private var jumpSockets: [String: String] = [:]
+    private struct LinkCheck {
+        let startedAt: TimeInterval
+        let task: Task<Bool?, Never>
+    }
+    /// Checks under way, one per connection: everyone asking about it waits for the same verdict.
+    private var linkChecks: [String: LinkCheck] = [:]
+    /// Signs of life on a connection since a moment (a tab or a transfer received something), and
+    /// whether the Mac is online and awake: told by the app (see `configureLinkHealth`).
+    private var signsOfLife: @Sendable (String, Date) async -> Bool = { _, _ in false }
+    private var canJudge: @Sendable () async -> Bool = { true }
+
+    public func configureLinkHealth(signsOfLife: @escaping @Sendable (String, Date) async -> Bool,
+                                    canJudge: @escaping @Sendable () async -> Bool) {
+        self.signsOfLife = signsOfLife
+        self.canJudge = canJudge
+    }
+
+    /// The way out to the network changed (another network, a VPN, waking up): connections made
+    /// before it are checked before they are used again (see `isReady`).
+    public func noteNetworkChanged() { networkChangedAt = Self.uptime }
+
+    /// How long a connection made before the network changed may stay silent before it counts as
+    /// dead, when it is about to be used again (tests use less).
+    private var staleLinkDeadAfter: TimeInterval = 10
+    public func useStaleLinkDeadAfter(_ seconds: TimeInterval) { staleLinkDeadAfter = seconds }
+
+    /// Whether the connection at `socket` still reaches its server — the one place that decides,
+    /// and closes it when it does not. true: alive (or busy); false: it was dead and is closed now;
+    /// nil: nothing could be decided (offline, asleep).
+    ///
+    /// One check per connection at a time; whoever asks meanwhile gets its verdict — unless it
+    /// began before the network last changed, when one more check follows it. A check is not
+    /// stopped when the one who asked stops waiting (the next network event would otherwise cancel
+    /// every check before it decided anything). One that does not answer gets until `deadAfter`
+    /// seconds — of the network being there — before it counts as dead; any sign of life on it
+    /// meanwhile (a large transfer can hold the check up) keeps it.
+    @discardableResult
+    public func verifyLink(_ socket: String, ssh: String, deadAfter: TimeInterval, why: String? = nil) async -> Bool? {
+        if let running = linkChecks[socket] {
+            let verdict = await running.task.value
+            if running.startedAt >= networkChangedAt || verdict == false { return verdict }
+            if let next = linkChecks[socket], next.startedAt >= networkChangedAt { return await next.task.value }
+        }
+        let started = Self.uptime
+        let deadAfter = max(deadAfter, 0.5)
+        let signsOfLife = self.signsOfLife, canJudge = self.canJudge
+        let task = Task<Bool?, Never> { [weak self] in
+            let since = Date()
+            var verdict = await Self.probe(socket, ssh: ssh, timeout: min(8, deadAfter))
+            while verdict == nil {
+                // Only time with the network counts; without it nothing is decided.
+                guard await canJudge() else { break }
+                if await signsOfLife(socket, since) { verdict = true; break }
+                let left = deadAfter - (Self.uptime - started)
+                if left <= 0 { verdict = false; break }
+                try? await Task.sleep(for: .seconds(min(5, deadAfter / 3, left)))
+                verdict = await Self.probe(socket, ssh: ssh, timeout: min(10, max(1, deadAfter - (Self.uptime - started))))
+            }
+            await self?.linkJudged(socket, verdict, ssh: ssh, deadAfter: deadAfter, took: Self.uptime - started, why: why)
+            return verdict
+        }
+        linkChecks[socket] = LinkCheck(startedAt: started, task: task)
+        let verdict = await task.value
+        if linkChecks[socket]?.startedAt == started { linkChecks[socket] = nil }
+        return verdict
+    }
+
+    private func linkJudged(_ socket: String, _ verdict: Bool?, ssh: String, deadAfter: TimeInterval, took: TimeInterval, why: String?) async {
+        let host = targets[socket]?.key
+        let asked = why.map { "; checked because " + $0 } ?? ""
+        switch verdict {
+        case true?:
+            confirmed[socket] = Self.uptime
+            linkVerified[socket] = Self.uptime
+            ConnectionLog.shared.info("Checked a connection: it still reaches its server (\(Self.seconds(took))\(asked))", host: host)
+            if let host { HostLinks.post(.linkAlive(host)) }
+        case false?:
+            ConnectionLog.shared.notice("Closed a connection that no longer reaches its server (no answer in \(Self.seconds(took))\(asked))", host: host)
+            await Self.close(socket: socket, ssh: ssh, directory: socketDirectory)
+            forget(socket: socket)
+            // Through a jump host: the jump host's own connection may be what died (the target
+            // behind it can be fine). Checked too, or the next sign-in would hang on it.
+            if let jump = jumpSockets.removeValue(forKey: socket), Self.isSocket(jump) {
+                Task { await self.verifyLink(jump, ssh: ssh, deadAfter: deadAfter, why: "a connection through it stopped answering") }
+            }
+            if let host { HostLinks.post(.connectionEnded(host)) }
+        case nil:
+            break
+        }
     }
 
     // MARK: Sockets
@@ -710,17 +1039,119 @@ public actor SharedConnections {
 
     /// `ssh -O check` on the socket itself: the master process answers (says nothing about its link).
     public nonisolated static func check(_ socket: String, ssh: String) async -> Check {
-        let r = await ProcessRunner.run(ssh, arguments: ["-F", "/dev/null", "-o", "ControlPath=\(socket)", "-O", "check", "tether-master"],
+        let r = await ProcessRunner.run(ssh, arguments: controlArguments(.check, socket: socket),
                                         timeout: 5)
         if r.timedOut { return .noAnswer }
         return r.status == 0 ? .alive : .gone
     }
 
+    /// Whether a shared connection still reaches its server: true (alive), false (clearly dead),
+    /// nil (no answer in time). It asks the server, over the connection's own link, to forward to a
+    /// closed port on itself (`-W 127.0.0.1:9`): nothing runs on the server — no session, no shell,
+    /// no login scripts, nothing counted against its session limit —, and the server's refusal,
+    /// which comes at once, is the answer (also where forwarding is forbidden, and on network
+    /// devices). Only silence means the link is gone. No new login can happen: no config file,
+    /// BatchMode, and a ProxyCommand that fails at once if the socket does not answer.
+    public nonisolated static func probe(_ socket: String, ssh: String, timeout: TimeInterval) async -> Bool? {
+        let r = await ProcessRunner.run(ssh, arguments: [
+            "-F", "/dev/null", "-o", "ControlPath=\(socket)", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
+            "-o", "ProxyCommand=/usr/bin/false", "-W", "127.0.0.1:9", "tether-master",
+        ], input: Data(), timeout: timeout)
+        return probeVerdict(status: r.status, stderr: r.errorOutput, timedOut: r.timedOut)
+    }
+
+    /// What `probe`'s ssh said, as a verdict (see `probe`).
+    nonisolated static func probeVerdict(status: Int32, stderr: String, timedOut: Bool) -> Bool? {
+        if timedOut { return nil }
+        if isLostConnectionMessage(stderr) { return false }
+        // The server answered: it refused the forward (the usual answer), or forwarded somewhere.
+        let l = stderr.lowercased()
+        if status != 255 || l.contains("forwarding request failed") || l.contains("open failed")
+            || l.contains("administratively prohibited") || l.contains("refused by peer") { return true }
+        return false
+    }
+
     /// What a client of a shared connection says when the connection is not there: its ProxyCommand
     /// (`/usr/bin/false`) ended at once, or the socket refused it.
-    public nonisolated static func isLostConnectionMessage(_ stderr: String) -> Bool {
-        stderr.contains("UNKNOWN port 65535") || stderr.contains("Control socket connect")
+    public nonisolated static func isLostConnectionMessage(_ stderr: String) -> Bool { SSHFailure.isLostSharedConnection(stderr) }
+
+    /// What `ssh -O` asks a shared connection's master (answered by the master itself, on this Mac).
+    public enum ControlCommand: String, Sendable { case check, exit, stop }
+
+    /// ssh's arguments for `command` on the master at `socket` (no ssh_config read: only the socket counts).
+    public nonisolated static func controlArguments(_ command: ControlCommand, socket: String) -> [String] {
+        ["-F", "/dev/null", "-o", "ControlPath=\(socket)", "-O", command.rawValue, "tether-master"]
     }
+
+    /// Asks the master at `socket` (`ssh -O`), waiting at most `timeout`.
+    @discardableResult
+    public nonisolated static func control(_ command: ControlCommand, socket: String, ssh: String, timeout: TimeInterval = 5) async -> ProcessResult {
+        await ProcessRunner.run(ssh, arguments: controlArguments(command, socket: socket), timeout: timeout)
+    }
+
+    /// Ends a shared connection: `ssh -O exit`; one whose master does not even answer that (stuck)
+    /// is ended as a process — found by its own socket in its arguments, so only the master Tether
+    /// started for it — and its socket removed (inside Tether's socket folder only).
+    public nonisolated static func close(socket: String, ssh: String, directory: URL = AppPaths.controlSocketDirectory) async {
+        let r = await ProcessRunner.run(ssh, arguments: controlArguments(.exit, socket: socket),
+                                        timeout: 5)
+        // It took the request (it is ending), or there was none to ask.
+        guard r.timedOut || (r.status != 0 && isSocket(socket)) else { return }
+        let stuck = masterProcesses(socket: socket)
+        guard !stuck.isEmpty else { return }
+        ConnectionLog.shared.notice("A connection did not answer when asked to close; its ssh was ended")
+        for pid in stuck { kill(pid, SIGTERM) }
+        try? await Task.sleep(for: .seconds(1))
+        // Only those found stuck: a new connection started meanwhile on the same socket (a tab
+        // reconnecting) is not touched, nor is its socket.
+        let now = masterProcesses(socket: socket)
+        for pid in now where stuck.contains(pid) { kill(pid, SIGKILL) }
+        if now.allSatisfy(stuck.contains) { removeStaleSocket(socket, directory: directory) }
+    }
+
+    /// This user's ssh processes that are the master of `socket` (`ControlMaster=yes` and
+    /// `ControlPath=<socket>` among their arguments).
+    nonisolated static func masterProcesses(socket: String) -> [pid_t] {
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(count) + 32)
+        let n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        guard n > 0 else { return [] }
+        let me = getuid()
+        return pids.prefix(Int(n)).filter { pid in
+            guard pid > 0 else { return false }
+            var info = proc_bsdinfo()
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0, info.pbi_uid == me else { return false }
+            let args = arguments(of: pid)
+            return args.contains("ControlMaster=yes") && args.contains("ControlPath=\(socket)")
+        }
+    }
+
+    /// A process's arguments (KERN_PROCARGS2); empty when they cannot be read.
+    nonisolated static func arguments(of pid: pid_t) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > 4 else { return [] }
+        let argc = Int(buffer.withUnsafeBytes { $0.load(as: Int32.self) })
+        var i = 4
+        // The executable's path, then padding.
+        while i < size, buffer[i] != 0 { i += 1 }
+        while i < size, buffer[i] == 0 { i += 1 }
+        var args: [String] = []
+        while i < size, args.count < argc {
+            let start = i
+            while i < size, buffer[i] != 0 { i += 1 }
+            args.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
+
+    /// The server refused one more session on a connection that is alive (sshd's MaxSessions, or a
+    /// server that allows a single session): nothing ran.
+    public nonisolated static func isSessionRefused(_ message: String) -> Bool { SSHFailure.isSessionRefused(message) }
 
     public nonisolated static func isSocket(_ path: String) -> Bool {
         var st = stat()
@@ -756,10 +1187,42 @@ final class MasterLauncher: @unchecked Sendable {
     private var tail: [String] = []
     /// ssh's steps worth reporting (`DiagnosticText.isMilestone`), for the Connection Log.
     private var steps: [String] = []
-    /// When ssh last wrote to its log (system uptime): a sign-in stuck without a word is ended.
+    /// When ssh last wrote to its log or a question was open (system uptime): a sign-in stuck
+    /// without a word is ended.
     private var lastProgress = ProcessInfo.processInfo.systemUptime
     private var environment: [String: String] = [:]
+    /// A question was answered: the server is checking it now (PAM, LDAP, a push approval).
+    private var answered = false
+    private var wasAsking = false
+    private var answersSeen = 0
+    /// Why Tether ended it, if it did.
+    private var _stop: Stop?
+    /// Silence allowed before any question: a server stuck in the key exchange.
     static let silentLimit: TimeInterval = 45
+    /// Silence allowed after an answer: checking it may take a while (and sshd's own login time is
+    /// two minutes).
+    static let answeredLimit: TimeInterval = 120
+    static let stoppedMessage = "The sign-in was stopped"
+
+    enum Stop: Sendable {
+        /// Stopped by Tether (a tab closed, Retry, stuck before any question): nothing was judged.
+        case stopped
+        /// An answer was sent and the server said nothing for `answeredLimit`.
+        case unanswered
+    }
+
+    var stop: Stop? { lock.withLock { _stop } }
+
+    /// Sign-ins under way now (their ssh not yet backgrounded as the connection's master).
+    private static let signingIn = OSAllocatedUnfairLock<[ObjectIdentifier: MasterLauncher]>(initialState: [:])
+    nonisolated(unsafe) private static var quitting = false
+
+    /// Tether quits: sign-ins under way stop (a server that never answers would keep their ssh
+    /// waiting after Tether is gone), and none starts any more.
+    static func stopAllForQuit() {
+        quitting = true
+        for launcher in signingIn.withLock({ Array($0.values) }) { launcher.cancel() }
+    }
 
     init(directory: URL) {
         logPath = directory.appendingPathComponent("connect-\(UUID().uuidString.prefix(8)).log").path
@@ -769,7 +1232,7 @@ final class MasterLauncher: @unchecked Sendable {
     var milestones: [String] { lock.withLock { steps } }
 
     func cancel() {
-        lock.lock(); cancelled = true; let p = process; lock.unlock()
+        lock.lock(); cancelled = true; if _stop == nil { _stop = .stopped }; let p = process; lock.unlock()
         if let p, p.isRunning { p.terminate() }
     }
 
@@ -782,7 +1245,13 @@ final class MasterLauncher: @unchecked Sendable {
         p.environment = ChildEnvironment.base.merging(environment) { $1 }
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        // What the jump host's ssh (its ProxyCommand) says goes to stderr, not to `-E`'s log: kept
+        // apart, since a server's banner arrives there too and must not pass for ssh's own words.
+        let errorPath = logPath + ".err"
+        FileManager.default.createFile(atPath: errorPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        let errors = FileHandle(forWritingAtPath: errorPath)
+        p.standardError = errors ?? FileHandle.nullDevice
+        defer { try? errors?.close(); unlink(errorPath) }
         let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
         timer.schedule(deadline: .now() + 0.15, repeating: 0.15)
         self.environment = environment
@@ -796,15 +1265,17 @@ final class MasterLauncher: @unchecked Sendable {
         let status: Int32 = await withCheckedContinuation { cont in
             p.terminationHandler = { cont.resume(returning: $0.terminationReason == .uncaughtSignal ? -2 : $0.terminationStatus) }
             lock.lock()
-            let stop = cancelled
+            let stop = cancelled || Self.quitting
             if !stop { process = p }
             lock.unlock()
             if stop { p.terminationHandler = nil; cont.resume(returning: -2); return }
+            Self.signingIn.withLock { $0[ObjectIdentifier(self)] = self }
             do {
                 try p.run()
                 AskPassBridge.shared.bindToken(environment, pid: p.processIdentifier)
             } catch { p.terminationHandler = nil; cont.resume(returning: -1) }
         }
+        Self.signingIn.withLock { _ = $0.removeValue(forKey: ObjectIdentifier(self)) }
         timer.cancel()
         readLog(onLine)
         lock.withLock { process = nil }
@@ -813,18 +1284,46 @@ final class MasterLauncher: @unchecked Sendable {
         let handle = status == 0 ? FileHandle(forUpdatingAtPath: logPath) : nil
         unlink(logPath)
         if status == 0 { try? handle?.truncate(atOffset: 0); return .success(log: handle) }
-        let log = lock.withLock { tail }
-        if status == -2 { return .failure("The sign-in was stopped", log: log) }
-        return .failure("ssh exited with code \(status)", log: log)
+        var log = lock.withLock { tail }
+        if status == -2 { return .failure(Self.stoppedMessage, log: log) }
+        // Only the jump host's words about the server behind it are taken from there.
+        let jump = Self.jumpWords(in: (try? String(contentsOfFile: errorPath, encoding: .utf8)) ?? "")
+        log += jump
+        return .failure(jump.first ?? "ssh exited with code \(status)", log: log)
+    }
+
+    /// The jump host's lines saying it could not reach the server, from what ssh printed.
+    static func jumpWords(in text: String) -> [String] {
+        Array(text.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter(SSHFailure.isJumpCannotReachTarget).prefix(4))
     }
 
     /// A server that answered and then went silent in the middle of signing in (a key exchange or
     /// an authentication step that never finishes): stopped after a while, unless a question waits
     /// for the user — so every tab, file window and transfer waiting for this server is not stuck.
+    ///
+    /// The time a question is in front of the user does not count: they may take minutes. A
+    /// question nobody can see (held back for a tab in the background, waiting for Tether to be
+    /// unlocked) counts like silence: the sign-in ends, and is asked again when the user is back.
+    /// After an answer the server gets `answeredLimit` to check it.
     private func stopIfStuck() {
-        let idle = lock.withLock { ProcessInfo.processInfo.systemUptime - lastProgress }
-        guard idle > Self.silentLimit, !AskPassBridge.shared.isAsking(environment: environment) else { return }
-        ConnectionLog.shared.problem("A sign-in made no progress for \(Int(Self.silentLimit)) s; stopped", .signIn, detail: milestones.suffix(6).joined(separator: "\n"))
+        let now = ProcessInfo.processInfo.systemUptime
+        let asking = AskPassBridge.shared.isAsking(environment: environment)
+        let waitsOnUser = AskPassBridge.shared.waitsOnUser(environment: environment)
+        // Answers given at once (remembered, from the keychain) are never seen as a question open.
+        let answers = AskPassBridge.shared.answerCount(environment: environment)
+        let (idle, limit, afterAnswer): (TimeInterval, TimeInterval, Bool) = lock.withLock {
+            if waitsOnUser { lastProgress = now }
+            if asking { wasAsking = true }
+            else if wasAsking { wasAsking = false; answered = true; lastProgress = now }
+            if answers > answersSeen { answersSeen = answers; answered = true; lastProgress = now }
+            return (now - lastProgress, answered ? Self.answeredLimit : Self.silentLimit, answered)
+        }
+        guard !waitsOnUser, idle > limit else { return }
+        lock.withLock { if _stop == nil { _stop = afterAnswer ? .unanswered : .stopped } }
+        ConnectionLog.shared.problem(afterAnswer ? "The server did not answer the sign-in for \(Int(limit)) s after it was answered; stopped"
+                                                 : "A sign-in made no progress for \(Int(limit)) s; stopped",
+                                     .signIn, detail: milestones.suffix(6).joined(separator: "\n"))
         cancel()
     }
 
@@ -853,6 +1352,85 @@ final class MasterLauncher: @unchecked Sendable {
     }
 }
 
+/// What the user's ssh_config sets (from `ssh -G`) that Tether's own options have to respect.
+public struct UserConfig: Sendable, Equatable {
+    /// ServerAliveInterval / ServerAliveCountMax (0 interval: none set).
+    public var serverAliveInterval = 0
+    public var serverAliveCountMax = 3
+    /// The user set a ConnectTimeout of their own.
+    public var setsConnectTimeout = false
+    /// A RemoteCommand is set: Tether's own commands replace it (`RemoteCommand=none`).
+    public var remoteCommand = false
+
+    public init(serverAliveInterval: Int = 0, serverAliveCountMax: Int = 3, setsConnectTimeout: Bool = false, remoteCommand: Bool = false) {
+        self.serverAliveInterval = serverAliveInterval
+        self.serverAliveCountMax = serverAliveCountMax
+        self.setsConnectTimeout = setsConnectTimeout
+        self.remoteCommand = remoteCommand
+    }
+
+    static func parse(_ output: String) -> UserConfig {
+        var c = UserConfig()
+        for line in output.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+            switch parts[0].lowercased() {
+            case "serveraliveinterval": c.serverAliveInterval = Int(value) ?? 0
+            case "serveralivecountmax": c.serverAliveCountMax = Int(value) ?? 3
+            case "connecttimeout": c.setsConnectTimeout = value.lowercased() != "none" && Int(value) != nil
+            case "remotecommand": c.remoteCommand = value.lowercased() != "none" && !value.isEmpty
+            default: break
+            }
+        }
+        return c
+    }
+}
+
+/// The names ssh itself uses on the way to each target (`SharedConnections.parseNames`), readable
+/// from the app at once: a password question naming one of them belongs to that connection.
+public enum ResolvedNames {
+    nonisolated(unsafe) private static var table: [String: (names: Set<String>, hasJumps: Bool)] = [:]
+    nonisolated(unsafe) private static var remoteCommands: Set<String> = []
+    private static let lock = NSLock()
+
+    nonisolated(unsafe) private static var servers: [String: String] = [:]
+
+    static func noteServer(_ targetKey: String, _ destination: String) { lock.withLock { servers[targetKey] = destination } }
+
+    /// A short, stable name for the server a target reaches (host name, port, user as ssh works them
+    /// out — the same for every alias of it), or nil before it was worked out this run.
+    public static func serverID(for targetKey: String) -> String? {
+        guard let destination = lock.withLock({ servers[targetKey] }) else { return nil }
+        return shortHash(destination)
+    }
+
+    /// A short hash naming a server or host without its name (settings keep this, not the name).
+    public static func shortHash(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The target's ssh_config sets a RemoteCommand, which Tether's tabs do not run (told once).
+    static func noteRemoteCommand(_ targetKey: String) {
+        let new = lock.withLock { remoteCommands.insert(targetKey).inserted }
+        if new {
+            ConnectionLog.shared.notice("ssh_config sets a RemoteCommand for this host; Tether's tabs run their own instead", host: targetKey)
+        }
+    }
+
+    /// Whether the target's ssh_config sets a RemoteCommand (that Tether's tabs do not run).
+    public static func setsRemoteCommand(_ targetKey: String) -> Bool { lock.withLock { remoteCommands.contains(targetKey) } }
+
+    static func note(_ targetKey: String, _ value: (names: Set<String>, hasJumps: Bool)) {
+        lock.withLock { table[targetKey] = value }
+    }
+
+    /// What ssh last worked out for the target with this key (nil: not resolved yet this run).
+    public static func names(for targetKey: String) -> (names: Set<String>, hasJumps: Bool)? {
+        lock.withLock { table[targetKey] }
+    }
+}
+
 /// Which tabs wait for each sign-in question (see `SharedConnections.publishInterest`), readable
 /// from the app at once.
 public enum SignInInterest {
@@ -865,7 +1443,18 @@ public enum SignInInterest {
     nonisolated(unsafe) private static var table: [String: Waiting] = [:]
     private static let lock = NSLock()
 
-    static func replace(_ new: [String: Waiting]) { lock.withLock { table = new } }
+    /// Posted (on the main thread) when who waits for a sign-in changed: a question held back may be
+    /// shown now (a file window started waiting for it).
+    public static let changed = Notification.Name("TetherSignInInterestChanged")
+
+    static func replace(_ new: [String: Waiting]) {
+        let differs = lock.withLock { () -> Bool in
+            let differs = table.mapValues(\.sessions) != new.mapValues(\.sessions) || table.mapValues(\.unowned) != new.mapValues(\.unowned)
+            table = new
+            return differs
+        }
+        if differs { DispatchQueue.main.async { NotificationCenter.default.post(name: changed, object: nil) } }
+    }
 
     /// Who waits for the sign-in that asks with this askpass token (nil: not a shared sign-in).
     public static func waiting(for token: String) -> Waiting? { lock.withLock { table[token] } }

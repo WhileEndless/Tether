@@ -46,7 +46,10 @@ struct SessionPane: View {
         if session.serverWaitsInTerminal, p.failure == nil { return false }
         switch session.phase {
         case .connecting: return true
-        case .waiting: return p.failure != nil || !session.wasOnline || p.includesRestore
+        // A tab that was working here and lost its connection gets the small banner while it
+        // re-attaches (the terminal stays readable and scrollable); the card is for failures and for
+        // tabs coming back after a relaunch.
+        case .waiting: return p.failure != nil || !session.wasOnline || (p.includesRestore && session.restoredFromDisk)
         case .dead: return (!session.wasOnline && p.failure != nil) || p.hostKeyChange != nil
         default: return false
         }
@@ -67,7 +70,9 @@ struct SessionPane: View {
                 if let progress = session.progress, showsProgressCard {
                     ConnectionProgressCard(session: session, progress: progress)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(.black.opacity(0.08))
+                        // Dims the terminal without taking its clicks: it can still be scrolled and
+                        // selected from around the card.
+                        .background(Color.black.opacity(0.08).allowsHitTesting(false))
                         .transition(.opacity.combined(with: .scale(scale: 0.97)))
                 } else {
                     SessionBanner(session: session)
@@ -142,6 +147,7 @@ struct SessionPane: View {
             .animation(.snappy, value: browsingHistory)
             .animation(.snappy, value: commandSelection)
             .animation(.smooth(duration: 0.25), value: session.progress == nil)
+            TmuxNoticeStrip(session: session)
             SessionFooter(session: session)
         }
         .onDisappear { session.isOnScreen = false }
@@ -203,6 +209,8 @@ struct SessionBanner: View {
                                 Text("Send what you typed while away?").fontWeight(.semibold)
                                 Text("\(session.heldInput.count) characters, typed while the connection was lost")
                                     .font(.caption).foregroundStyle(.secondary)
+                                Text(session.heldInputPreview())
+                                    .font(.caption.monospaced()).lineLimit(1).truncationMode(.head)
                             }
                             Button("Send") { session.sendHeldInput() }
                                 .prominentGlassButtonStyle()
@@ -461,6 +469,61 @@ struct FilesPane: View {
         FileBrowserView(target: tab.target, standalone: true, initialPath: tab.path,
                         openTerminal: { dir in state.connect(tab.target, directory: dir) },
                         external: model.fileTabs.browser(for: tab))
+    }
+}
+
+/// Once per server, ever: a tab of a server without tmux or screen says what that means, with a
+/// link to how to install tmux. No button takes Return (it appears while the user may be typing).
+struct TmuxNoticeStrip: View {
+    @Environment(AppModel.self) private var model
+    let session: TerminalSession
+    /// Shown in this tab (it stays until closed, also once the server is recorded).
+    @State private var showing = false
+    @State private var showHow = false
+
+    /// A plain shell only because the server has no tmux or screen (not a host set to plain shells,
+    /// not Windows, not a device, not this Mac).
+    private var applies: Bool {
+        session.persistence == .plain && session.phase.isOnline && !session.descriptor.target.isLocal
+            && !session.platform.isWindows && session.descriptor.persistence != .off
+            && !PlatformCache.shared.isDevice(session.descriptor.target.key)
+            && !model.settings.noTmuxSuggestion.contains(session.descriptor.target.key)
+    }
+
+    /// The server's short hash (its connection's resolved name), or the host's when that is not known
+    /// (no shared connection): never the name itself.
+    private var serverKey: String {
+        ResolvedNames.serverID(for: session.descriptor.target.key) ?? ResolvedNames.shortHash("host:" + session.descriptor.target.key)
+    }
+
+    var body: some View {
+        Group {
+            if showing {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                    Text("This server has no tmux: shells here end when the connection drops.")
+                        .lineLimit(1).truncationMode(.tail)
+                    Button("How to Install…") { showHow = true }
+                        .buttonStyle(.link)
+                        .popover(isPresented: $showHow, arrowEdge: .top) { TmuxSuggestion(session: session) }
+                    Spacer()
+                    Button { showing = false } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless)
+                        .help("Close")
+                }
+                .font(.callout)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(.orange.opacity(0.08))
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: showing)
+        .onChange(of: applies, initial: true) { _, now in
+            // Recorded the moment it is shown here: never again for this server, in any tab.
+            guard now, !showing, !model.settings.tmuxNoticeShown.contains(serverKey) else { return }
+            model.settings.tmuxNoticeShown.append(serverKey)
+            showing = true
+        }
     }
 }
 

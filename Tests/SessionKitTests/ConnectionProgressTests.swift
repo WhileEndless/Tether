@@ -35,4 +35,24 @@ import Testing
         #expect(ConnectionProgress.diagnose("connect to host 192.0.2.9 port 22: Connection refused") != nil)
         #expect(ConnectionProgress.diagnose("debug1: Connection established.") == nil)
     }
+
+    /// What the jump host said about the server behind it is the cause shown — not the generic
+    /// "closed during the handshake" ssh adds after it, and not "the server refused" (it was the
+    /// jump host's word about the server, not this Mac's about the jump host).
+    @Test func aJumpHostsWordsAreTheCauseShown() {
+        var p = ConnectionProgress()
+        p.ingest("channel 0: open failed: connect failed: Connection refused")
+        p.ingest("stdio forwarding failed")
+        p.ingest("kex_exchange_identification: Connection closed by remote host")
+        p.ingest("Connection closed by UNKNOWN port 65535")
+        #expect(p.failure == "The jump host answered, but could not reach the server (Connection refused).")
+        let lines = ["channel 0: open failed: connect failed: Connection timed out", "stdio forwarding failed",
+                     "kex_exchange_identification: Connection closed by remote host"]
+        #expect(ConnectionProgress.diagnose(lines: lines)?.0 == "The jump host answered, but could not reach the server (Connection timed out).")
+        #expect(ConnectionProgress.diagnose("channel 0: open failed: administratively prohibited: open failed\nstdio forwarding failed")?.0
+                == "The jump host does not allow connections through it to this server.")
+        // Without a jump host the same words keep their plain meaning.
+        #expect(ConnectionProgress.diagnose("ssh: connect to host jump.example.com port 22: Connection refused")?.0
+                == "The server refused the connection.")
+    }
 }

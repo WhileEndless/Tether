@@ -6,6 +6,7 @@ import RecordingKit
 import TerminalUI
 import SSHTransport
 import TetherCore
+import UserNotifications
 
 /// Optional lock for the whole app (Settings ▸ Security ▸ App Lock).
 ///
@@ -65,9 +66,10 @@ final class AppLock {
     /// Touch ID can unlock: the system lock, or a Tether password with "also unlock with Touch ID".
     var canUseSystemUnlock: Bool { mode == .system || (mode == .password && settings.unlockWithTouchID) }
 
-    /// Touch ID / Apple Watch / the Mac's password.
-    func unlockWithSystem() async {
-        guard isLocked, canUseSystemUnlock, !unlocking, !screenAway else { return }
+    /// Touch ID / Apple Watch / the Mac's password. `byUser`: a click on Unlock — someone is there,
+    /// whatever the last screen notification said (one can be missed, e.g. switching users).
+    func unlockWithSystem(byUser: Bool = true) async {
+        guard isLocked, canUseSystemUnlock, !unlocking, byUser || !screenAway else { return }
         // With a Tether password, Touch ID needs the keychain copy of the very same key.
         unlocking = true
         // The keychain and the recordings' headers are read in the background.
@@ -105,14 +107,20 @@ final class AppLock {
 
     private func didUnlock(key: SymmetricKey?) {
         ConnectionLog.shared.info("Tether was unlocked", .app)
+        // The user just proved who they are: a saved password needed right now does not ask again.
+        SecretGate.shared.noteAuthenticated()
         failures = 0
         retryAfter = nil
         installKey(key)
         isLocked = false
+        // Recordings over the limit while locked are compressed now (they waited for the key).
+        RecordingStore.requestQuotaEnforcement()
         showHiddenWindows()
         let work = afterFirstUnlock
         afterFirstUnlock = []
         work.forEach { $0() }
+        // Whatever stopped for the lock (a sign-in ended while locked, a transfer that waits) goes on.
+        HostLinks.shared.post(.unlocked)
     }
 
     /// Makes the recording key available to readers and (when encryption is on) new recordings.
@@ -129,12 +137,18 @@ final class AppLock {
 
     func lock() {
         guard mode != .off, !isLocked else { return }
-        ConnectionLog.shared.info("Tether was locked", .app, detail: "Tabs keep running; their earlier output and remembered passwords are let go")
+        ConnectionLog.shared.info("Tether was locked", .app,
+                                  detail: "Tabs keep running; their earlier output is let go. Remembered passwords are kept but not used, and nothing signs in, until Tether is unlocked")
         isLocked = true
         RecordingCrypto.key = nil          // open recorders keep writing with their own copy
+        RecordingReader.forgetDecrypted()
+        // Remembered passwords stay (forgotten only with "Also forget them when the screen locks",
+        // see SecretGate): while locked no sign-in starts (`SignInEvents.gatekeeper`), and a
+        // question asked meanwhile is not answered from them (`AppModel.answer`).
         SecretGate.shared.lock()
         AppModel.shared.quickConnectPasswords.removeAll()
-        AppModel.shared.passwordCache.removeAll()
+        // What notifications showed of terminals' text goes from Notification Center too.
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
         TerminalRegistry.shared.releaseEarlierOutput()
         AskPassPanel.shared.update(nil)
         // Sheets show the lock screen themselves (`appLockCover`), so Tether can be unlocked from
@@ -162,10 +176,27 @@ final class AppLock {
     }
 
     /// The Mac is asleep, its display is off, or its screen is locked: no one is there to answer Touch ID.
-    var screenAway: Bool { systemAsleep || displayAsleep || screenLocked }
+    var screenAway: Bool { systemAsleep || displayAsleep || screenLocked || sessionInactive }
     @ObservationIgnored private var systemAsleep = false
     @ObservationIgnored private var displayAsleep = false
     @ObservationIgnored private var screenLocked = false
+    /// Another user's session is in front (fast user switching).
+    @ObservationIgnored private var sessionInactive = false
+    @ObservationIgnored private var awaitingPresence: [CheckedContinuation<Void, Never>] = []
+
+    /// Suspends until someone can be at the Mac (screen awake and unlocked, this user's session in
+    /// front); at once when that is so.
+    func waitUntilPresent() async {
+        guard screenAway else { return }
+        await withCheckedContinuation { awaitingPresence.append($0) }
+    }
+
+    private func presenceChanged() {
+        guard !screenAway else { return }
+        let waiting = awaitingPresence
+        awaitingPresence = []
+        waiting.forEach { $0.resume() }
+    }
 
     private func observeSleep() {
         guard !observing else { return }
@@ -178,13 +209,33 @@ final class AppLock {
         let workspace = NSWorkspace.shared.notificationCenter
         let distributed = DistributedNotificationCenter.default()
         on(workspace, NSWorkspace.willSleepNotification) { $0.systemAsleep = true; $0.lockIfWanted() }
-        on(workspace, NSWorkspace.didWakeNotification) { $0.systemAsleep = false; $0.offerSystemUnlock() }
+        on(workspace, NSWorkspace.didWakeNotification) { $0.systemAsleep = false; $0.presenceChanged(); $0.offerSystemUnlock() }
         on(workspace, NSWorkspace.screensDidSleepNotification) { $0.displayAsleep = true; $0.lockIfWanted() }
-        on(workspace, NSWorkspace.screensDidWakeNotification) { $0.displayAsleep = false; $0.offerSystemUnlock() }
+        on(workspace, NSWorkspace.screensDidWakeNotification) { $0.displayAsleep = false; $0.presenceChanged(); $0.offerSystemUnlock() }
         on(distributed, .init("com.apple.screenIsLocked")) { $0.screenLocked = true; $0.lockIfWanted() }
-        on(distributed, .init("com.apple.screenIsUnlocked")) { $0.screenLocked = false; $0.offerSystemUnlock() }
+        on(distributed, .init("com.apple.screenIsUnlocked")) { $0.screenLocked = false; $0.presenceChanged(); $0.offerSystemUnlock() }
+        // Fast user switching: another user in front is like a locked screen; coming back clears
+        // every "away" flag (a notification missed meanwhile must not leave Unlock dead).
+        on(workspace, NSWorkspace.sessionDidResignActiveNotification) { $0.sessionInactive = true; $0.lockIfWanted() }
+        on(workspace, NSWorkspace.sessionDidBecomeActiveNotification) {
+            $0.sessionInactive = false
+            $0.systemAsleep = false
+            $0.displayAsleep = false
+            $0.presenceChanged()
+            $0.offerSystemUnlock()
+        }
         // Coming back to Tether (a click on its window, the Dock, ⌘Tab) asks for Touch ID right away.
-        on(NotificationCenter.default, NSApplication.didBecomeActiveNotification) { $0.offerSystemUnlock() }
+        // Someone is at the Mac then (nothing becomes active behind a locked screen): an "away" flag
+        // whose notification was missed must not hold sign-ins back for good.
+        on(NotificationCenter.default, NSApplication.didBecomeActiveNotification) {
+            if $0.screenAway, !$0.sessionInactive {
+                $0.systemAsleep = false
+                $0.displayAsleep = false
+                $0.screenLocked = false
+                $0.presenceChanged()
+            }
+            $0.offerSystemUnlock()
+        }
     }
 
     private func lockIfWanted() {
@@ -196,7 +247,7 @@ final class AppLock {
     /// the time the user is back, leaving only the Unlock button.)
     func offerSystemUnlock() {
         guard isLocked, canUseSystemUnlock, !unlocking, !screenAway, NSApp.isActive else { return }
-        Task { await unlockWithSystem() }
+        Task { await unlockWithSystem(byUser: false) }
     }
 
     /// Suspends until Tether is unlocked (immediately if it is not locked).

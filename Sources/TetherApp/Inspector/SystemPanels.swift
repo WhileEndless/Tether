@@ -40,7 +40,7 @@ struct GPUPanel: View {
         .task {
             while !Task.isCancelled {
                 await monitor.refreshGPUProcesses()
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(monitor.panelWait(5)))
             }
         }
     }

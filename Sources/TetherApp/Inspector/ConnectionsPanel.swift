@@ -72,7 +72,7 @@ struct ConnectionsPanel: View {
             while !Task.isCancelled {
                 await monitor.refreshConnections()
                 await monitor.refreshListeningPorts()
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(monitor.panelWait(10)))
             }
         }
     }
@@ -350,9 +350,6 @@ struct RemoteSessionsPanel: View {
         Set(model.sessions.sessions(for: target.key).filter { !$0.phase.isDead }.map(\.descriptor.remoteSessionName))
     }
 
-    private var leftoverCount: Int {
-        monitor.remoteSessions.filter { $0.isTether && !openNames.contains($0.name) && !$0.attached }.count
-    }
 
     var body: some View {
         List {
@@ -362,16 +359,16 @@ struct RemoteSessionsPanel: View {
                 HStack {
                     Text("tmux / screen sessions on this host")
                     Spacer()
-                    let leftovers = leftoverCount
-                    if leftovers > 0 {
-                        Button("Clean Up \(leftovers) Leftover…") {
+                    let detached = state.detachedSessions(on: target).count
+                    if detached > 0 {
+                        Button("Open or End \(detached) Detached…") {
                             state.cleanUpLeftovers(on: target)
                         }
                         .help("Open as tabs, or end, the detached Tether sessions that are not open in the app (asks first)")
                     }
                 }
             } footer: {
-                Text("Includes sessions you started yourself. Attach to continue where you left off; leftovers from closed tabs can be cleaned up.")
+                Text("Includes sessions you started yourself. Attach to continue where you left off: tabs closed while their work went on are still here.")
             }
         }
         .overlay {
@@ -397,6 +394,13 @@ private struct RemoteSessionRow: View {
     let monitor: RemoteMonitor
     let target: ConnectionTarget
 
+    private func kill() {
+        let key = target.key, name = entry.name
+        Task {
+            if await monitor.killRemoteSession(entry) { model.sessions.forgetLeftSession(on: key, named: name) }
+        }
+    }
+
     private var isOpen: Bool {
         model.sessions.sessions.contains { $0.descriptor.remoteSessionName == entry.name && !$0.phase.isDead }
     }
@@ -413,7 +417,7 @@ private struct RemoteSessionRow: View {
             Image(systemName: entry.kind == .tmux ? "rectangle.split.3x1" : "rectangle.on.rectangle")
             VStack(alignment: .leading) {
                 HStack(spacing: 6) {
-                Text(entry.name).uiFont(.callout, design: .monospaced)
+                Text({ let n = DisplayText.clean(entry.name, limit: 80); return n.isEmpty ? "Unnamed session" : n }()).uiFont(.callout, design: .monospaced)
                 if entry.isTether {
                     Text("Tether").uiFont(.caption2).padding(.horizontal, 4).background(Capsule().fill(.quaternary))
                 }
@@ -437,7 +441,7 @@ private struct RemoteSessionRow: View {
             }
             Spacer()
             Button(role: .destructive) {
-                Task { await monitor.killRemoteSession(entry) }
+                kill()
             } label: { Image(systemName: "xmark.circle") }
             .buttonStyle(.borderless)
             .help("Kill this session on the server")
@@ -452,7 +456,7 @@ private struct RemoteSessionRow: View {
             }
         }
         .contextMenu {
-            Button("Kill Session", role: .destructive) { Task { await monitor.killRemoteSession(entry) } }
+            Button("Kill Session", role: .destructive) { kill() }
         }
     }
 }

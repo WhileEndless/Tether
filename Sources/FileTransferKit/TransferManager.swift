@@ -108,6 +108,8 @@ public final class TransferItem: Identifiable {
     public internal(set) var totalBytes: Int64?
     /// Bytes moved so far (packed transfers).
     public internal(set) var bytesDone: Int64 = 0
+    /// When data last moved (a sign of life for its connection while that is being checked).
+    public internal(set) var lastActivity: Date?
     /// Cancelled, and its processes are being stopped.
     public internal(set) var isStopping = false
     /// Packed transfers: what is happening now.
@@ -126,11 +128,13 @@ public final class TransferItem: Identifiable {
 
     /// Called on completion (success or not), once.
     @ObservationIgnored public var completion: ((TransferItem) -> Void)?
-    @ObservationIgnored private var reported = false
+    @ObservationIgnored private(set) var reported = false
     /// Packed transfers: the group's completion (kept for Retry and for sending file by file).
     @ObservationIgnored var groupCompletion: (([TransferItem]) -> Void)?
     /// Retry was asked for (it is being sent again: not twice).
     @ObservationIgnored var retrying = false
+    /// Tried again by itself once already, after its connection failed it.
+    @ObservationIgnored var retriedByItself = false
 
     func report() {
         guard !reported else { return }
@@ -179,6 +183,14 @@ public final class TransferItem: Identifiable {
         case (.download, .scp): return Self.abbreviate(localURL.path)
         case (.download, .archive): return Self.abbreviate(localURL.path)
         }
+    }
+
+    /// A download someone is waiting to look at: into the folders for previews, drags to Finder and
+    /// copies for the clipboard.
+    var isInteractive: Bool {
+        guard direction == .download else { return false }
+        let path = localURL.standardizedFileURL.path + "/"
+        return [AppPaths.previewDirectory, AppPaths.clipboardDirectory].contains { path.hasPrefix($0.standardizedFileURL.path + "/") }
     }
 
     /// A failed transfer can be sent again from the start (with the same rules: nothing is overwritten).
@@ -332,7 +344,21 @@ public final class TransferManager {
     public private(set) var items: [TransferItem] = []
     /// Transfers being prepared (names checked, files counted).
     public private(set) var preparations: [TransferPreparation] = []
-    @ObservationIgnored private var jobs: [UUID: TransferJob] = [:]
+    @ObservationIgnored private var jobs: [UUID: TransferJob] = [:] {
+        didSet { keepAwake(!jobs.isEmpty) }
+    }
+    /// While a transfer runs the Mac does not go to sleep by itself (closing the lid still does).
+    @ObservationIgnored private var awake: NSObjectProtocol?
+
+    private func keepAwake(_ on: Bool) {
+        if on, awake == nil {
+            awake = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated],
+                                                          reason: "Transferring files")
+        } else if !on, let awake {
+            ProcessInfo.processInfo.endActivity(awake)
+            self.awake = nil
+        }
+    }
     /// When each job started (see `unansweredHosts`).
     @ObservationIgnored private var launched: [UUID: Date] = [:]
     /// Starts the queue again once a job has waited `TransferTimeouts.unanswered` (see `pump`).
@@ -616,26 +642,43 @@ public final class TransferManager {
     /// Sends a failed transfer again from the start, in its place in the list. The same rules as
     /// the first time: free names are chosen again (what the failed attempt left was removed),
     /// nothing is overwritten. Items whose source is gone fail with that reason.
-    public func retry(_ item: TransferItem) {
-        guard item.canRetry, items.contains(where: { $0.id == item.id }) else { return }
+    /// `byItself`: the automatic second try (`finished`): whoever waits for the first attempt is
+    /// told how this one ends.
+    public func retry(_ item: TransferItem, byItself: Bool = false) {
+        // Asked for by you: may sign in (and ask), also right after a sign-in was cancelled.
+        if !byItself { HostLinks.shared.signInWanted(item.target.key) }
+        guard item.canRetry, items.contains(where: { $0.id == item.id }) else {
+            if byItself { item.report() }
+            return
+        }
         let target = item.target
         let missing = item.direction == .upload
             ? (item.method == .archive ? item.sources : [item.localURL.path]).first { !LocalFiles.exists($0) } : nil
         if let missing {
             item.state = .failed("\((missing as NSString).lastPathComponent) is no longer on this Mac, so it cannot be sent again.")
+            if byItself { item.report() }
             return
         }
         item.retrying = true
         // A packed transfer tells its group again (an upload bar, a folder to refresh); a single
         // copy's completion belongs to the first attempt (a drag to Finder answers only once).
         let group = item.groupCompletion
+        // Retried by hand while the automatic try was still to come: who waits for the first attempt
+        // hears how this one ends instead (the first attempt then tells nobody).
+        // Handed on to the new copy (single copies only: a packed transfer's group is told through
+        // `group`, and its item keeps its own completion for when this try ends here).
+        let waiting = !item.reported && (byItself || item.retriedByItself) ? item.completion : nil
+        if waiting != nil, item.method == .scp { item.completion = nil }
         switch (item.direction, item.method) {
         case (.upload, .scp):
             items.removeAll { $0.id == item.id }
-            upload(item.localURL, to: item.remotePath, as: item.remoteName, target: target)
+            let again = upload(item.localURL, to: item.remotePath, as: item.remoteName, target: target,
+                               completion: waiting)
+            again.retriedByItself = true
         case (.download, .scp):
             items.removeAll { $0.id == item.id }
-            download(item.remotePath, to: item.localURL, target: target)
+            let again = download(item.remotePath, to: item.localURL, target: target, completion: waiting)
+            again.retriedByItself = true
         case (.download, .archive):
             items.removeAll { $0.id == item.id }
             let names = LocalFiles.uniqueNames(in: item.localURL, for: item.renames.map(\.to),
@@ -652,7 +695,11 @@ public final class TransferManager {
                 do {
                     guard let names = try await self.untilCancelled(prep, step: .checkingNames(wanted.count), {
                         try await fs.uniqueNames(in: dir, for: wanted, mayBeMissing: true)
-                    }) else { item.retrying = false; return }
+                    }) else {
+                        item.retrying = false
+                        if byItself { item.report() }
+                        return
+                    }
                     self.items.removeAll { $0.id == item.id }
                     self.uploadGroup(item.sources.map { URL(fileURLWithPath: $0) }, names: names, to: dir, target: target,
                                      fileCount: item.fileCount ?? item.sources.count, totalBytes: item.totalBytes, pack: true,
@@ -660,6 +707,9 @@ public final class TransferManager {
                 } catch {
                     item.retrying = false
                     item.state = .failed(error.localizedDescription)
+                    // Tried by itself: the server still cannot be reached — the next automatic try
+                    // (or the end, told to who waits) as for any other try.
+                    if byItself { self.finished(item) }
                 }
             }
         }
@@ -754,10 +804,14 @@ public final class TransferManager {
         let limit = min(max(policy.parallel, 1), 16)
         // A host whose sign-in hangs holds one place, never the whole queue: one transfer per host is
         // prepared at a time (the others of that host follow once its connection is there).
-        while let next = items.last(where: { item in
-                  item.state == .queued && !items.contains { preparing.contains($0.id) && $0.target.key == item.target.key }
-                      && mayStart(item, limit: limit)
-              }) {
+        func startable(_ item: TransferItem, limit: Int) -> Bool {
+            item.state == .queued && !items.contains { preparing.contains($0.id) && $0.target.key == item.target.key }
+                && mayStart(item, limit: limit)
+        }
+        // What someone is waiting to look at (a preview, a drop in Finder, a copy for the clipboard)
+        // goes first, also past the limit by a little: never behind a long transfer.
+        while let next = items.last(where: { $0.isInteractive && startable($0, limit: limit + 2) }) { start(next) }
+        while let next = items.last(where: { startable($0, limit: limit) }) {
             start(next)
         }
         checkUnansweredSoon()
@@ -804,6 +858,21 @@ public final class TransferManager {
         }
     }
 
+    /// How many times each transfer was tried again by itself (`retryKey`); cleared when it ends.
+    private var automaticTries: [String: Int] = [:]
+    static let automaticTryLimit = 6
+
+    /// The same transfer across its tries (each try is a new item).
+    static func retryKey(_ item: TransferItem) -> String {
+        "\(item.direction)|\(item.target.key)|\(item.remotePath)|\(item.localURL.path)"
+    }
+
+    /// Whether a running transfer to `host` (any of its names) moved data since `moment`.
+    public func movedData(host: String, since moment: Date) -> Bool {
+        items.contains { $0.state == .running && ($0.lastActivity ?? .distantPast) > moment
+            && HostLinks.sameServer($0.target.key, host) }
+    }
+
     private func finished(_ item: TransferItem) {
         jobs[item.id] = nil
         launched[item.id] = nil
@@ -811,6 +880,43 @@ public final class TransferManager {
         starting.remove(item.id)
         reservations[item.id] = nil
         item.isStopping = false
+        let key = Self.retryKey(item)
+        if item.state == .completed || item.state == .cancelled { automaticTries[key] = nil }
+        // Stopped by its connection (lost, or stalled): tried again by itself — a few times, waiting
+        // longer each time — who waits for it (a preview, a drop in Finder, an upload bar) hears
+        // only how the last try ends. Never overwriting: each try picks free names again.
+        let tries = automaticTries[key, default: 0]
+        if case .failed(let why) = item.state, tries < Self.automaticTryLimit, !quitting, TransferFailure.waitsForConnection(why) {
+            automaticTries[key] = tries + 1
+            item.retriedByItself = true
+            // Once the host can be reached again: at once when it signs in (or the network comes
+            // back, or Tether is unlocked); while the network is there, after a wait that grows with
+            // each try; without it, for as long as half an hour.
+            let host = item.target.key
+            let wait: TimeInterval = HostLinks.shared.networkUp && !TransferFailure.waitsForUser(why)
+                ? Backoff.delay(base: 5, doublings: tries, longest: 120, maxDoublings: 6) : 1800
+            let done = item.progress > 0.005 && item.progress < 1 ? " at \(Int((item.progress * 100).rounded()))%" : ""
+            item.note = "The connection to \(item.target.displayName) was lost\(done); it is sent again from the start once \(item.target.displayName) can be reached."
+            Task { @MainActor [weak self] in
+                _ = await HostLinks.shared.whenReachable(host, within: wait)
+                // Its own partial copy from this try is removed first: the retry then gets the name
+                // it had, not the next free one next to a broken file.
+                if item.direction == .upload, let removal = self?.removals[Self.remoteKey(item.target, item.uploadedPath)] {
+                    await removal.value
+                }
+                guard let self, !self.quitting, self.items.contains(where: { $0.id == item.id }), case .failed = item.state else {
+                    // Removed from the list, retried by hand or quitting: its count goes with it.
+                    self?.automaticTries[key] = nil
+                    item.report()
+                    return
+                }
+                self.retry(item, byItself: true)
+            }
+            pump()
+            return
+        }
+        // Ended for good (or tried enough): a Retry by hand gets its own tries again.
+        automaticTries[key] = nil
         item.report()
         pump()
     }
@@ -832,6 +938,28 @@ public final class TransferManager {
 
     private func reservedByOthers(_ id: UUID) -> Set<String> {
         reservations.filter { $0.key != id }.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+            .union(beingRemoved.values.reduce(into: Set<String>()) { $0.formUnion($1) })
+    }
+
+    /// What failed copies left on a server, while their removal runs (it may wait for the
+    /// connection): no other transfer — a retry least of all — takes those names before it is done,
+    /// or the late removal would delete the new copy.
+    private var beingRemoved: [UUID: Set<String>] = [:]
+    /// Those removals, by the partial copy's place (a retry of that copy waits for its own).
+    private var removals: [String: Task<Void, Never>] = [:]
+
+    /// Removes a failed copy's partial file on the server. A copy fails mostly because its
+    /// connection went away — then so does the first try to remove it: tried again once the
+    /// server can be reached (a few times), or a retry would find the name taken, and a broken
+    /// partial file would stay next to the complete copy.
+    static func removeWhenReachable(_ path: String, fs: RemoteFileSystem, host: String) async {
+        for attempt in 0..<6 {
+            if (try? await fs.delete(path)) != nil { return }
+            guard attempt < 5 else { return }
+            _ = await HostLinks.shared.whenReachable(host, within: 300)
+            // A moment more each time: events come in bursts, and one does not mean it answers.
+            try? await Task.sleep(for: .seconds(Double(1 << attempt)))
+        }
     }
 
     /// Names (lowercased) other transfers will write into a local folder.
@@ -924,11 +1052,24 @@ public final class TransferManager {
     }
 
     private func start(_ item: TransferItem, options: SSHOptions, device: Bool) {
-        let env = AskPassBridge.shared.environment(targetKey: item.target.key, purpose: "transfer", mode: "force")
+        // Its own askpass token; with sharing off its scp or ssh signs in by itself and is told
+        // about as a sign-in of this connection first (what it is answered with is remembered, and
+        // a question open at the same time for another transfer of the host takes the same answer).
+        // (Told without holding the transfer up: its ssh asks no sooner than the server answers.)
+        let channel = RemoteChannel(target: item.target, options: options, purpose: "transfer")
+        if channel.signsInItself { Task { await channel.began() } }
+        start(item, options: options, device: device, channel: channel)
+    }
+
+    private func start(_ item: TransferItem, options: SSHOptions, device: Bool, channel: RemoteChannel) {
+        let env = channel.askPass
         let done: @MainActor () -> Void = { [weak self] in
-            AskPassBridge.shared.revoke(environment: env)
+            var words = ""
+            if case .failed(let why) = item.state { words = why }
+            channel.ended(succeeded: item.state == .completed, stopped: item.state == .cancelled, words: words)
             self?.finished(item)
         }
+        guard item.state == .running else { done(); return }
         if item.method == .archive {
             // The host's kind is known before anything is packed (a Windows host or a device never
             // gets a POSIX script: it is sent file by file instead), and an upload's names are
@@ -981,11 +1122,19 @@ public final class TransferManager {
                     let path = item.uploadedPath
                     if item.target.isLocal {
                         let clean: () -> Void = { LocalFiles.discard(URL(fileURLWithPath: path)) }
-                        self.launchScp(item, options: options, device: device, env: env, cleanUp: clean, quitCleanUp: clean, done: done)
+                        self.launchScp(item, options: options, device: device, channel: channel, cleanUp: clean, quitCleanUp: clean, done: done)
                     } else {
                         let target = item.target
-                        self.launchScp(item, options: options, device: device, env: env,
-                                       cleanUp: { Task { try? await fs.delete(path) } },
+                        self.launchScp(item, options: options, device: device, channel: channel,
+                                       cleanUp: { [weak self] in
+                                           let removal = UUID(), key = Self.remoteKey(target, path)
+                                           self?.beingRemoved[removal] = [key]
+                                           self?.removals[key] = Task { @MainActor [weak self] in
+                                               await Self.removeWhenReachable(path, fs: fs, host: target.key)
+                                               self?.beingRemoved[removal] = nil
+                                               self?.removals[key] = nil
+                                           }
+                                       },
                                        quitCleanUp: { Self.detachedRemoteScript(#"[ -n "$1" ] && [ "$1" != / ] && rm -rf -- "$1""#,
                                                                                 arguments: [path], target: target, options: options) },
                                        done: done)
@@ -995,7 +1144,7 @@ public final class TransferManager {
             return
         }
         let clean = partialCleanup(for: item)
-        launchScp(item, options: options, device: device, env: env, cleanUp: clean, quitCleanUp: clean, done: done)
+        launchScp(item, options: options, device: device, channel: channel, cleanUp: clean, quitCleanUp: clean, done: done)
     }
 
     /// Before a packed transfer starts: the host's kind (a Windows host or a device never gets a
@@ -1118,7 +1267,7 @@ public final class TransferManager {
         pump()
     }
 
-    private func launchScp(_ item: TransferItem, options: SSHOptions, device: Bool, env: [String: String],
+    private func launchScp(_ item: TransferItem, options: SSHOptions, device: Bool, channel: RemoteChannel,
                            cleanUp: @escaping () -> Void, quitCleanUp: @escaping () -> Void, done: @escaping @MainActor () -> Void) {
         guard item.state == .running, !quitting else { done(); return }
         // A cleanup removes only what this transfer reserved (no other transfer can have chosen it).
@@ -1135,9 +1284,8 @@ public final class TransferManager {
             args = ["-Rp", "--"] + (item.direction == .upload ? [item.localURL.path, item.remoteName == nil ? item.remotePath : item.uploadedPath]
                                                               : [item.remotePath, item.localURL.path])
         } else {
-            let (destOpts, host) = SSHOptions.scpArguments(for: item.target, jump: !options.usesSharedConnection)
-            // Devices often speak only the classic scp protocol, not SFTP (scp's default now).
-            args = options.commonOptions() + destOpts + (device ? ["-O"] : []) + ["-r", "-p"]
+            let (scpOptions, host) = channel.scp(device: device)
+            args = scpOptions + ["-r", "-p"]
             switch item.direction {
             case .upload:
                 args += ["--", item.localURL.path, "\(host):\(item.remoteName == nil ? item.remotePath : item.uploadedPath)"]
@@ -1146,13 +1294,18 @@ public final class TransferManager {
             }
         }
         // A local cp prints no progress, so nothing could tell a stall from a large file.
+        // On a server, what a failed copy left is removed only when the copy had begun: before
+        // that (still signing in, refused) it wrote nothing, and the name may be someone else's by now.
+        weak var made: ScpJob?
         let job = ScpJob(item: item, timeouts: timeouts, watch: !item.target.isLocal,
-                         cleanUp: { if owns() { cleanUp() } }, quitCleanUp: { if owns() { quitCleanUp() } }) { _ in
+                         cleanUp: { if owns(), item.direction == .download || made?.hasMoved == true { cleanUp() } },
+                         quitCleanUp: { if owns(), item.direction == .download || made?.hasMoved == true { quitCleanUp() } }) { _ in
             done()
         }
+        made = job
         jobs[item.id] = job
         launched[item.id] = Date()
-        job.start(executable: executable, arguments: args, environment: env)
+        job.start(executable: executable, arguments: args, environment: channel.askPass)
     }
 
     // MARK: Quitting and leftovers
@@ -1218,21 +1371,7 @@ public final class TransferManager {
     /// cancelled while Tether runs, through `RemoteFileSystem.delete`, which has a PowerShell variant).
     static func detachedRemoteScript(_ script: String, arguments: [String], target: ConnectionTarget, options: SSHOptions) {
         if !target.isLocal, PlatformCache.shared.cached(target.key)?.isWindows != false { return }
-        let p = Process()
-        if target.isLocal {
-            p.executableURL = URL(fileURLWithPath: "/bin/sh")
-            p.arguments = ["-c", script, "sh"] + arguments
-        } else {
-            let command = (["sh", "-c", script.shellQuoted, "sh"] + arguments.map(\.shellQuoted)).joined(separator: " ")
-            p.executableURL = URL(fileURLWithPath: options.sshBinary)
-            p.arguments = options.commonOptions() + ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
-                + SSHOptions.destinationArguments(for: target, jump: !options.usesSharedConnection) + [command]
-        }
-        p.environment = ChildEnvironment.base
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
+        RemoteChannel.detached(script, arguments: arguments, target: target, options: options)
     }
 }
 
@@ -1319,6 +1458,8 @@ final class ScpJob: TransferJob {
         AskPassBridge.shared.bindToken(environment, pid: pid)
         if watch {
             let watchdog = StallWatchdog(timeouts: timeouts) { [weak self] in self?.stall() }
+            let asking = environment
+            watchdog.waitWhile = { AskPassBridge.shared.waitsOnUser(environment: asking) }
             self.watchdog = watchdog
             watchdog.start()
         }
@@ -1415,6 +1556,7 @@ final class ScpJob: TransferJob {
             let progress = "\(file)|\(pct)|\(moved)"
             if progress != lastProgress {
                 lastProgress = progress
+                item.lastActivity = Date()
                 watchdog?.activity(warm: true)
             }
         }
@@ -1422,8 +1564,19 @@ final class ScpJob: TransferJob {
 
     fileprivate func terminated(_ status: Int32?) {
         exited = true
+        guard !finished else { process = nil; return }
+        // scp failed without a word yet: its last words (what tells a lost connection from a refusal)
+        // come through the terminal separately from its end, and on a busy Mac can come after it.
+        // They are waited for a moment before the failure is judged — with the terminal kept open
+        // meanwhile (letting go of it closes its reading, and what was still unread is lost).
+        if status != 0, !cancelled, !stalled, !waitedForLastWords, !Self.saysSomething(output) {
+            waitedForLastWords = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                MainActor.assumeIsolated { self?.terminated(status) }
+            }
+            return
+        }
         process = nil
-        guard !finished else { return }
         finished = true
         watchdog?.stop()
         item.finishedAt = Date()
@@ -1448,6 +1601,14 @@ final class ScpJob: TransferJob {
         }
         if !succeeded { cleanUp() }
         onFinish(self)
+    }
+
+    private var waitedForLastWords = false
+
+    /// Output with more in it than progress lines.
+    static func saysSomething(_ output: String) -> Bool {
+        output.split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+            .contains { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.contains("%") }
     }
 
     /// LocalProcess reports the raw wait status.

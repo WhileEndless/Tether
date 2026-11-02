@@ -12,6 +12,10 @@ import TetherCore
 /// the rendered screen. Reproduces layout/size problems that headless tests cannot.
 @MainActor
 @Suite(.serialized) final class TerminalWindowTests {
+    /// A host name of this suite's own: per-host state (the sign-in queue, retry rounds, platform
+    /// cache) is shared by every test running at the same time, and the fake ssh ignores the name.
+    let host = ConnectionTarget.alias("local-" + String(UUID().uuidString.prefix(6)))
+
     let dir: URL
     let fakeSSH: URL
 
@@ -72,7 +76,7 @@ import TetherCore
 
     func run(mode: PersistenceMode) async throws -> (cols: Int, rows: Int, remoteCols: String, screen: [String]) {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: mode)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: mode)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1100, height: 600),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: TerminalHost(session: session))
@@ -124,7 +128,7 @@ import TetherCore
 
     @Test func shiftCommandUpSelectsWholeCommands() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: TerminalHost(session: session))
@@ -180,7 +184,7 @@ import TetherCore
     /// and then to those before — always onto a command's line.
     @Test func commandMarksStayOnTheirLinesAfterAReattachAddsOutput() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: TerminalHost(session: session))
@@ -246,7 +250,7 @@ import TetherCore
         settings.autoReconnect = false
         SettingsStore.shared.settings = settings
         let cfg = SessionConfiguration(settings: settings)
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         func open(_ session: TerminalSession) async throws -> (TetherTerminalView, NSWindow) {
             let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                                   styleMask: [.borderless], backing: .buffered, defer: false)
@@ -318,7 +322,7 @@ import TetherCore
     /// Ctrl+L moves the screen into the scrollback; ⇧⌘↑ and ⌘↑ must still reach the commands before it.
     @Test func commandMarksSurviveCtrlL() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: TerminalHost(session: session))
@@ -405,7 +409,7 @@ import TetherCore
         settings.scrollbackLines = 1000
         SettingsStore.shared.settings = settings
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: TerminalHost(session: session))
@@ -453,7 +457,7 @@ import TetherCore
         settings.scrollbackLines = 2000
         SettingsStore.shared.settings = settings
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = NSHostingView(rootView: TerminalHost(session: session))
@@ -541,7 +545,7 @@ import TetherCore
         settings.scrollbackLines = 2000
         SettingsStore.shared.settings = settings
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = NSHostingView(rootView: TerminalHost(session: session))
@@ -668,7 +672,7 @@ import TetherCore
         settings.recordingEnabled = true
         SettingsStore.shared.settings = settings
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         let window = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 900, height: 500),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = NSHostingView(rootView: TerminalHost(session: session))

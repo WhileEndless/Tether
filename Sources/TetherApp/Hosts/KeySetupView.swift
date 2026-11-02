@@ -234,7 +234,7 @@ struct KeySetupView: View {
 
         // Where the passphrase is kept (only once it is known to be right).
         if let secret, remember {
-            PasswordVault.setPassword(secret, for: CredentialKey.passphrase(keyPath: key.privateKeyURL.path))
+            Credentials.save(secret, for: CredentialKey.passphrase(keyPath: key.privateKeyURL.path))
             note("The passphrase is kept in Tether's keychain.")
         }
         var agentWorks = false

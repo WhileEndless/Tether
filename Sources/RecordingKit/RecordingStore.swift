@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import os
 import TetherCore
 
 public struct RecordingInfo: Identifiable, Hashable, Sendable {
@@ -26,6 +27,12 @@ public enum RecordingStore {
     nonisolated(unsafe) private static var compressAfterDays = 7
     nonisolated(unsafe) private static var _partBytes = 16 * 1024 * 1024
     nonisolated(unsafe) private static var shortenLargest = true
+    /// Free space kept on the recordings' volume (0: not watched).
+    nonisolated(unsafe) private static var minFreeBytes: Int64 = 5 * 1024 * 1024 * 1024
+    /// The free space of the volume holding `directory`.
+    static func freeSpace(_ url: URL) -> Int64? {
+        (try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage
+    }
     private static let lock = NSLock()
     private static let queue = DispatchQueue(label: "tether.recording-quota", qos: .utility)
 
@@ -45,18 +52,25 @@ public enum RecordingStore {
     ///     every this many MB (0 = never: it is compressed only after the session, as configured).
     ///   - shortenLargestFirst: when space runs out, a recording that holds more than half of it
     ///     loses its oldest parts before any other recording is removed.
+    ///   - minFreeGB: free space kept on the disk (0: not watched): below it, the oldest closed
+    ///     recordings go even while they cannot be compressed (Tether locked, encryption on).
     public static func configure(quotaMB: Int, retentionDays days: Int, compressAfterDays compressDays: Int = 7,
-                                 partMB: Int = 16, shortenLargestFirst: Bool = true) {
+                                 partMB: Int = 16, shortenLargestFirst: Bool = true, minFreeGB: Int = 5) {
         lock.lock()
         let values = (Int64(max(quotaMB, 16)) * 1024 * 1024, max(days, 0), max(compressDays, 0), max(partMB, 0) * 1024 * 1024)
+        let minFree = Int64(max(minFreeGB, 0)) * 1024 * 1024 * 1024
         // Settings change for many reasons (every keystroke in a field): a pass only when these did.
-        let changed = !configured || values != (quotaBytes, retentionDays, compressAfterDays, _partBytes)
-            || shortenLargestFirst != shortenLargest
+        let first = !configured
+        let changed = first || values != (quotaBytes, retentionDays, compressAfterDays, _partBytes)
+            || shortenLargestFirst != shortenLargest || minFree != minFreeBytes
         (quotaBytes, retentionDays, compressAfterDays, _partBytes) = values
         shortenLargest = shortenLargestFirst
+        minFreeBytes = minFree
         configured = true
         lock.unlock()
-        if changed { requestQuotaEnforcement() }
+        // At launch the pass waits a minute: tabs coming back continue their recordings on the same
+        // queue, and must not wait behind compressing or encrypting old ones to connect.
+        if changed { requestQuotaEnforcement(after: first ? 60 : 0) }
     }
     nonisolated(unsafe) private static var configured = false
     /// Folders a pass is already queued for: requests made meanwhile are covered by it.
@@ -118,11 +132,11 @@ public enum RecordingStore {
     /// With `minimumGap`, the pass starts no sooner than that long after the previous one (a
     /// recorder writing hundreds of megabytes a minute would otherwise list the folder every few seconds).
     public static func requestQuotaEnforcement(in directory: URL = AppPaths.recordingsDirectory,
-                                               minimumGap: TimeInterval = 0) {
+                                               minimumGap: TimeInterval = 0, after: TimeInterval = 0) {
         let delay: TimeInterval? = lock.withLock {
             guard queuedPasses.insert(directory.path).inserted else { return nil }
             let since = lastPass[directory.path].map { Date().timeIntervalSince($0) } ?? .infinity
-            return max(0, minimumGap - since)
+            return max(after, minimumGap - since)
         }
         guard let delay else { return }
         queue.asyncAfter(deadline: .now() + delay) {
@@ -189,18 +203,27 @@ public enum RecordingStore {
 
     /// Deletes the oldest inactive recordings until the total fits the quota,
     /// and anything older than the retention period.
+    /// `keepFree` and `free` stand in for the configured free space and the disk's (tests).
     @discardableResult
     public static func enforceQuota(in directory: URL = AppPaths.recordingsDirectory,
-                                    quota: Int64? = nil, now: Date = Date()) -> [URL] {
+                                    quota: Int64? = nil, now: Date = Date(),
+                                    keepFree: Int64? = nil, free: ((URL) -> Int64?)? = nil) -> [URL] {
         lock.lock()
-        let limit = quota ?? quotaBytes
+        var limit = quota ?? quotaBytes
         let days = retentionDays
+        let minFree = keepFree ?? (quota == nil ? minFreeBytes : 0)
+        let freeOf = free ?? freeSpace
         lock.unlock()
         // Leftovers of an interrupted compression or encryption (possibly plain text) go first.
         removeStaleTemporaryFiles(in: directory, now: now)
-        // Compressing waits until the Mac is idle (`IdleCompression`) — unless the limit is reached:
-        // then it comes first, as it frees most of the space without losing anything.
-        if quota == nil, all(in: directory).reduce(0, { $0 + $1.size }) > limit { compressOld(in: directory, now: now) }
+        // The disk is close to full: this much has to go (compressing first, then the oldest).
+        func shortOfSpace() -> Int64 {
+            guard minFree > 0, let free = freeOf(directory), free >= 0 else { return 0 }
+            return max(minFree - free, 0)
+        }
+        // Compressing waits until the Mac is idle (`IdleCompression`) — unless the limit is reached
+        // or the disk runs short: then it comes first, as it frees most of the space without losing anything.
+        if quota == nil, all(in: directory).reduce(0, { $0 + $1.size }) > limit || shortOfSpace() > 0 { compressOld(in: directory, now: now) }
         // Recordings follow the encryption switch once they are closed: those still open when it was
         // turned on are encrypted, those still open when it was turned off are decrypted (only while
         // Tether is unlocked, when the key is there).
@@ -218,6 +241,30 @@ public enum RecordingStore {
             items.removeAll { removed.contains($0.url) }
         }
         var total = items.reduce(0) { $0 + $1.size }
+        let short = shortOfSpace()
+        // Encrypted recordings while Tether is locked cannot be compressed (that needs the key): the
+        // limit may be passed for now instead of deleting what compressing would have kept. Once
+        // unlocked, the next pass compresses first. Not without end while the disk is watched: up
+        // to twice the limit, and never into the free space kept.
+        if quota == nil, RecordingCrypto.encryptNew, RecordingCrypto.key == nil, total > limit,
+           short == 0, total <= limit * 2 {
+            requestQuotaEnforcement(in: directory, after: minFree == 0 ? 600 : 60)
+            return removed
+        }
+        // Short of free space: the limit is lowered by what is missing, so the oldest go until the
+        // disk has that much free again (recordings still being written are never removed; the
+        // largest loses its oldest parts, see below). When something else filled the disk, the
+        // recordings are not thrown away for it: nothing goes when removing every one of them would
+        // not free enough, and never below a quarter of the limit.
+        if short > 0 {
+            let log = Logger(subsystem: "io.github.whileendless.tether", category: "recordings")
+            if total <= short {
+                log.notice("The disk is short of the free space kept for it, by more than all recordings take; none removed")
+            } else {
+                limit = min(limit, max(total - short, limit / 4))
+                log.notice("The disk is short of the free space kept for it; removing the oldest recordings")
+            }
+        }
         lock.lock(); let shorten = shortenLargest; lock.unlock()
         if shorten, total > limit {
             // One very long session must not push every other recording out: while the largest

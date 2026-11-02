@@ -53,8 +53,9 @@ import Testing
         let c = cache()
         c.bind(token: "t1", connection: "/s/abc")
         c.offer("example-password", login: "user@example.com", token: "t1", source: .typed)
-        #expect(lookup(c, connection: "/s/abc", login: "user@example.com") == nil, "not before the server accepted it")
+        #expect(c.count == 0, "not remembered before the server accepted it (only handed to this connection's sign-ins for a minute)")
         c.commit(token: "t1")
+        #expect(c.count == 1)
         #expect(lookup(c, connection: "/s/abc", login: "user@example.com") == "example-password")
     }
 
@@ -119,15 +120,185 @@ import Testing
         #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil, "past its time: gone, however often it was used")
     }
 
-    @Test func keychainEntriesGoWhenTouchIDLocksAgain() {
+    /// Waking from sleep, the network is often not back when the first sign-in starts: one that
+    /// failed on the way (no answer, no route) was never refused, and what it was answered with
+    /// stays — the next try signs in without asking. A connection closed or reset is not the
+    /// network's doing for sure (a server can hang up instead of saying no): forgotten.
+    @Test func aNetworkFailureKeepsTheRememberedPassword() {
         let c = cache()
-        signIn(c, "typed", connection: "/s/a", login: "u@a")
-        c.bind(token: "k", connection: "/s/b")
-        c.offer("saved", login: "u@b", token: "k", source: .keychain)
-        c.commit(token: "k")
-        c.removeKeychainEntries()
-        #expect(lookup(c, connection: "/s/a", login: "u@a") == "typed")
-        #expect(lookup(c, connection: "/s/b", login: "u@b") == nil)
+        signIn(c, "pw", connection: "/s/abc", login: "u@h")
+        c.bind(token: "timed-out", connection: "/s/abc")
+        #expect(c.password(token: "timed-out", login: "u@h")?.password == "pw")
+        c.discard(token: "timed-out", end: .notJudged)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == "pw")
+        #expect(SealedPasswordCache.isNetworkFailure("ssh: connect to host 192.0.2.5 port 22: Operation timed out"))
+        #expect(SealedPasswordCache.isNetworkFailure("connect to address 192.0.2.5 port 22: Host is down"))
+        #expect(!SealedPasswordCache.isNetworkFailure("Connection closed by 192.0.2.5 port 22"))
+        #expect(!SealedPasswordCache.isNetworkFailure("ssh_dispatch_run_fatal: Connection to 192.0.2.5 port 22: Broken pipe"))
+        #expect(!SealedPasswordCache.isNetworkFailure("user@example.com: Permission denied (publickey,password)."))
+    }
+
+    /// When ssh asks although passwords are remembered, the Connection Log says why (never the
+    /// password, nor where it goes).
+    @Test func saysWhyNothingAnswered() {
+        let c = cache()
+        let first = UUID().uuidString
+        c.bind(token: first, connection: "/s/abc")
+        #expect(c.whyNotRemembered(token: first, login: "u@h") == "nothing was remembered for this connection since Tether started")
+        signIn(c, "pw", connection: "/s/abc", login: "u@h")
+        let elsewhere = UUID().uuidString
+        c.bind(token: elsewhere, connection: "/s/other-port")
+        #expect(c.whyNotRemembered(token: elsewhere, login: "u@h").contains("another connection"))
+        let refused = UUID().uuidString
+        c.bind(token: refused, connection: "/s/abc")
+        c.reject(token: refused, login: "u@h")
+        #expect(c.whyNotRemembered(token: refused, login: "u@h") == "it was forgotten: the server did not accept it")
+        signIn(c, "pw", connection: "/s/abc", login: "u@h")
+        c.removeAll(reason: "Tether was locked (App Lock)")
+        let later = UUID().uuidString
+        c.bind(token: later, connection: "/s/abc")
+        #expect(c.whyNotRemembered(token: later, login: "u@h") == "it was forgotten: Tether was locked (App Lock)")
+        #expect(c.whyNotRemembered(token: "never-bound", login: "u@h").contains("not one Tether started"))
+        let off = SealedPasswordCache(sealer: FakeSealer())
+        #expect(off.whyNotRemembered(token: first, login: "u@h") == "the ssh program was still being checked")
+    }
+
+    /// What a sign-in gave is reported once it worked (for the log: logins, never passwords).
+    @Test func commitTellsWhatWasRemembered() {
+        let c = cache()
+        c.bind(token: "t", connection: "/s/abc")
+        c.offer("pw", login: "u@h", token: "t", source: .keychain)
+        #expect(c.commit(token: "t") == ["u@h"])
+        #expect(c.commit(token: "t").isEmpty)
+    }
+
+    /// Sent and then nothing from the server until Tether gave up: perhaps a slow server, perhaps
+    /// one that goes silent instead of refusing. Sent once more at most, then forgotten.
+    @Test func anUnansweredPasswordIsSentOnceMoreAtMost() {
+        let c = cache()
+        signIn(c, "pw", connection: "/s/abc", login: "u@h")
+        c.bind(token: "silent-1", connection: "/s/abc")
+        #expect(c.password(token: "silent-1", login: "u@h")?.password == "pw")
+        c.discard(token: "silent-1", end: .unanswered)
+        c.bind(token: "silent-2", connection: "/s/abc")
+        #expect(c.password(token: "silent-2", login: "u@h")?.password == "pw", "once more")
+        c.discard(token: "silent-2", end: .unanswered)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil, "then never again")
+        // Answered after all: no longer in doubt.
+        signIn(c, "pw", connection: "/s/abc", login: "u@h")
+        c.bind(token: "silent-3", connection: "/s/abc")
+        _ = c.password(token: "silent-3", login: "u@h")
+        c.discard(token: "silent-3", end: .unanswered)
+        c.bind(token: "works", connection: "/s/abc")
+        _ = c.password(token: "works", login: "u@h")
+        c.commit(token: "works")
+        c.bind(token: "silent-4", connection: "/s/abc")
+        _ = c.password(token: "silent-4", login: "u@h")
+        c.discard(token: "silent-4", end: .unanswered)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == "pw")
+    }
+
+    /// One question per server: a typed answer goes to the same connection's next sign-ins for a
+    /// minute — also with remembering turned off, and also when the sign-in it was typed for was
+    /// stopped before the server judged it (a question answered late, a tab closed).
+    @Test func aTypedAnswerIsHandedToTheSameConnection() {
+        let c = cache()
+        c.isEnabled = false
+        c.bind(token: "first", connection: "/s/abc")
+        c.offer("typed", login: "u@h", token: "first", source: .typed)
+        c.discard(token: "first", end: .notJudged)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == "typed")
+        #expect(lookup(c, connection: "/s/other", login: "u@h") == nil, "never another connection")
+        #expect(c.count == 0, "nothing remembered with remembering off")
+        // Refused: not handed on.
+        c.bind(token: "refused", connection: "/s/abc")
+        #expect(c.password(token: "refused", login: "u@h")?.password == "typed")
+        c.discard(token: "refused", end: .failed)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil)
+        // The screen locked with "forget when locking" (removeAll): gone too.
+        c.bind(token: "again", connection: "/s/abc")
+        c.offer("typed", login: "u@h", token: "again", source: .typed)
+        c.removeAll()
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil)
+        // A keychain answer is not handed on (it is read again, with Touch ID when that is on).
+        c.bind(token: "keychain", connection: "/s/abc")
+        c.offer("saved", login: "u@h", token: "keychain", source: .keychain)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil)
+    }
+
+    /// The same "Password:" asked again: digits only are a one-time code, anything else a password.
+    @Test func oneTimeCodesAreToldFromPasswords() {
+        #expect(SealedPasswordCache.looksLikeOneTimeCode("123456"))
+        #expect(SealedPasswordCache.looksLikeOneTimeCode("12345678"))
+        #expect(!SealedPasswordCache.looksLikeOneTimeCode("123"))
+        #expect(!SealedPasswordCache.looksLikeOneTimeCode("example-password"))
+        #expect(!SealedPasswordCache.looksLikeOneTimeCode("12345678901"))
+        #expect(!SealedPasswordCache.looksLikeOneTimeCode("\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}"), "only ASCII digits")
+    }
+
+    /// A typed answer the server refused by hanging up (no second question), with remembering off:
+    /// its own sign-in failing takes the hand-off back.
+    @Test func aFailedTypedAnswerIsNotHandedOn() {
+        let c = cache()
+        c.isEnabled = false
+        c.bind(token: "typed", connection: "/s/abc")
+        c.offer("wrong", login: "u@h", token: "typed", source: .typed)
+        c.discard(token: "typed", end: .failed)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil)
+    }
+
+    /// The sign-in a password was typed for was stopped before the server judged it; the next one
+    /// takes it from the hand-off and works: it is remembered then, as if typed for that one.
+    @Test func aHandedOffAnswerIsRememberedWhenItWorks() {
+        let c = cache()
+        c.bind(token: "stopped", connection: "/s/abc")
+        c.offer("typed", login: "u@h", token: "stopped", source: .typed)
+        c.discard(token: "stopped", end: .notJudged)
+        #expect(c.count == 0)
+        c.bind(token: "next", connection: "/s/abc")
+        #expect(c.password(token: "next", login: "u@h")?.password == "typed")
+        c.commit(token: "next")
+        #expect(c.count == 1)
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == "typed")
+    }
+
+    /// The same server and user under another name (another alias, Quick Connect) on the same
+    /// connection: the password typed under one answers the other.
+    @Test func theSameAccountUnderAnotherName() {
+        let c = cache()
+        c.bind(token: "t1", connection: "/s/abc")
+        c.offer("pw", login: "web", token: "t1", source: .typed, named: "user@web.example.com")
+        c.commit(token: "t1")
+        let t2 = UUID().uuidString
+        c.bind(token: t2, connection: "/s/abc")
+        #expect(c.password(token: t2, login: "web-admin-alias", named: "user@web.example.com")?.password == "pw")
+        let t3 = UUID().uuidString
+        c.bind(token: t3, connection: "/s/abc")
+        #expect(c.password(token: t3, login: "other", named: "admin@web.example.com") == nil, "another user")
+    }
+
+    /// A key's passphrase typed for a sign-in the server then refused (the key, or a password) is
+    /// kept: the key opened with it.
+    @Test func aPassphraseSurvivesAnotherFailure() {
+        let c = cache()
+        let key = SealedPasswordCache.passphrasePrefix + "/Users/user/.ssh/id_example"
+        c.bind(token: "t", connection: "/s/abc")
+        c.offer("phrase", login: key, token: "t", source: .typed)
+        c.offer("wrong", login: "u@h", token: "t", source: .typed)
+        c.discard(token: "t", end: .failed)
+        #expect(lookup(c, connection: "/s/other", login: key) == "phrase")
+        #expect(lookup(c, connection: "/s/abc", login: "u@h") == nil)
+    }
+
+    /// A saved password changed or removed: the copy remembered from it is not used any more.
+    @Test func forgettingALoginSaysWhy() {
+        let c = cache()
+        signIn(c, "pw", connection: "/s/abc", login: "web")
+        c.forget(login: "web", reason: "its saved password was changed or removed")
+        let t = UUID().uuidString
+        c.bind(token: t, connection: "/s/abc")
+        #expect(c.password(token: t, login: "web") == nil)
+        #expect(c.whyNotRemembered(token: t, login: "web") == "it was forgotten: its saved password was changed or removed")
     }
 
     @Test func offWhenDisabledWithoutASecureEnclaveOrWithAnOldSSH() {

@@ -32,11 +32,18 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         lastPosted[session.id] = Date()
         let content = UNMutableNotificationContent()
         let host = session.descriptor.target.displayName
+        // While Tether is locked, or its recordings are encrypted, what programs print stays out of
+        // Notification Center (it keeps what it shows, and shows it on the lock screen).
+        let withheld = AppLock.shared.isLocked || settings.encryptRecordings
         switch attention {
         case _ where session.descriptor.isPrivate:
             // Notification Center keeps what it shows: a private tab's text is not given to it.
             content.title = "Private tab"
             content.body = "A program wants your attention"
+        case _ where withheld:
+            content.title = "Tether"
+            content.subtitle = host
+            content.body = "A program in a tab wants your attention"
         case .message(let n):
             content.title = n.title ?? session.displayTitle
             content.subtitle = n.title == nil ? host : "\(session.displayTitle) — \(host)"
@@ -75,6 +82,28 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             }
             guard authorized == true else { return }
             try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
+    }
+
+    /// A tab the user closed while its server could not be reached: the server answers now and its
+    /// session still runs there. Clicking it shows the tab; ending it stays the user's choice.
+    func stillRunning(_ session: TerminalSession) {
+        let content = UNMutableNotificationContent()
+        content.title = "Still running on \(session.descriptor.target.displayName)"
+        // A tab's title can come from what runs in it: kept out of Notification Center as for any
+        // other notification while Tether is locked, recordings are encrypted, or the tab is private.
+        let withheld = AppLock.shared.isLocked || AppModel.shared.settings.encryptRecordings || session.descriptor.isPrivate
+        let name = withheld ? "a tab" : "\u{201C}\(session.displayTitle)\u{201D}"
+        content.body = "You closed \(name) while the server could not be reached. It is still running there: open it, or end it from the sidebar."
+        content.threadIdentifier = session.id.uuidString
+        content.userInfo = ["session": session.id.uuidString]
+        Task {
+            let center = UNUserNotificationCenter.current()
+            if authorized == nil {
+                authorized = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+            }
+            guard authorized == true else { return }
+            try? await center.add(UNNotificationRequest(identifier: "tether-still-running-" + session.id.uuidString, content: content, trigger: nil))
         }
     }
 

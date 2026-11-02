@@ -11,21 +11,8 @@ import MonitorKit
 import RecordingKit
 import KeySetupKit
 
-/// A password or confirmation request waiting for the user.
-struct PendingPrompt: Identifiable {
-    let id = UUID()
-    let request: AskPassRequest
-    let created = Date()
-    let continuation: CheckedContinuation<String?, Never>
-    /// The saved password was just sent and not accepted (it probably changed on the server).
-    var savedWasRejected = false
-    /// The same host-key question from other ssh processes of this host, answered together.
-    var followers: [CheckedContinuation<String?, Never>] = []
-
-    /// What makes two host-key questions the same: the connection and ssh's own text, which
-    /// names the host and the key's fingerprint.
-    var confirmationKey: String? { request.isConfirmation ? request.targetKey + "\n" + request.prompt : nil }
-}
+/// A question ssh asked, waiting for the user (decided by `SignInBroker`).
+typealias PendingPrompt = SignInQuestion
 
 /// Items in the sidebar.
 enum SidebarItem: Hashable {
@@ -50,9 +37,11 @@ final class AppModel {
     private(set) var library: HostLibrary
     private(set) var configError: String?
 
-    var prompts: [PendingPrompt] = [] {
+    /// The open sign-in questions (kept by `signInBroker`, shown in the panel).
+    private(set) var prompts: [PendingPrompt] = [] {
         didSet { refreshPromptPanel() }
     }
+    func setPrompts(_ questions: [PendingPrompt]) { prompts = questions }
     @ObservationIgnored private var promptExpiryTimer: Timer?
 
     /// The prompt to show now: one that belongs to no tab (a file transfer, a host-key question, a
@@ -81,21 +70,42 @@ final class AppModel {
         return false
     }
 
-    /// Whether a password typed for this prompt may be remembered for the host's other logins:
-    /// only ssh's own password question or a local key's passphrase, never a one-time code — and
-    /// only from an ssh that marks a server's questions (see `isUnverifiedPasswordPrompt`).
-    private func isRememberable(_ request: AskPassRequest) -> Bool {
-        (request.isPlainPasswordPrompt && request.askerNamesItsQuestions) || request.isPassphrasePrompt
-    }
-
     /// A tab whose login waits for the user (a held-back prompt, or one that gave up waiting).
     func waitsForSignIn(_ session: TerminalSession) -> Bool {
         session.waitsForUser || prompts.contains { $0.request.sessionID == session.id }
     }
 
     /// Shows the prompt for what is in front (after prompts, the shown tab or the lock changed).
+    /// Never at once: showing the panel makes a window key, which posts the very notifications that
+    /// call this again (a tab shown, a window becoming key) — done right away, each would show the
+    /// panel again inside the last one until the stack ran out. Every request in one turn of the
+    /// run loop is answered by one refresh after it.
     func refreshPromptPanel() {
-        AskPassPanel.shared.update(promptInFront)
+        guard !promptRefreshPending else { return }
+        promptRefreshPending = true
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                let model = AppModel.shared
+                model.promptRefreshPending = false
+                model.applyPromptPanel()
+            }
+        }
+    }
+    @ObservationIgnored private var promptRefreshPending = false
+
+    private func applyPromptPanel() {
+        let front = promptInFront
+        AskPassPanel.shared.update(front)
+        // The questions queued behind the one shown are in front of the user too (they come next):
+        // what waits for them may wait, as for the one shown (see `AskPassBridge.waitsOnUser`).
+        if front != nil, !AppLock.shared.isLocked, AskPassPanel.shared.isShowing {
+            let frontSessions = workspaces.frontSessions
+            let ids = Set(frontSessions.map(\.id)), hosts = Set(frontSessions.map(\.descriptor.target.key))
+            for p in prompts where isInFront(p, frontIDs: ids, frontHosts: hosts) {
+                // Also every other ssh asking the same host-key question (answered together).
+                for token in signInBroker.tokens(of: p.id) { AskPassBridge.shared.notePresented(token: token) }
+            }
+        }
         schedulePromptExpiry()
         // A tab in front that waits for a sign-in (its window came back, was un-minimized, the app
         // was unhidden) starts it now — it is in front, so its question can be shown.
@@ -110,13 +120,12 @@ final class AppModel {
         let front = Set(frontSessions.map(\.id)), frontHosts = Set(frontSessions.map(\.descriptor.target.key))
         for p in prompts where !isInFront(p, frontIDs: front, frontHosts: frontHosts) && Date().timeIntervalSince(p.created) > 90 {
             guard p.request.sessionID != nil else { continue }
-            ConnectionLog.shared.notice("A sign-in question waited in the background too long; ended", .signIn, host: p.request.targetKey)
-            // The host's tabs in the background wait, instead of each taking its turn at a login
-            // nobody answers (20 tabs would mean 20 attempts at the server).
-            let host = p.request.sessionID.flatMap { sessions.session($0)?.descriptor.target.key } ?? p.request.targetKey
-            for other in sessions.sessions(for: host) where !front.contains(other.id) {
-                other.waitForUser()
-            }
+            ConnectionLog.shared.notice("A sign-in question waited in the background too long; ended", .signIn, host: p.request.targetKey,
+                                        detail: "the tabs it was for wait until one of them is shown, then ask once")
+            // Every tab waiting for it — of the host, another name for it, hosts behind it — waits in
+            // the background, instead of each taking its turn at a login nobody answers (20 tabs
+            // would mean 20 attempts at the server).
+            waitForUser(token: p.request.token, sessionID: p.request.sessionID, host: p.request.targetKey)
             AskPassBridge.shared.terminateProcesses(of: p.request.token)
         }
     }
@@ -135,6 +144,9 @@ final class AppModel {
         }
     }
 
+    /// Returns once Tether is not locked (at once when it is not).
+    static func waitUntilUnlocked() async { await AppLock.shared.waitUntilUnlocked() }
+
     /// A tab came to the front: its held-back prompt appears, or a login that waited for it starts.
     func sessionShown(_ session: TerminalSession) {
         session.shownToUser()
@@ -144,9 +156,7 @@ final class AppModel {
     /// ssh behind a prompt is gone (gave up, timed out, was stopped): the prompt goes away. A tab in
     /// the background then waits to be shown before it tries again (see `TerminalSession.waitsForUser`).
     func withdrawPrompts(token: String) {
-        guard let i = prompts.firstIndex(where: { $0.request.token == token }), prompts[i].followers.isEmpty else { return }
-        let prompt = prompts.remove(at: i)
-        ConnectionLog.shared.info("A sign-in question went away (its ssh ended)", .signIn, host: prompt.request.targetKey)
+        guard let prompt = signInBroker.withdraw(token: token) else { return }
         // A sign-in that went unanswered in the background: the host's tabs there wait to be shown
         // (one question when the user comes back, not one per tab in turn).
         if let id = prompt.request.sessionID {
@@ -156,7 +166,6 @@ final class AppModel {
                 for other in sessions.sessions(for: host) where !front.contains(other.id) { other.waitForUser() }
             }
         }
-        prompt.continuation.resume(returning: nil)
     }
     /// Set while the app quits so closing windows does not end sessions.
     var isTerminating = false
@@ -205,6 +214,8 @@ final class AppModel {
             AppModel.shared.applyAgentSettings(to: session)
             session.onOnline = { s in
                 let model = AppModel.shared
+                // Its own sign-in too (no shared connection): the host is reachable.
+                HostLinks.shared.post(.signedIn(s.descriptor.target.key))
 
                 // Tabs to the same host that waited for a sign-in can use this tab's connection now.
                 // (Also one whose sign-in was refused or cancelled: this one just signed in, so the
@@ -212,18 +223,18 @@ final class AppModel {
                 // server's next round try now too: it answers again.
                 for other in model.sessions.sessions(for: s.descriptor.target.key)
                 where other.id != s.id && { if case .waiting = other.phase { true } else { false } }() {
-                    other.reconnectNow()
+                    other.reconnectNow("another tab to this server connected")
                 }
                 model.monitors[s.descriptor.target.key]?.serverAnswered()
-                // Asked to be ended on the server while it could not be reached: now it can.
-                if s.endWhenConnected {
-                    DispatchQueue.main.async { model.sessions.close(s.id, killRemote: true) }
-                    return
-                }
                 model.forwards.sessionConnected(to: s.descriptor.target,
                                                 saved: model.metadata(for: s.descriptor.target.key).forwards ?? [])
             }
         }
+        // A tab closed while its server could not be reached still runs there: the user is told,
+        // and decides (nothing is ended by itself).
+        sessions.onStillRunning = { s in Notifier.shared.stillRunning(s) }
+        // A transfer moving data keeps its connection from being judged dead while it is checked.
+        sessions.otherActivity = { host, moment in AppModel.shared.transfers.movedData(host: host, since: moment) }
         // Keep the sidebar's list of sessions on the server current: a session ended or closed here
         // is updated right away instead of lingering as "detached".
         sessions.onSessionEnded = { s in
@@ -241,8 +252,10 @@ final class AppModel {
         // A window coming back (unhidden, un-minimized, the app brought forward) can put a waiting
         // tab in front: show its question, or start its sign-in.
         for name in [NSApplication.didUnhideNotification, NSApplication.didBecomeActiveNotification,
-                     NSWindow.didDeminiaturizeNotification, NSWindow.didBecomeKeyNotification] {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                     NSWindow.didDeminiaturizeNotification, NSWindow.didBecomeKeyNotification, SignInInterest.changed] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { note in
+                // The prompt panel itself becoming key is the answer to a refresh, not a reason for one.
+                if note.object is NSPanel { return }
                 MainActor.assumeIsolated { AppModel.shared.refreshPromptPanel() }
             }
         }
@@ -250,8 +263,15 @@ final class AppModel {
         // for the screen locking from now on (Touch ID again, "forget when locking").
         _ = passwordCache
         _ = SecretGate.shared
+        // While Tether is locked no sign-in that may ask starts; it does once unlocked.
+        SignInEvents.shared.gatekeeper = signInGatekeeper
+        // A server reachable again (signed in, the network back, Tether unlocked): what waited for it
+        // goes on — tabs, file views whose listing failed, port forwards to restore, monitors.
+        HostLinks.shared.observe { event in AppModel.shared.hostReachable(event) }
+        signInBroker.host = self
+        let broker = signInBroker
         AskPassBridge.shared.start { request in
-            await AppModel.shared.answer(request)
+            await broker.answer(request)
         } cancel: { token in
             Task { @MainActor in AppModel.shared.withdrawPrompts(token: token) }
         }
@@ -259,10 +279,15 @@ final class AppModel {
                                  retentionDays: store.settings.recordingRetentionDays,
                                  compressAfterDays: store.settings.compressRecordingsAfterDays,
                                  partMB: store.settings.recordingPartMB,
-                                 shortenLargestFirst: store.settings.recordingShortenLargestFirst)
+                                 shortenLargestFirst: store.settings.recordingShortenLargestFirst,
+                                 minFreeGB: store.settings.recordingProtectFreeSpace ? store.settings.recordingMinFreeGB : 0)
         // Compress old recordings now and then once a day.
-        Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { _ in RecordingStore.requestQuotaEnforcement() }
-        DispatchQueue.global(qos: .utility).async { AppPaths.removeLeftovers() }
+        // Once a day too: copies made for previews, drags and the clipboard older than a day go.
+        Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { _ in
+            RecordingStore.requestQuotaEnforcement()
+            DispatchQueue.global(qos: .utility).async { AppPaths.removeLeftovers(); PasteboardFiles.removeOldFiles() }
+        }
+        DispatchQueue.global(qos: .utility).async { AppPaths.removeLeftovers(); PasteboardFiles.removeOldFiles() }
         watchConfigFile()
         // Platforms detected earlier (Windows or Unix-like) are known before the first connection;
         // newly detected ones are remembered per host.
@@ -290,7 +315,9 @@ final class AppModel {
     func launch() {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         ConnectionLog.shared.info("Tether \(AppInfo.version) started on macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)", .app,
-                                  detail: AppLock.shared.mode == .off ? nil : "App Lock is on: tabs come back once unlocked")
+                                  detail: Self.settingsSnapshot(settings)
+                                      + (AppLock.shared.mode == .off ? "" : "\nApp Lock is on: tabs come back once unlocked"))
+        lastLoggedSettings = Self.settingsSnapshot(settings)
         applyAppearance()
         watchWindowVisibility()
         // With App Lock, sessions (and their history) come back only after unlocking.
@@ -311,8 +338,91 @@ final class AppModel {
             self.sessionsRestored = true
             self.afterRestore.forEach { $0() }
             self.afterRestore = []
+            self.restoreOpenForwards()
         }
     }
+
+    private func hostReachable(_ event: HostLinks.Event) {
+        switch event {
+        case .signedIn(let host):
+            sessions.lookForEndedSessions(host: host)
+            FileBrowserModel.reloadFailed(host: host)
+            forwards.retryPending(host: host)
+            for (key, monitor) in monitors where HostLinks.sameServer(key, host) { monitor.serverAnswered() }
+        case .networkBack:
+            // Tabs closed while their server could not be reached are looked for again (quietly:
+            // a server that needs a password is not asked — it is told when you sign in to it).
+            sessions.lookForEndedSessions(host: nil, atMostEvery: 60)
+            FileBrowserModel.reloadFailed()
+            forwards.retryPending()
+            monitors.values.forEach { $0.serverAnswered() }
+        case .unlocked:
+            sessions.retryWaiting()
+            FileBrowserModel.reloadFailed()
+            forwards.retryPending()
+        case .linkAlive(let host):
+            sessions.lookForEndedSessions(host: host)
+            // Checked and still reaching its server: what failed for it (a listing over a network
+            // that came back by itself) tries again.
+            FileBrowserModel.reloadFailed(host: host)
+            for (key, monitor) in monitors where HostLinks.sameServer(key, host) { monitor.serverAnswered() }
+        case .connectionEnded(let host):
+            forwards.connectionEnded(host)
+        }
+    }
+
+    /// Port forwards that were running when Tether last quit: those listening only on this Mac come
+    /// back by themselves; the others (open to the network, or on the server) only when asked.
+    private func restoreOpenForwards() {
+        let wanted = Set(settings.openForwards)
+        forwards.onWantedChanged = { ids in
+            let list = ids.sorted { $0.uuidString < $1.uuidString }
+            if AppModel.shared.settings.openForwards != list { AppModel.shared.settings.openForwards = list }
+        }
+        guard !wanted.isEmpty else { return }
+        var local: [(ConnectionTarget, PortForward)] = [], open: [(ConnectionTarget, PortForward)] = []
+        for (key, m) in library.metadata {
+            for f in m.forwards ?? [] where wanted.contains(f.id) && !f.autoStart {
+                if f.listensOnlyOnThisMac { local.append((target(forKey: key), f)) } else { open.append((target(forKey: key), f)) }
+            }
+        }
+        for (target, f) in local { Task { await forwards.start(f, on: target, restoring: true) } }
+        if !local.isEmpty {
+            ConnectionLog.shared.info("Reopening \(local.count) port forward\(local.count == 1 ? "" : "s") that were running when Tether quit", .forward)
+        }
+        guard !open.isEmpty else { return }
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Reopen port forwards?"
+            alert.informativeText = "These were running when Tether quit. They listen beyond this Mac:\n\n"
+                + open.map { "• \($0.1.summary) (\($0.0.displayName))" }.joined(separator: "\n")
+            alert.addButton(withTitle: "Reopen")
+            alert.addButton(withTitle: "Not Now")
+            if alert.runModal() == .alertFirstButtonReturn {
+                for (target, f) in open { Task { await AppModel.shared.forwards.start(f, on: target, restoring: true) } }
+            } else {
+                AppModel.shared.settings.openForwards.removeAll { id in open.contains { $0.1.id == id } }
+            }
+        }
+    }
+
+    /// The settings that decide sign-ins and connections, in words for the Connection Log (no host,
+    /// path or secret): written at launch, and again when one of them changes.
+    static func settingsSnapshot(_ s: AppSettings) -> String {
+        [
+            "connection sharing " + (s.useControlMaster ? "on" : "off")
+                + (s.keepConnectionsAfterQuit ? ", kept after quitting" : ""),
+            s.serverAliveInterval > 0 ? "keep-alive every \(s.serverAliveInterval) s" : "keep-alive off",
+            "remember sign-in passwords " + (s.rememberSignInPasswords
+                ? "on (forget after " + (s.forgetSignInPasswordsAfterHours > 0 ? "\(s.forgetSignInPasswordsAfterHours) h" : "quitting") + ")"
+                : "off")
+                + (s.forgetSignInPasswordsOnLock ? ", forgotten when the screen locks" : ""),
+            "Touch ID for saved passwords " + (s.requireAuthForSavedPasswords ? "on" : "off"),
+            "App Lock " + (s.appLockMode == .off ? "off" : "on" + (s.lockOnSleep ? ", locks with the screen" : "")),
+            "reconnect " + (s.autoReconnect ? "automatically" : "when asked"),
+        ].joined(separator: "; ")
+    }
+    @ObservationIgnored private var lastLoggedSettings: String?
 
     @ObservationIgnored private var sessionsRestored = false
     @ObservationIgnored private var afterRestore: [() -> Void] = []
@@ -462,14 +572,59 @@ final class AppModel {
         try editConfig(alias: alias) { try $0.removeHost(alias) }
         library.metadata[alias] = nil
         libraryStore.saveSoon(library)
-        PasswordVault.deletePassword(for: alias)
+        Credentials.remove(alias)
+    }
+
+    /// What quitting now would end for good (nil: nothing): plain shells online (on servers and on
+    /// this Mac), transfers, port forwards.
+    struct WorkEnding {
+        var shells = 0, transfers = 0, forwards = 0
+        var description: String {
+            var parts: [String] = []
+            if shells > 0 { parts.append("\(shells) tab\(shells == 1 ? "" : "s") without tmux or screen will end") }
+            if transfers > 0 { parts.append("\(transfers) transfer\(transfers == 1 ? "" : "s") will stop") }
+            if forwards > 0 { parts.append("\(forwards) port forward\(forwards == 1 ? "" : "s") will close") }
+            return parts.joined(separator: ", ").prefix(1).uppercased() + parts.joined(separator: ", ").dropFirst()
+        }
+    }
+
+    func workEndingOnQuit() -> WorkEnding? {
+        var w = WorkEnding()
+        w.shells = sessions.sessions.filter { $0.phase.isOnline && ($0.persistence == .plain || $0.persistence == .unknown) }.count
+        w.transfers = transfers.activeCount
+        // Only those that do not come back: kept open with the connections, started by themselves,
+        // or reopened at the next launch (listening only on this Mac) they are not lost.
+        w.forwards = settings.keepConnectionsAfterQuit ? 0
+            : forwards.activeForwards.filter { !$0.autoStart && !$0.listensOnlyOnThisMac }.count
+        return w.shells + w.transfers + w.forwards > 0 ? w : nil
+    }
+
+    /// The user saved, replaced or removed a saved password: a copy remembered from the old one is
+    /// not used any more, and a new one may be sent again.
+    func savedPasswordChanged(_ key: String) {
+        signIns.clearRefusal(key)
+        passwordCache.forget(login: key, reason: "its saved password was changed or removed")
     }
 
     private func watchConfigFile() {
         configWatcher?.cancel()
+        configWatcher = nil
         let url = settings.resolvedSSHConfigURL
         let fd = open(url.path, O_EVTONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            // No ssh_config yet (a first launch): looked for again, so one made later is read.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.configWatcher == nil else { return }
+                if FileManager.default.fileExists(atPath: url.path) {
+                    self.config.reload()
+                    self.configChanged()
+                    self.watchConfigFile()
+                } else {
+                    self.watchConfigFile()
+                }
+            }
+            return
+        }
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
         source.setEventHandler { [weak self] in
             guard let self else { return }
@@ -529,8 +684,14 @@ final class AppModel {
         _ = workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated {
                 AppModel.shared.isAsleep = false
-                refresh()
-                for h in AppModel.shared.commandHubs.values { h.resume() }
+                // Once the network is back and the shared connections were checked (a stream started
+                // on a dead one only fails) — or after 20 s, whatever comes first.
+                Task { @MainActor in
+                    _ = await HostLinks.shared.whenReachable("", within: 20)
+                    guard !AppModel.shared.isAsleep else { return }
+                    refresh()
+                    for h in AppModel.shared.commandHubs.values { h.resume() }
+                }
             }
         }
         let center = NotificationCenter.default
@@ -605,11 +766,14 @@ final class AppModel {
 
     @ObservationIgnored private var keyChecks: Set<String> = []
 
-    /// Once per launch and host: checks whether the host accepts key login without a password, so
-    /// the key setup offer is only shown where it is useful.
+    /// Once per host: checks whether the host accepts key login without a password, so the key setup
+    /// offer is only shown where it is useful. The answer is kept (setting up a key updates it): each
+    /// check is a login attempt the server logs, and tools such as fail2ban count those. Not for a
+    /// host behind jump hosts — the check would sign in to the jump host on its own.
     func checkKeyLogin(_ target: ConnectionTarget) {
         guard case .alias(let alias) = target, !keyChecks.contains(alias), isEnabled(.keyLoginCheck, for: target) else { return }
         keyChecks.insert(alias)
+        guard metadata(for: alias).keyLoginWorks == nil, !connectionPath(of: alias).hasJumps else { return }
         // A key with a passphrase cannot be tried without asking for it (BatchMode never asks): a
         // host set up with one is a key host already, and the check would only say it is not.
         guard !usesKeyWithPassphrase(alias) else { return }
@@ -620,7 +784,9 @@ final class AppModel {
                "-o", "ConnectTimeout=10"] + SSHOptions.destinationArguments(for: target) + ["exit"]
         Task {
             let r = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 20)
-            updateMetadata(for: alias) { $0.keyLoginWorks = r.status == 0 }
+            // Only a clear answer is kept: a server that could not be reached is asked next launch.
+            if r.status == 0 { updateMetadata(for: alias) { $0.keyLoginWorks = true } }
+            else if r.errorOutput.contains("Permission denied") { updateMetadata(for: alias) { $0.keyLoginWorks = false } }
         }
     }
 
@@ -688,14 +854,17 @@ final class AppModel {
     /// A password typed into Quick Connect without saving it: handed to that connection's first
     /// password question only, then dropped (also if no question comes within a minute). Like any
     /// typed password, it is then remembered sealed when Signing In Again is on.
-    @ObservationIgnored var quickConnectPasswords: [String: (password: String, at: TimeInterval)] = [:]
+    /// Sealed with this run's Secure Enclave key where there is one (see `SealedPasswordCache`).
+    @ObservationIgnored var quickConnectPasswords: [String: (sealed: Data, at: TimeInterval)] = [:]
 
-    /// Quick Connect hands a typed (not saved) password to the connection it starts; gone after a
-    /// minute whether or not it was asked for (or when the screen locks).
+    /// Quick Connect hands the password typed there (saved or not) to the connection it starts —
+    /// no Touch ID for a password just typed. Kept until that connection's own question takes it:
+    /// a jump host's sign-in may come first. Gone after five minutes either way (or when the screen
+    /// locks).
     func offerQuickConnectPassword(_ password: String, for key: String) {
         let at = ProcessInfo.processInfo.systemUptime
-        quickConnectPasswords[key] = (password, at)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+        quickConnectPasswords[key] = (passwordCache.seal(password), at)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
             if self?.quickConnectPasswords[key]?.at == at { self?.quickConnectPasswords[key] = nil }
         }
     }
@@ -704,7 +873,7 @@ final class AppModel {
     func takeQuickConnectPassword(for request: AskPassRequest) -> String? {
         guard let login = request.sshNamedLogin, isTargetItself(login.host, targetKey: request.targetKey),
               let entry = quickConnectPasswords.removeValue(forKey: request.targetKey) else { return nil }
-        return ProcessInfo.processInfo.systemUptime - entry.at < 60 ? entry.password : nil
+        return ProcessInfo.processInfo.systemUptime - entry.at < 300 ? passwordCache.open(entry.sealed) : nil
     }
 
     /// Whether ssh's question names the target itself rather than a jump host on its way.
@@ -757,6 +926,13 @@ final class AppModel {
         case .local:
             break
         }
+        // What ssh itself works out (HostName from `%h`, wildcard or Match blocks, a HostKeyAlias,
+        // every jump host): the config text alone does not show those.
+        var resolvedJumps = false
+        if let resolved = ResolvedNames.names(for: targetKey) {
+            names.formUnion(resolved.names)
+            resolvedJumps = resolved.hasJumps
+        }
         var seen = 0
         while let raw = jumps.first, seen < 8 {
             jumps.removeFirst(); seen += 1
@@ -772,7 +948,7 @@ final class AppModel {
                 if let j = e.proxyJump { jumps += j.split(separator: ",").map(String.init) }
             }
         }
-        return (names, seen > 0)
+        return (names, seen > 0 || resolvedJumps)
     }
 
     /// Whether a "host key changed" report can be acted on: it names a host on this connection's own
@@ -802,131 +978,70 @@ final class AppModel {
         return path.names.contains(login.host) || path.names.contains(key) ? key : nil
     }
 
-    /// What marks a saved or remembered answer as given to one asker: its token — and for a key's
-    /// passphrase its ssh process too. The ssh that ProxyJump starts for a jump host has the same
-    /// token and opens the same key on its own; its question is not a sign of a wrong passphrase.
-    nonisolated static func triedKey(_ request: AskPassRequest, _ key: String) -> String {
-        request.isPassphrasePrompt ? request.token + "\u{0}\(request.askerPID)\u{0}" + key : request.token + key
+    /// The tabs a sign-in stands for wait to be shown (it was ended while nobody could answer).
+    func waitForUser(token: String, sessionID: UUID?, host: String) {
+        let front = Set(workspaces.frontSessions.map(\.id))
+        var waiting: [UUID: TerminalSession] = [:]
+        for id in SignInInterest.waiting(for: token)?.sessions ?? [] { if let s = sessions.session(id) { waiting[id] = s } }
+        if let id = sessionID, let s = sessions.session(id) { waiting[id] = s }
+        let hostKey = sessionID.flatMap { sessions.session($0)?.descriptor.target.key } ?? host
+        for s in sessions.sessions(for: hostKey) { waiting[s.id] = s }
+        for s in waiting.values where !front.contains(s.id) && !s.phase.isOnline { s.waitForUser() }
     }
 
-    nonisolated func answer(_ request: AskPassRequest) async -> String? {
-        // Nothing is filled in by itself for a question an older ssh asks: a jump host behind it
-        // could have worded it as the target's (the user still sees it, and Fill).
-        if (request.isPasswordPrompt && request.askerNamesItsQuestions) || request.isPassphrasePrompt {
-            let (key, remembered, tried, fromCache) = await MainActor.run {
-                let key = self.savedPasswordKey(for: request)
-                // Background work never gets a password (it refuses every prompt anyway).
-                let usable = !SSHOptions.isQuietPurpose(request.purpose)
-                let tried = key.map { self.triedPasswords.contains(Self.triedKey(request, $0)) } ?? true
-                // The same ssh asking again: the password it got was refused. It is never sent again.
-                if tried, let key { self.passwordCache.reject(token: request.token, login: key) }
-                var remembered: (password: String, source: SealedPasswordCache.Source)?
-                var fromCache = false
-                // A key's passphrase too: typed once, it opens that key for every server it signs in to.
-                if usable, !tried, request.isPlainPasswordPrompt || request.isPassphrasePrompt, let key {
-                    if let quick = self.takeQuickConnectPassword(for: request) { remembered = (quick, .typed) }
-                    else { remembered = self.passwordCache.password(token: request.token, login: key); fromCache = remembered != nil }
-                }
-                return (key, remembered, tried, fromCache)
-            }
-            // A saved password remembered from the keychain still needs Touch ID when that is asked
-            // for (after the time chosen, after locking or sleeping), like reading it again would.
-            var allowed = false
-            if let key, let remembered {
-                let touchID = await MainActor.run { self.settings.requireAuthForSavedPasswords }
-                if remembered.source == .typed || !touchID {
-                    allowed = true
-                } else {
-                    allowed = await SecretGate.shared.authorize(Self.reason(for: request, key: key))
-                }
-            }
-            if allowed, let key, let remembered {
-                // A key is named by its file name only (the log can be copied; no home folder in it).
-                ConnectionLog.shared.info(request.isPassphrasePrompt ? "Opened the key with the remembered passphrase" : "Answered ssh's sign-in question with the remembered password",
-                                          .signIn, host: request.isPassphrasePrompt ? Self.keyLabel(request) : key)
-                await MainActor.run {
-                    _ = self.triedPasswords.insert(Self.triedKey(request, key))
-                    // One taken from the cache is not given to it again: its entry keeps the time
-                    // it was typed (Forget them after …), and one forgotten meanwhile (App Lock,
-                    // Forget, the screen locked) stays forgotten.
-                    if !fromCache {
-                        self.passwordCache.offer(remembered.password, login: key, token: request.token, source: remembered.source)
-                    }
-                }
-                return remembered.password
-            }
-            // Offer a saved password once per hop; a second prompt for the same hop means it was wrong.
-            // Touch ID (if enabled) comes before the password is even read from the keychain.
-            // Touch ID was just declined for the remembered copy: not asked a second time.
-            let declined = remembered != nil && !allowed
-            if let key, !tried, !declined, PasswordVault.hasPassword(for: key) {
-                if await SecretGate.shared.authorize(Self.reason(for: request, key: key)), let saved = await PasswordVault.passwordOffThread(for: key) {
-                    await MainActor.run {
-                        _ = self.triedPasswords.insert(Self.triedKey(request, key))
-                        // Remembered for this connection's further sign-ins this run (still behind
-                        // Touch ID when that is required, see above).
-                        if request.isPlainPasswordPrompt || request.isPassphrasePrompt { self.passwordCache.offer(saved, login: key, token: request.token, source: .keychain) }
-                    }
-                    return saved
-                }
-            }
-        }
-        // Asked again after the saved password was sent: it was not accepted.
-        let rejected = await MainActor.run {
-            guard let key = self.savedPasswordKey(for: request) else { return false }
-            return self.triedPasswords.contains(Self.triedKey(request, key)) && PasswordVault.hasPassword(for: key)
-        }
-        return await withCheckedContinuation { cont in
-            Task { @MainActor in
-                let prompt = PendingPrompt(request: request, continuation: cont, savedWasRejected: rejected)
-                // Several ssh processes logging in to a new host at once (a tab, monitoring, files)
-                // each ask about the same key: the question is shown once and answers them all, and
-                // one asked again right after it was answered gets the same answer.
-                // Its ssh ended while this was on the way (Touch ID, the lock screen): nothing to ask.
-                guard AskPassBridge.shared.isLive(request.token) else { cont.resume(returning: nil); return }
-                if let key = prompt.confirmationKey {
-                    if let recent = self.recentConfirmations[key], Date().timeIntervalSince(recent.date) < 120 {
-                        cont.resume(returning: recent.answer)
-                        return
-                    }
-                    if let i = self.prompts.firstIndex(where: { $0.confirmationKey == key }) {
-                        self.prompts[i].followers.append(cont)
-                        return
-                    }
-                }
-                self.prompts.append(prompt)
-            }
-        }
-    }
-
-    /// Host-key questions answered in the last minutes (see `answer`).
-    @ObservationIgnored private var recentConfirmations: [String: (answer: String?, date: Date)] = [:]
-
-    /// "key id_example" for a passphrase question (never the folder it is in).
-    nonisolated static func keyLabel(_ request: AskPassRequest) -> String {
-        "key " + (request.keyPath.map { ($0 as NSString).lastPathComponent } ?? "")
-    }
-
-    nonisolated static func reason(for request: AskPassRequest, key: String) -> String {
-        if request.isPassphrasePrompt { return "unlock your SSH key \((request.keyPath.map { ($0 as NSString).lastPathComponent }) ?? "")" }
-        return "sign in to \(key)"
-    }
-
-    @ObservationIgnored private var triedPasswords: Set<String> = []
+    /// Decides how each askpass question is answered (`SignInBroker`); what was done for each
+    /// sign-in's questions is in its ledger.
+    @ObservationIgnored lazy var signInBroker = SignInBroker(cache: passwordCache)
+    var signIns: SignInLedger { signInBroker.ledger }
     /// The ssh program whose version `passwordCache.sshNamesItsQuestions` was worked out for.
     @ObservationIgnored private var checkedSSHBinary: String?
     /// Counts version checks: only the newest may set the answer (a slow check for the program set
     /// before must not overwrite the one for the program set now).
     @ObservationIgnored private var sshCheckGeneration = 0
+    @ObservationIgnored private var sshCheck: Task<Void, Never>?
 
-    private func startSSHCheck(_ cache: SealedPasswordCache, binary: String) {
+    /// Works out whether the ssh program marks servers' questions. A program that does not answer in
+    /// time (a busy Mac at launch) is asked again, never taken as a no. `forgetIfNot`: the program was
+    /// changed in Settings — remembered passwords stay only if the new one marks them too.
+    private func startSSHCheck(_ cache: SealedPasswordCache, binary: String, forgetIfNot: Bool = false) {
         sshCheckGeneration += 1
         let generation = sshCheckGeneration
-        Task { @MainActor [weak self] in
-            let names = await SSHVersion.namesItsQuestions(binary: binary)
+        sshCheck = Task { @MainActor [weak self] in
+            var names: Bool?
+            for attempt in 0..<4 {
+                names = await SSHVersion.namesItsQuestions(binary: binary)
+                guard let self, generation == self.sshCheckGeneration else { return }
+                if names != nil { break }
+                ConnectionLog.shared.notice("The ssh program did not tell its version in time; asking again", .app)
+                try? await Task.sleep(for: .seconds(2 * (attempt + 1)))
+            }
             guard let self, generation == self.sshCheckGeneration else { return }
-            cache.sshNamesItsQuestions = names
+            let marks = names ?? false
+            ConnectionLog.shared.info("ssh program checked", .app,
+                                      detail: names == nil ? "it did not answer; nothing is filled in by itself"
+                                          : marks ? "it marks servers' own questions (OpenSSH 8.4 or later)" : "it does not mark servers' own questions (older than OpenSSH 8.4)")
+            if forgetIfNot, !marks { cache.removeAll(reason: "the ssh program was changed in Settings") }
+            cache.sshNamesItsQuestions = marks
         }
+    }
+
+    /// Waits (at most 5 s) for the ssh program's check, so the first questions after launch are
+    /// decided with its answer.
+    nonisolated func sshCheckSettled() async {
+        guard let check = await MainActor.run(body: { self.passwordCache.sshChecked ? nil : self.sshCheck }) else { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await check.value }
+            group.addTask { try? await Task.sleep(for: .seconds(5)) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
+    /// A sign-in ended: a password typed for it is saved in the keychain only if it worked.
+    func signInEnded(token: String, end: SignInEnd) {
+        guard let save = signIns.ended(token: token, end: end) else { return }
+        Credentials.save(save.password, for: save.item, replacesRemembered: false)
+        ConnectionLog.shared.info("Saved the password in the keychain (the sign-in worked)", .signIn, host: save.item)
     }
     @ObservationIgnored private var lastSharing: Bool?
 
@@ -940,13 +1055,14 @@ final class AppModel {
         // thread; a program that does not answer `-V` keeps it off).
         checkedSSHBinary = settings.sshBinary
         startSSHCheck(cache, binary: settings.sshBinary)
-        SharedConnections.onSignInStarted = { [cache] token, connection in cache.bind(token: token, connection: connection) }
-        SharedConnections.onSignInResult = { [cache] token, ok, refused in
-            // Failed for whatever reason (`refused` or not): see `SealedPasswordCache.discard`.
-            if ok { cache.commit(token: token) } else { cache.discard(token: token) }
-        }
+        signInRecorder = SignInRecorder(cache: cache)
+        SignInEvents.shared.add(signInRecorder!)
         return cache
     }()
+    /// Keeps what sign-ins were answered with, by how they ended (held here: `SignInEvents` holds
+    /// its observers weakly).
+    @ObservationIgnored private var signInRecorder: SignInRecorder?
+    @ObservationIgnored private let signInGatekeeper = LockGatekeeper()
 
     /// When a saved password was last typed into each session (automatically or with a click): the
     /// same prompt coming back right after means it was not accepted.
@@ -956,94 +1072,17 @@ final class AppModel {
     /// Last automatic fill per session (to stop after a wrong password).
     @ObservationIgnored var autoFilled: [UUID: (key: String, date: Date)] = [:]
 
-    /// The host whose tabs a cancelled sign-in stands for: the asking tab's, or the one the ssh
-    /// connects to.
-    private func cancelledHost(_ request: AskPassRequest) -> String? {
-        if let id = request.sessionID, let session = sessions.session(id) { return session.descriptor.target.key }
-        return request.targetKey.isEmpty ? nil : request.targetKey
-    }
-
+    /// The user answered a sign-in question (nil: cancelled; "": a key skipped; "yes"/"no").
     func resolvePrompt(_ prompt: PendingPrompt, answer: String?, save: Bool) {
-        // Answered once only: Return in the field and the default button can both arrive, and a
-        // prompt withdrawn a moment ago (its ssh ended) has already been resumed. Resuming twice
-        // would end the app.
-        guard let i = prompts.firstIndex(where: { $0.id == prompt.id }) else { return }
-        let current = prompts.remove(at: i)
-        // Cancelled: the ssh behind it is ended first. Told "no answer", ssh would send an empty
-        // password (a failed login on the server) and ask again, up to three times.
-        if answer == nil, !prompt.request.isConfirmation {
-            AskPassBridge.shared.terminateProcesses(of: prompt.request.token)
+        let reply: SignInBroker.UserAnswer
+        switch answer {
+        case nil: reply = .cancel
+        case "": reply = .skipKey
+        case "yes" where prompt.request.isConfirmation || prompt.request.isPermissionQuestion: reply = .yes
+        case "no" where prompt.request.isConfirmation || prompt.request.isPermissionQuestion: reply = .no
+        case let text?: reply = .text(text, save: save)
         }
-        // Cancelled by the user: no tab to this host tries (and asks) again until the user presses
-        // Reconnect or a tab signs in — in front or not, in this window or another.
-        if answer == nil, !prompt.request.isConfirmation { ConnectionLog.shared.info("Sign-in question cancelled", .signIn, host: prompt.request.targetKey) }
-        if answer == nil, !prompt.request.isConfirmation {
-            // Every tab this sign-in stood for — of the host itself, or of hosts behind it when it
-            // is a jump host's — stops asking until the user presses Reconnect.
-            var stopped: [UUID: TerminalSession] = [:]
-            for s in cancelledHost(prompt.request).map({ sessions.sessions(for: $0) }) ?? [] { stopped[s.id] = s }
-            for id in SignInInterest.waiting(for: prompt.request.token)?.sessions ?? [] {
-                if let s = sessions.session(id) { stopped[id] = s }
-            }
-            for other in stopped.values where !other.phase.isOnline {
-                other.pauseRetries("Sign-in cancelled. Press Reconnect when you want to sign in.")
-            }
-        }
-        // Answered after the server's login time ran out (sshd closes an unfinished login after about
-        // two minutes; ssh does not notice while it waits): sending it would fail. Nothing is kept:
-        // the tab signs in afresh and asks once more, saying why.
-        if let answer, !answer.isEmpty, isRememberable(prompt.request), prompt.request.sessionID != nil,
-           Date().timeIntervalSince(current.created) > 110 {
-            if save { PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request)) }
-            AskPassBridge.shared.terminateProcesses(of: prompt.request.token)
-            current.continuation.resume(returning: nil)
-            for follower in current.followers { follower.resume(returning: nil) }
-            return
-        }
-        if save, let answer, prompt.request.isPasswordPrompt || prompt.request.isPassphrasePrompt {
-            PasswordVault.setPassword(answer, for: passwordKey(for: prompt.request))
-            // The same ssh asking again means it was wrong: then the user is asked, not the keychain.
-            if let key = savedPasswordKey(for: prompt.request) { triedPasswords.insert(Self.triedKey(prompt.request, key)) }
-        }
-        // Remembered (sealed) for this server's further sign-ins only once this one has worked.
-        if let answer, !answer.isEmpty, isRememberable(prompt.request),
-           !SSHOptions.isQuietPurpose(prompt.request.purpose),
-           let key = savedPasswordKey(for: prompt.request) {
-            passwordCache.offer(answer, login: key, token: prompt.request.token, source: .typed)
-        }
-        // Skipped key: an earlier answer to this question (a typo ssh asked again for) is not kept.
-        if answer == "", prompt.request.isPassphrasePrompt, let key = savedPasswordKey(for: prompt.request) {
-            passwordCache.withdraw(token: prompt.request.token, login: key)
-        }
-        if let key = prompt.confirmationKey { recentConfirmations[key] = (answer, Date()) }
-        current.continuation.resume(returning: answer)
-        for follower in current.followers { follower.resume(returning: answer) }
-        // Other logins waiting for the same user and host at this moment (another shared connection
-        // to the same server, hosts behind the same jump host) take this password too, once each,
-        // instead of asking. It goes only to them: nothing keeps it afterwards.
-        // Only a sign-in for the same connection (host, port, user and jump host): the same
-        // user@host on another port, or behind another jump host, is another server.
-        let connection = passwordCache.connection(token: prompt.request.token)
-        func sameConnection(_ other: AskPassRequest) -> Bool {
-            // A key's passphrase belongs to the key file on this Mac: every sign-in waiting to open
-            // that key takes it, whatever server it is for (the same key, see `savedPasswordKey`).
-            if prompt.request.isPassphrasePrompt { return other.isPassphrasePrompt }
-            if let connection { return passwordCache.connection(token: other.token) == connection }
-            return passwordCache.connection(token: other.token) == nil && other.targetKey == prompt.request.targetKey
-        }
-        if let answer, !answer.isEmpty, isRememberable(prompt.request), let key = savedPasswordKey(for: prompt.request) {
-            for other in prompts where isRememberable(other.request) && savedPasswordKey(for: other.request) == key
-                && sameConnection(other.request) && !triedPasswords.contains(Self.triedKey(other.request, key)) {
-                triedPasswords.insert(Self.triedKey(other.request, key))
-                prompts.removeAll { $0.id == other.id }
-                if other.request.isPlainPasswordPrompt || other.request.isPassphrasePrompt {
-                    passwordCache.offer(answer, login: key, token: other.request.token, source: .typed)
-                }
-                other.continuation.resume(returning: answer)
-                // The same question asked by further ssh processes waits on this one: answered too.
-                for follower in other.followers { follower.resume(returning: answer) }
-            }
-        }
+        signInBroker.resolve(prompt.id, with: reply)
     }
 
     // MARK: One copy
@@ -1063,33 +1102,47 @@ final class AppModel {
 
     func settingsChanged() {
         applyAppearance()
+        // A setting that decides sign-ins or connections changed: noted (an event after it reads
+        // in its light).
+        let snapshot = Self.settingsSnapshot(settings)
+        if let last = lastLoggedSettings, last != snapshot {
+            ConnectionLog.shared.info("Settings for connections and sign-ins changed", .app, detail: snapshot)
+        }
+        lastLoggedSettings = snapshot
         // Sharing switched off: the shared connections close (their tabs reconnect without them).
         if lastSharing == true && !settings.useControlMaster {
-            ConnectionLog.shared.notice("Connection sharing was turned off; closing the shared connections", .app)
-            SharedConnections.closeAllNow(ssh: settings.sshBinary)
+            ConnectionLog.shared.notice("Connection sharing was turned off; the shared connections take nothing new and end once what runs on them has ended", .app)
+            SharedConnections.closeAllNow(ssh: settings.sshBinary, gently: true)
+            // Their silent channels too (each holds a session, and so its connection, open).
+            Task { await SharedConnections.shared.reset() }
         }
         lastSharing = settings.useControlMaster
         RetryPace.longest = settings.reconnectMaxDelay
         if checkedSSHBinary != settings.sshBinary {
             checkedSSHBinary = settings.sshBinary
+            // Remembered passwords stay if the new program marks servers' questions as well.
             let cache = passwordCache, binary = settings.sshBinary
-            cache.sshNamesItsQuestions = false
             cache.sshChecked = false
-            cache.removeAll()
-            startSSHCheck(cache, binary: binary)
+            startSSHCheck(cache, binary: binary, forgetIfNot: true)
         }
         passwordCache.maxAge = settings.forgetSignInPasswordsAfterHours > 0 ? Double(settings.forgetSignInPasswordsAfterHours) * 3600 : nil
         if passwordCache.isEnabled != settings.rememberSignInPasswords {
             passwordCache.isEnabled = settings.rememberSignInPasswords
-            if !settings.rememberSignInPasswords { passwordCache.removeAll() }
+            if !settings.rememberSignInPasswords { passwordCache.removeAll(reason: "remembering was turned off in Settings") }
         }
         TerminalRegistry.shared.applySettings(settings)
         RecordingStore.configure(quotaMB: settings.recordingQuotaMB, retentionDays: settings.recordingRetentionDays,
                                  compressAfterDays: settings.compressRecordingsAfterDays,
-                                 partMB: settings.recordingPartMB, shortenLargestFirst: settings.recordingShortenLargestFirst)
+                                 partMB: settings.recordingPartMB, shortenLargestFirst: settings.recordingShortenLargestFirst,
+                                 minFreeGB: settings.recordingProtectFreeSpace ? settings.recordingMinFreeGB : 0)
         if config.mainURL != settings.resolvedSSHConfigURL { reloadConfig() }
         applyCommandSettings()
         for s in sessions.sessions { applyAgentSettings(to: s) }
+        // Open file tabs and command watchers use the new ssh settings from now on too.
+        fileTabs.settingsChanged()
+        for hub in commandHubs.values where hub.executor.options != SSHOptions(settings: settings) {
+            hub.executor = executor(for: hub.executor.target)
+        }
         for (key, m) in monitors {
             // Probes started from now on use the new ssh settings (binary, shared connection, …).
             let options = SSHOptions(settings: settings)

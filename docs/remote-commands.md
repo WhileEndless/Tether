@@ -225,8 +225,36 @@ could run in, and their command line could take a script's lines as its own comm
     it, or no tmux server runs). A tmux that cannot be asked (another version after an upgrade, no
     tmux 3 any more) leaves the tab waiting for Reconnect, with why, instead of ending it.
   - GNU screen gets a private settings file (random name, readable only by you), removed after
-    10 seconds.
-- **No tmux or screen:** the footer offers *Keep Shells Running…*. Only when you open it, a short
+    10 seconds. Tether attaches alongside any other display of the session (`screen -x -RR`),
+    never pushing it out, and the settings file sets `defnonblock 5`, so a display whose
+    connection died never holds the session up for the others. When screen lets go of the tab,
+    `screen -ls` tells whether its session ended (`exit` in its last window: the tab ends) or only
+    detached it (the tab waits for Reconnect).
+  - A private tab's own session is ended when the tab closes or Tether quits: over a separate ssh
+    on the shared connection (`tmux kill-session`, `screen -S <name> -X quit`), and at quit also
+    through the tab itself while it is online.
+  - A paused tab — suspended, waiting for you (a sign-in, Reconnect), or closed while its server
+    could not be reached (*Close for Now*): once the server can be reached again,
+    Tether asks quietly whether its session is still there (`tmux has-session`, then `tmux ls` to
+    tell "no such session" from "could not ask"; or `screen -ls` and `grep` for its name) — without
+    attaching, and never with a sign-in that asks. Only an answer from tmux or screen itself counts
+    as "gone" (no tmux on the PATH, or a socket that cannot be opened, is "not known"), and it is
+    asked twice, a few seconds apart, before the tab closes. Nothing is ended on the server unless
+    you choose *End on Server…*.
+  - The list of sessions on a server is bounded (500 sessions, 64 panes each, lines of at most
+    8 KB, 4 MB in all) and what it says is shown made safe: control characters, bidirectional and
+    zero-width characters are removed, and long names are cut.
+  - Keys typed before the session is there (right after opening a tab) wait and are sent once it
+    is: before tmux has taken over the terminal they would reach it as control-mode commands.
+  - A tmux session open somewhere else as well (another computer, another terminal): tmux sizes
+    its window for the client used last (`window-size latest`, its default). When that is another
+    one, Tether draws the pane as tmux has it and clears the rows of the tab outside it, so no
+    earlier frame is left under the live one. Typing in the tab or showing it again sizes the
+    window for this tab (`select-window` on the pane's own window, which changes nothing else);
+    output and the terminal's own reports never do, so two computers showing one session do not
+    take the window from each other. What was printed while away is added as before.
+- **No tmux or screen:** once per server, ever, a strip under the tab says that shells there end
+  with the connection, with *How to Install…*; the footer offers *Keep Shells Running…* too. Only when you open it, a short
   script asks which package manager there is (`command -v` for brew, apt-get, dnf, yum, zypper,
   apk, pacman and others), the account's id and whether `sudo` exists, and the matching install
   command is shown. *Type in Terminal* types it at the prompt without pressing Return: you run it,
@@ -238,7 +266,11 @@ could run in, and their command line could take a script's lines as its own comm
 ## Files, transfers, keys and forwards
 
 - **File manager:**
-  - Lists folders with `find`, `stat` or `ls` (PowerShell on Windows).
+  - Lists folders with `find`, `stat` or `ls` (PowerShell on Windows). A folder that is not there
+    (any more) is told apart from one that cannot be opened (`[ -e ]`, and whether the folder
+    above it can be looked into). For a folder remembered from before, or the one shown being
+    deleted, a short loop of `dirname` and `cd` finds the nearest folder that is there (the home
+    folder if none is; `Split-Path` and `Test-Path` on Windows) — it only reads.
   - Creates, renames, moves or deletes only what you ask for.
   - Paste (⌘V) of items copied on the same server copies them there with `cp -R -p` (or moves them
     with `mv`, *Move Here*) under free names, never into themselves (PowerShell's `Copy-Item` /

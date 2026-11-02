@@ -78,4 +78,14 @@ import TestSupport
         #expect(KeySetup.ignoreUnknownAddingUseKeychain("!UseKeychain") == "!UseKeychain,UseKeychain")
         #expect(KeySetup.ignoreUnknownAddingUseKeychain("Use.Keychain") == "Use.Keychain,UseKeychain", "a dot is not a wildcard")
     }
+
+    /// Checking a new key answers only ssh's question for that key: a jump host's password
+    /// question on the way never gets the passphrase.
+    @Test func verifyAnswersOnlyItsKeysQuestion() {
+        let path = "/Users/user/.ssh/id_example"
+        #expect(KeySetup.asksPassphrase("Enter passphrase for key '/Users/user/.ssh/id_example': ", forKeyAt: path))
+        #expect(!KeySetup.asksPassphrase("Enter passphrase for key '/Users/user/.ssh/id_other': ", forKeyAt: path))
+        #expect(!KeySetup.asksPassphrase("user@jump.example.com's password: ", forKeyAt: path))
+        #expect(!KeySetup.asksPassphrase("(user@jump.example.com) Enter passphrase for key '/Users/user/.ssh/id_example': ", forKeyAt: path))
+    }
 }

@@ -11,7 +11,9 @@ import SSHTransport
 @MainActor
 @Suite(.serialized) final class TransferStopTests {
     let root: URL
-    let target = ConnectionTarget.adhoc(user: "user", host: "example.invalid", port: nil, jump: nil)
+    /// A host name of this test's own: what is kept per host (retry rounds, the platform, a
+    /// cancelled sign-in, reachability) is shared by every test running at the same time.
+    let target = ConnectionTarget.adhoc(user: "user", host: "stop-\(UUID().uuidString.prefix(6)).invalid", port: nil, jump: nil)
 
     init() throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tether-stop-\(UUID().uuidString.prefix(8))")
@@ -238,6 +240,92 @@ import SSHTransport
         #expect(await waitUntil(20) { again.isFinished })
         #expect(again.state == .completed)
         #expect(contents(local) == ["a.txt", "b.txt"])
+    }
+
+    /// A connection lost mid-way, more than once: the transfer is sent again by itself each time
+    /// the host can be reached (not only once), says how far it had come, and ends as one file —
+    /// nothing overwritten, nothing left over.
+    @Test func aTransferLostSeveralTimesIsSentAgainEachTime() async throws {
+        let count = root.appendingPathComponent("tries")
+        let scp = try shim("flaky-scp", """
+        n=$(cat "\(count.path)" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "\(count.path)"
+        if [ $n -le 2 ]; then echo "client_loop: send disconnect: Broken pipe" >&2; exit 1; fi
+        for a; do last=$a; done; printf data > "$last"
+        """)
+        let m = try manager(scp: scp, timeouts: TransferTimeouts())
+        let down = root.appendingPathComponent("down")
+        try FileManager.default.createDirectory(at: down, withIntermediateDirectories: true)
+        _ = m.download("/srv/x.bin", to: down.appendingPathComponent("x.bin"), target: target)
+        var notes: Set<String> = []
+        // The host answering again (a sign-in elsewhere) lets each retry go at once.
+        let done = await waitUntil(40) {
+            if let note = m.items.first?.note { notes.insert(note) }
+            HostLinks.post(.signedIn(target.key))
+            return m.items.first?.state == .completed
+        }
+        let tries = (try? String(contentsOf: count, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(done, "tries=\(tries ?? "none") states=\(m.items.map(\.state)) notes=\(m.items.map { $0.note ?? "" }) stages=\(m.items.map { "\($0.stage.map { "\($0)" } ?? "-")" })")
+        #expect(tries == "3")
+        #expect(contents(down) == ["x.bin"])
+        #expect(notes.contains { $0.contains("was lost") && $0.contains("sent again") }, "\(notes)")
+    }
+
+    /// An upload whose connection went away left a partial file, and removing it failed too (the
+    /// server could not be reached): it is removed once the server answers again, before the upload
+    /// is sent again — one complete file under its own name, no broken one beside it.
+    @Test func aPartialUploadIsRemovedBeforeItIsSentAgain() async throws {
+        let offline = root.appendingPathComponent("offline"), count = root.appendingPathComponent("scp-tries")
+        let ssh = try shim("offline-ssh", """
+        if [ -e "\(offline.path)" ]; then echo "ssh: connect to host example.invalid port 22: Network is unreachable" >&2; exit 255; fi
+        for a; do last=$a; done; exec /bin/sh -c "$last"
+        """)
+        let scp = try shim("partial-scp", """
+        for a; do prev=$last; last=$a; done
+        dest=${last#*:}
+        n=$(cat "\(count.path)" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "\(count.path)"
+        if [ $n -eq 1 ]; then
+          printf par > "$dest"; printf 'x.bin  40%%   26KB  1.0MB/s   00:01 ETA\\r'; sleep 0.3
+          touch "\(offline.path)"; echo "client_loop: send disconnect: Broken pipe" >&2; exit 1
+        fi
+        cp "$prev" "$dest"
+        """)
+        let m = try manager(ssh: ssh, scp: scp, timeouts: TransferTimeouts())
+        let src = root.appendingPathComponent("up"), dest = root.appendingPathComponent("up-dest")
+        try write("x.bin", bytes: 64, in: src)
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        _ = m.upload(src.appendingPathComponent("x.bin"), to: dest.path, target: target)
+        // The server comes back a moment after the copy broke off.
+        #expect(await waitUntil(10) { FileManager.default.fileExists(atPath: offline.path) })
+        try await Task.sleep(for: .milliseconds(500))
+        try FileManager.default.removeItem(at: offline)
+        let done = await waitUntil(40) {
+            HostLinks.post(.signedIn(target.key))
+            return m.items.first?.state == .completed
+        }
+        #expect(done, "\(m.items.map(\.state))")
+        #expect(contents(dest) == ["x.bin"], "\(contents(dest))")
+        #expect((try? Data(contentsOf: dest.appendingPathComponent("x.bin")))?.count == 64)
+    }
+
+    /// A host that never comes back: the transfer stops trying after a few rounds and says why.
+    @Test func automaticTriesAreLimited() async throws {
+        let count = root.appendingPathComponent("tries-forever")
+        let scp = try shim("lost-scp", """
+        n=$(cat "\(count.path)" 2>/dev/null || echo 0); echo $((n+1)) > "\(count.path)"
+        echo "client_loop: send disconnect: Broken pipe" >&2; exit 1
+        """)
+        let m = try manager(scp: scp, timeouts: TransferTimeouts())
+        _ = m.download("/srv/y.bin", to: root.appendingPathComponent("y.bin"), target: target)
+        let ended = await waitUntil(60) {
+            HostLinks.post(.signedIn(target.key))
+            guard let item = m.items.first, case .failed = item.state else { return false }
+            return item.retriedByItself && Int((try? String(contentsOf: count, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") == TransferManager.automaticTryLimit + 1
+        }
+        #expect(ended)
+        try? await Task.sleep(for: .seconds(2))
+        let tries = Int((try? String(contentsOf: count, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        #expect(tries == TransferManager.automaticTryLimit + 1, "tried \(tries) times")
     }
 
     // MARK: Scripts and helpers

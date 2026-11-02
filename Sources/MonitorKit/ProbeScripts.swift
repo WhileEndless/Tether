@@ -262,17 +262,19 @@ echo "@@end"
 
     public static let remoteSessions = #"""
 export LC_ALL=C
-echo "@@tmux"; tmux ls -F '#{session_name}|#{session_created}|#{session_attached}|#{session_windows}|#{session_activity}' 2>/dev/null
-panes=$(tmux list-panes -a -F '#{session_name}|#{window_index}|#{window_name}|#{window_active}|#{pane_active}|#{pane_id}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null)
+# Bounded: no more lines (or longer ones) than Tether reads, however many sessions there are.
+cap() { awk -v n="$1" 'length($0) <= 8192 { if (++c > n) exit; print }'; }
+echo "@@tmux"; tmux ls -F '#{session_name}|#{session_created}|#{session_attached}|#{session_windows}|#{session_activity}' 2>/dev/null | cap 500
+panes=$(tmux list-panes -a -F '#{session_name}|#{window_index}|#{window_name}|#{window_active}|#{pane_active}|#{pane_id}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null | cap 4000)
 echo "@@tmuxpanes"; printf '%s\n' "$panes"
-echo "@@tmuxtitles"; [ -n "$panes" ] && tmux list-panes -a -F '#{pane_id}|#{host}|#{pane_title}' 2>/dev/null
+echo "@@tmuxtitles"; [ -n "$panes" ] && tmux list-panes -a -F '#{pane_id}|#{host}|#{pane_title}' 2>/dev/null | cap 4000
 # Foreground processes of tmux panes only (not every process on the host).
 fg=
 if [ -n "$panes" ]; then
   TTYS=$(printf '%s\n' "$panes" | awk -F'|' '{ t = $7; sub(/^\/dev\//, "", t); sub(/^tty/, "", t); print t }')
   # Only the panes' terminals are asked for (not every process on the host); ps without -t: all.
   TL=$(printf '%s\n' "$TTYS" | awk 'NF { printf "%s%s", s, $0; s = "," }')
-  fg=$( { ps -t "$TL" -o pid=,tty=,stat=,args= 2>/dev/null || ps -A -o pid=,tty=,stat=,args= 2>/dev/null; } | TTYS="$TTYS" awk '
+  fg=$( { ps -t "$TL" -o pid=,tty=,stat=,args= 2>/dev/null || ps -A -o pid=,tty=,stat=,args= 2>/dev/null; } | cut -c 1-4096 | TTYS="$TTYS" awk '
     BEGIN { n = split(ENVIRON["TTYS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
     $3 ~ /\+/ { t = $2; sub(/^tty/, "", t); if (t in want) print }')
 fi
@@ -328,7 +330,7 @@ pcwd() { readlink "/proc/$1/cwd" 2>/dev/null || lsof -n -P -w -a -p "$1" -d cwd 
   esac
 done
 set +f
-echo "@@screen"; screen -ls 2>/dev/null
+echo "@@screen"; screen -ls 2>/dev/null | cap 500
 echo "@@end"
 """#
 }

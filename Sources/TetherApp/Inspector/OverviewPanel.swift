@@ -455,7 +455,7 @@ struct ErrorCard: View {
 
     /// A known ssh failure in the message (e.g. a changed host key), said in a sentence.
     private var diagnosis: (String, String)? {
-        message.split(whereSeparator: \.isNewline).lazy.compactMap { ConnectionProgress.diagnose(String($0)) }.first
+        ConnectionProgress.diagnose(lines: message.split(whereSeparator: \.isNewline).map(String.init))
     }
 
     var body: some View {

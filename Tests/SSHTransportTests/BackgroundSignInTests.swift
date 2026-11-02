@@ -101,6 +101,45 @@ import TetherCore
         #expect(!r("(user@web.example.com) New password: ").isPlainPasswordPrompt)
         #expect(!r("(user@web.example.com) Verification code: ").isPlainPasswordPrompt)
         #expect(!r("Enter passphrase for key '/tmp/none': ").isPlainPasswordPrompt)
+        // PAM stacks word the same question in other ways.
+        #expect(r("(user@web.example.com) password: ").isPlainPasswordPrompt)
+        #expect(r("(user@web.example.com) Password for user@EXAMPLE.COM: ").isPlainPasswordPrompt)
+        #expect(!r("(user@web.example.com) Password for user@EXAMPLE.COM and then a code: ").isPlainPasswordPrompt)
+    }
+
+    /// A directory account (`user@corp.example.com`) holds "@": the host is what follows the last one.
+    @Test func userNamesWithAnAtSign() {
+        func r(_ prompt: String) -> AskPassRequest {
+            AskPassRequest(token: "t", targetKey: "web", purpose: "connect", prompt: prompt, sequence: 1)
+        }
+        let own = r("user@corp.example.com@web.example.com's password: ")
+        #expect(own.sshNamedLogin?.user == "user@corp.example.com" && own.sshNamedLogin?.host == "web.example.com")
+        #expect(own.isPlainPasswordPrompt)
+        let kbd = r("(user@corp.example.com@web.example.com) Password: ")
+        #expect(kbd.sshNamedLogin?.user == "user@corp.example.com" && kbd.sshNamedLogin?.host == "web.example.com")
+        #expect(kbd.isPlainPasswordPrompt && kbd.isServerText)
+        #expect(kbd.serverQuestion == "Password:")
+    }
+
+    /// Only the account's own password is filled from the keychain, counted as refused when asked
+    /// again, and saved — never a one-time code, a second factor or a new password, whatever the
+    /// server calls it.
+    @Test func loginPasswordQuestionsOnly() {
+        func r(_ prompt: String) -> AskPassRequest {
+            AskPassRequest(token: "t", targetKey: "web", purpose: "connect", prompt: prompt, sequence: 1)
+        }
+        for login in ["user@web.example.com's password: ", "(user@web.example.com) Password: ",
+                      "(user@web.example.com) LDAP Password: ", "(user@web.example.com) Password for user@EXAMPLE.COM: ",
+                      "(user@web.example.com) Password for user2: "] {
+            #expect(r(login).isLoginPasswordPrompt, "\(login)")
+        }
+        for other in ["(user@web.example.com) One-time password (OATH) for 'user': ", "(user@web.example.com) One time password: ",
+                      "(user@web.example.com) New password: ", "(user@web.example.com) Current password: ",
+                      "(user@web.example.com) Retype new password: ", "(user@web.example.com) Password + PIN: ",
+                      "(user@web.example.com) OTP password: ", "(user@web.example.com) Verification code: ",
+                      "(user@web.example.com) Enter your 2FA password: "] {
+            #expect(!r(other).isLoginPasswordPrompt, "\(other)")
+        }
     }
 
     /// Ending a sign-in ends what it started (a ProxyJump ssh), children found through the parent chain.

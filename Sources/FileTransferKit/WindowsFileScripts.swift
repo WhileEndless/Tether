@@ -29,6 +29,7 @@ if ($p -eq '/') {
   exit 0
 }
 $p = WinPath $p
+if (-not (Test-Path -LiteralPath $p)) { [Console]::Error.WriteLine("Directory not found: $($A[0])"); exit 1 }
 try { $item = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch { [Console]::Error.WriteLine("Cannot open directory: $($A[0])"); exit 1 }
 Slash $item.FullName
 Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -38,6 +39,15 @@ Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue |
   $target = if ($_.LinkType) { ($_.Target | Select-Object -First 1) -replace '\\', '/' } else { '' }
   "$kind`t$mode`t-`t-`t$size`t$(Epoch $_.LastWriteTime)`t$target`t$($_.Name)"
 }
+"""#
+
+    /// The nearest existing folder at or above `$A[0]` (the home folder when none is), as the
+    /// listing shows it (`RemoteFileSystem.nearestScript`).
+    static let nearest = pathHelper + #"""
+$p = WinPath $A[0]
+while ($p -and -not (Test-Path -LiteralPath $p -PathType Container)) { $p = Split-Path -Parent $p }
+if (-not $p) { $p = $HOME }
+Slash (Get-Item -LiteralPath $p -Force).FullName
 """#
 
     /// The file manager's search: the resolved folder, then the matches in the listing's format
@@ -151,7 +161,22 @@ exit $LASTEXITCODE
 
     static let makeDirectory = pathHelper + "New-Item -ItemType Directory -Force -Path (WinPath $A[0]) -ErrorAction Stop | Out-Null\n"
 
-    static let rename = pathHelper + "Move-Item -LiteralPath (WinPath $A[0]) -Destination (WinPath $A[1]) -ErrorAction Stop\n"
+    /// Never over something that is there (Move-Item would move into a folder of that name). A new
+    /// spelling of the same name (`readme` → `README`) is that very item: renamed through a free
+    /// temporary name, as Windows does not move a folder onto its own name.
+    static let rename = pathHelper + #"""
+$s = WinPath $A[0]
+$d = WinPath $A[1]
+if ($s -ceq $d) { exit 0 }
+if ($s -ieq $d) {
+  $t = Join-Path ([IO.Path]::GetDirectoryName($s)) ('.tether-rename-' + [guid]::NewGuid().ToString('N'))
+  Move-Item -LiteralPath $s -Destination $t -ErrorAction Stop
+  Move-Item -LiteralPath $t -Destination $d -ErrorAction Stop
+  exit 0
+}
+if (Test-Path -LiteralPath $d) { [Console]::Error.WriteLine('Something named that is already there.'); exit 1 }
+Move-Item -LiteralPath $s -Destination $d -ErrorAction Stop
+"""#
 
     static let delete = pathHelper + #"""
 $p = WinPath $A[0]

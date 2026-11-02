@@ -191,13 +191,31 @@ if grep -qF "$1" "$HOME/.ssh/authorized_keys" 2>/dev/null; then echo exists; els
                "-o", "KbdInteractiveAuthentication=no", "-o", "IdentitiesOnly=yes", "-o", "NumberOfPasswordPrompts=1",
                "-i", key.privateKeyURL.path, "-o", "ConnectTimeout=15"]
             + SSHOptions.destinationArguments(for: target) + ["exit"]
-        let env = passphrase.map { AskPassBridge.shared.environment(answering: $0, purpose: "key-verify") }
-            ?? AskPassBridge.shared.environment(targetKey: target.key, purpose: "key-verify")
-        let r = await ProcessRunner.run(opts.sshBinary, arguments: args, environment: env, timeout: 60)
+        // The passphrase answers only ssh's question for this very key: a jump host on the way
+        // (ProxyJump) asks through the same helper, and must never be sent it as its password.
+        let env = passphrase.map { phrase in
+            let path = key.privateKeyURL.path
+            return AskPassBridge.shared.environment(answers: { question in
+                Self.asksPassphrase(question, forKeyAt: path) ? phrase : nil
+            }, purpose: "key-verify")
+        } ?? AskPassBridge.shared.environment(targetKey: target.key, purpose: "key-verify")
+        // Its passphrase question (when asked) may stay open a while: the time does not run out then.
+        let r = await ProcessRunner.run(opts.sshBinary, arguments: args, environment: env, timeout: 60,
+                                        waitWhile: { AskPassBridge.shared.waitsOnUser(environment: env) })
         AskPassBridge.shared.revoke(environment: env)
         if r.status == 0 { return nil }
         let said = r.errorOutput.split(separator: "\n").last.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
         return said.isEmpty ? "Key login failed (the server may not allow public keys)." : said
+    }
+
+    /// Whether `question` is ssh's own `Enter passphrase for key '<path>':` for the key at `path`.
+    static func asksPassphrase(_ question: String, forKeyAt path: String) -> Bool {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = q.wholeMatch(of: #/Enter passphrase for (?:key )?'(.+)': ?/#) else { return false }
+        func canonical(_ p: String) -> String {
+            URL(fileURLWithPath: (p as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        return canonical(String(m.1)) == canonical(path)
     }
 
     /// Windows OpenSSH: the user's `~/.ssh/authorized_keys`, and for administrators also

@@ -191,6 +191,8 @@ final class ArchiveJob: TransferJob {
         // Nothing moving for too long (a connection gone silent, a server that stopped reading):
         // stopped with a clear message rather than waiting for ever.
         let watchdog = StallWatchdog(timeouts: timeouts) { [weak self] in self?.stall() }
+        let asking = environment
+        watchdog.waitWhile = { AskPassBridge.shared.waitsOnUser(environment: asking) }
         self.watchdog = watchdog
         watchdog.start()
 
@@ -292,6 +294,7 @@ final class ArchiveJob: TransferJob {
         guard item.state == .running, !finished else { return }
         // Going up, the first megabytes fill pipes and buffers before ssh has even connected.
         watchdog?.activity(warm: bytes >= (item.direction == .upload ? 8 << 20 : 1))
+        if bytes > item.bytesDone { item.lastActivity = Date() }
         item.bytesDone = bytes
         if let total = item.totalBytes, total > 0 {
             item.progress = min(Double(bytes) / Double(total), 0.99)
@@ -450,9 +453,10 @@ final class ArchiveJob: TransferJob {
             p.environment = ChildEnvironment.local
             return p
         }
-        let command = (["sh", "-c", script.shellQuoted, "sh"] + arguments.map(\.shellQuoted)).joined(separator: " ")
+        // Its own sign-in (sharing off): an unreachable server fails after the usual time.
         let args = options.commonOptions() + ["-T"]
-            + SSHOptions.destinationArguments(for: item.target, jump: !options.usesSharedConnection) + [command]
+            + (options.usesSharedConnection ? [] : ["-o", "ConnectTimeout=\(options.connectTimeout)"])
+            + options.destination(item.target) + [RemoteChannel.shCommand(script, arguments: arguments)]
         let p = Self.process(options.sshBinary, args)
         var env = ChildEnvironment.base
         for (k, v) in environment { env[k] = v }
@@ -689,13 +693,19 @@ final class ErrorCollector: @unchecked Sendable {
 /// Fails a transfer that moved nothing for too long, instead of letting it wait for ever. Before
 /// any real data moved, the longer `firstData` limit applies (the connection may still be signing
 /// in, waiting for a password); after that, `stall`.
+///
+/// Only time the Mac is awake counts (system uptime), and a check that comes late — the Mac slept,
+/// or macOS held Tether back — starts the count again: a transfer over a connection that survived
+/// the sleep goes on instead of failing as "stalled" the moment the Mac wakes.
 @MainActor
 final class StallWatchdog {
     private let timeouts: TransferTimeouts
     private let onStall: @MainActor () -> Void
-    private var last = Date()
+    private var last = ProcessInfo.processInfo.systemUptime
     private(set) var isWarm = false
     private var task: Task<Void, Never>?
+    /// While this holds (its ssh's own password question is open), nothing moving is not a stall.
+    var waitWhile: () -> Bool = { false }
 
     init(timeouts: TransferTimeouts, onStall: @escaping @MainActor () -> Void) {
         self.timeouts = timeouts
@@ -703,14 +713,18 @@ final class StallWatchdog {
     }
 
     func start() {
-        last = Date()
+        last = ProcessInfo.processInfo.systemUptime
         let step = max(min(timeouts.stall / 4, 1), 0.05)
         task = Task { @MainActor [weak self] in
+            var checked = ProcessInfo.processInfo.systemUptime
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(step))
                 guard let self, !Task.isCancelled else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                defer { checked = now }
+                if now - checked > step * 2 + 3 || self.waitWhile() { self.last = now; continue }
                 let limit = self.isWarm ? self.timeouts.stall : max(self.timeouts.firstData, self.timeouts.stall)
-                if Date().timeIntervalSince(self.last) > limit {
+                if now - self.last > limit {
                     self.stop()
                     self.onStall()
                     return
@@ -721,7 +735,7 @@ final class StallWatchdog {
 
     /// Something moved; `warm`: real data (from now on the shorter limit applies).
     func activity(warm: Bool) {
-        last = Date()
+        last = ProcessInfo.processInfo.systemUptime
         if warm { isWarm = true }
     }
 
@@ -733,26 +747,44 @@ final class StallWatchdog {
 
 /// Readable reasons for a failed transfer.
 enum TransferFailure {
-    /// What ssh and scp say when the connection went away under them.
-    static let lostConnectionMarkers = [
-        "broken pipe", "connection reset", "connection closed", "closed by remote host", "client_loop",
-        "lost connection", "connection timed out", "timeout, server", "read from master failed", "mux_client",
-        "network is unreachable", "no route to host", "connection refused", "control socket connect",
-    ]
-
-    static func isLostConnection(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        return lostConnectionMarkers.contains { lower.contains($0) }
-            || lower.contains("connection to") && lower.contains("closed")
-    }
+    static func isLostConnection(_ text: String) -> Bool { SSHFailure.isLostDuringTransfer(text) }
 
     static func message(_ errors: String, host: String, fallback: String) -> String {
         let cleaned = ArchiveJob.clean(errors)
+        // The jump host answered but could not reach the server (before the session limit below:
+        // its "administratively prohibited" is the jump host's, not the server's MaxSessions).
+        if SSHFailure.isJumpCannotReachTarget(errors) {
+            let why = SSHFailure.jumpFailureReason(errors).map { " (\($0))" } ?? ""
+            return "The jump host could not reach \(host)\(why), so the transfer did not go through. It is sent again once \(host) can be reached."
+        }
+        // Not a lost connection: the server's limit of sessions per connection (MaxSessions).
+        if SharedConnections.isSessionRefused(errors) {
+            return "\(host) refused one more session on its connection (the server limits sessions per connection), so the transfer did not start. Retry in a moment, or close some of its tabs."
+        }
         if isLostConnection(errors) {
             let reason = cleaned.split(separator: "\n").last.map { "\n" + $0 } ?? ""
             return "The connection to \(host) was lost, so the transfer stopped. Retry sends it again from the start.\(reason)"
         }
         return cleaned.isEmpty ? fallback : cleaned
+    }
+
+    /// A failure the connection caused (lost, or stalled), which one more try may not have.
+    static func isConnectionFailure(_ message: String) -> Bool {
+        message.contains("was lost, so the transfer stopped") || message.hasPrefix("Nothing moved for ")
+    }
+
+    /// Tried once more by itself once the host can be reached: its connection was lost or stalled,
+    /// the server's session limit was reached for a moment, the network was not there, or its
+    /// sign-in was stopped while nobody could answer (asleep, locked).
+    static func waitsForConnection(_ message: String) -> Bool {
+        isConnectionFailure(message) || waitsForUser(message) || message.contains("refused one more session")
+            || message.hasPrefix("The jump host could not reach")
+            || SSHFailure.isNetwork(message) || SSHFailure.isUnreachable(message)
+    }
+
+    /// Its sign-in was stopped (nobody there to answer, Tether locked): tried again once someone is.
+    static func waitsForUser(_ message: String) -> Bool {
+        message.contains("The sign-in was stopped")
     }
 
     static func stalled(host: String, after seconds: TimeInterval) -> String {

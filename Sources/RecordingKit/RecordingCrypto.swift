@@ -579,6 +579,13 @@ public enum RecordingReader {
     }
     private static let partCache = PartCache()
 
+    /// Tether was locked: decrypted output kept for scrolling back is let go at once.
+    public static func forgetDecrypted() {
+        partCache.lock.lock()
+        partCache.entry = nil
+        partCache.lock.unlock()
+    }
+
     static func tail(ofFile url: URL, lines: Int, key loaded: SymmetricKey?) -> [UInt8]? {
         if RecordingCompression.isCompressed(url) {
             let data = slice(ofFile: url, around: 1, maxBytes: tailMaxBytes, key: loaded).0

@@ -3,6 +3,8 @@ import Observation
 import SwiftUI
 import TetherCore
 import SessionKit
+import SSHTransport
+import MonitorKit
 
 /// How a new session should be shown.
 enum OpenMode {
@@ -238,28 +240,48 @@ final class WindowState {
     }
 
     /// Ends the session on the server. Not connected: the server is reached first (one sign-in for
-    /// it if needed); if it cannot be reached, the user chooses to keep the session disconnected or
-    /// to have it ended as soon as the server can be reached again.
+    /// it if needed); if it cannot be reached in a few seconds, the user chooses to keep the session
+    /// in the background, or to be reminded once the server can be reached — nothing is ended on
+    /// the server without them. A tab that never connected has nothing there: it just closes.
     private func endOnServer(_ session: TerminalSession) {
         let persistent = session.persistence == .tmux || session.persistence == .screen
         guard !session.phase.isOnline, persistent, !session.descriptor.target.isLocal else {
             model.sessions.close(session.id, killRemote: true)
             return
         }
+        guard session.mayHoldServerWork else {
+            model.sessions.close(session.id, killRemote: false)
+            return
+        }
+        // Tried in the background; the choice comes after a few seconds at most (at once while the
+        // network is away), not after every limit of a sign-in that cannot work.
+        let offline = session.connectivityHeld
+        let ending: Task<Bool, Never>? = offline ? nil : Task { @MainActor [model] in await model.sessions.endOnServer(session.id) }
+        let host = session.descriptor.target.key
         Task { @MainActor [weak self, model] in
-            if await model.sessions.endOnServer(session.id) { return }
-            guard let self else { return }
+            // The user answering its sign-in (a password) does not count against the few seconds.
+            var ended: Bool?
+            if let ending {
+                ended = await Deadline.run(seconds: 8, paused: {
+                    AskPassBridge.shared.waitsOnUser(where: { ConnectionGate.key($0) == ConnectionGate.key(host) })
+                }) { await ending.value }
+            }
+            if ended == true { return }
+            guard let self, model.sessions.session(session.id) != nil else { return }
             let alert = NSAlert()
             alert.messageText = "\(session.descriptor.target.displayName) cannot be reached"
-            alert.informativeText = "The session \u{201C}\(session.displayTitle)\u{201D} keeps running on the server until it can be ended there.\n\nEnd When Connected moves the tab to the background and ends the session as soon as the server can be reached (if the server asks for a password and none is remembered, it waits until you open one of its tabs). Keep in Background keeps it for you to close later. Opening it again takes the request back."
-            alert.addButton(withTitle: "End When Connected")
+            alert.informativeText = "The session \u{201C}\(session.displayTitle)\u{201D} may still be running on the server.\n\nClose for Now moves the tab to the background; once \(session.descriptor.target.displayName) can be reached, Tether tells you whether the session is still there, and you decide whether to end it. Nothing is ended without you. Keep in Background keeps it as it is."
+            alert.addButton(withTitle: "Close for Now")
             alert.addButton(withTitle: "Keep in Background")
             alert.addButton(withTitle: "Cancel")
+            // What was asked is said here now: the attempt still trying in the background stops
+            // (also on the server), so nothing is ended behind the user's choice.
+            ending?.cancel()
             let handle: (NSApplication.ModalResponse) -> Void = { response in
                 switch response {
                 case .alertFirstButtonReturn:
                     model.workspaces.detach(session.id)
-                    model.sessions.endWhenConnected(session.id)
+                    model.sessions.closeWhileOffline(session.id)
                 case .alertSecondButtonReturn:
                     self.disconnectToBackground(session)
                 default:
@@ -274,41 +296,65 @@ final class WindowState {
     func terminateAll(on target: ConnectionTarget) {
         let open = model.sessions.sessions(for: target.key).filter { !$0.phase.isDead }
         let monitor = model.monitor(for: target)
+        let left = detachedSessions(on: target)
         confirm("Terminate all sessions on \(target.displayName)?",
-                "\(open.count) open session\(open.count == 1 ? "" : "s") and any detached Tether sessions on the server will be stopped. Your own tmux sessions are not touched.") { [model] in
+                "\(open.count) open session\(open.count == 1 ? "" : "s") and the sessions tabs closed on this Mac left running there will be stopped. Your own tmux sessions, and Tether sessions this Mac did not leave there, are not touched.") { [model] in
             for s in open { model.sessions.close(s.id, killRemote: true) }
-            Task { _ = await monitor.cleanUpOrphans(keeping: []) }
+            Task {
+                for name in await monitor.endSessions(left) { model.sessions.forgetLeftSession(on: target.key, named: name) }
+            }
         }
     }
 
-    /// Tether's sessions on a host that no tab here has open (detached): they may be tabs the last
-    /// run left behind, still running. Asked first, naming them: opened again as tabs, or ended.
+    /// Names of the server sessions the tabs here have open.
+    private func openSessionNames(on target: ConnectionTarget) -> Set<String> {
+        Set(model.sessions.sessions(for: target.key).filter { !$0.phase.isDead }.map(\.descriptor.remoteSessionName))
+    }
+
+    /// Sessions on the server that tabs closed on this Mac left running (see `LeftSession`), not
+    /// open in a tab and with nobody attached. Only these are opened or ended in a batch: a Tether
+    /// session this Mac did not leave there may be another Mac's — or someone else's who signs in
+    /// with the same account — and is only ever opened or ended one by one.
+    func detachedSessions(on target: ConnectionTarget) -> [RemoteSessionEntry] {
+        guard !target.isLocal else { return [] }
+        let open = openSessionNames(on: target)
+        return model.monitor(for: target).remoteSessions.filter {
+            $0.isTether && !open.contains($0.name) && !$0.attached
+                && model.sessions.leftSession(on: target.key, named: $0.name) != nil
+        }
+    }
+
+    /// The sessions tabs closed on this Mac left running on a host (`detachedSessions`). Asked
+    /// first, naming them: opened again as tabs (under their tabs' names), or ended.
     func cleanUpLeftovers(on target: ConnectionTarget, done: @escaping () -> Void = {}) {
         let monitor = model.monitor(for: target)
-        let open = Set(model.sessions.sessions(for: target.key).filter { !$0.phase.isDead }.map(\.descriptor.remoteSessionName))
-        let leftovers = monitor.remoteSessions.filter { $0.isTether && !open.contains($0.name) && !$0.attached }
+        let leftovers = detachedSessions(on: target)
         guard !leftovers.isEmpty else { done(); return }
         let alert = NSAlert()
-        alert.messageText = "\(leftovers.count) Tether session\(leftovers.count == 1 ? " is" : "s are") not open in any tab on \(target.displayName)"
+        alert.messageText = "\(leftovers.count) session\(leftovers.count == 1 ? "" : "s") from tabs closed on this Mac \(leftovers.count == 1 ? "is" : "are") still running on \(target.displayName)"
         let listed = leftovers.prefix(8).map { e -> String in
-            var line = "• " + e.name
+            let name = model.sessions.leftSession(on: target.key, named: e.name)?.title.map { DisplayText.clean($0, limit: 60) }
+            var line = "• " + (name.map { "\($0) (\(e.name))" } ?? e.name)
             if let at = e.lastActivity ?? e.created { line += " — last used " + at.formatted(date: .abbreviated, time: .shortened) }
             if let w = e.windows, w > 1 { line += ", \(w) windows" }
             return line
         }
         alert.informativeText = (listed + (leftovers.count > 8 ? ["and \(leftovers.count - 8) more"] : [])).joined(separator: "\n")
-            + "\n\nThey may still hold work (a tab the last run did not bring back). Open them as tabs, or end them and what runs in them."
+            + "\n\nOpen them as tabs again, or end them and what runs in them. Other sessions on the server are not included."
         alert.addButton(withTitle: "Open as Tabs")
         alert.addButton(withTitle: "End Them")
         alert.addButton(withTitle: "Cancel")
         alert.buttons[1].hasDestructiveAction = true
-        let answer: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+        let answer: (NSApplication.ModalResponse) -> Void = { [weak self, model] response in
             switch response {
             case .alertFirstButtonReturn:
                 for e in leftovers { self?.connect(target, remoteSessionName: e.name, persistence: e.kind == .tmux ? .tmux : .screen) }
                 done()
             case .alertSecondButtonReturn:
-                Task { _ = await monitor.cleanUpOrphans(keeping: open); done() }
+                Task {
+                    for name in await monitor.endSessions(leftovers) { model.sessions.forgetLeftSession(on: target.key, named: name) }
+                    done()
+                }
             default:
                 done()
             }

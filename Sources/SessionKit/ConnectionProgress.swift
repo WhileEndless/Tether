@@ -48,6 +48,10 @@ public struct ConnectionProgress: Equatable, Sendable {
 
     /// Lines from ssh's own log file (`-E`), which nothing on the server can write into.
     var sshLog: [String] = []
+    /// What ssh itself said (its errors and warnings), without its `-v` steps: those name files
+    /// that are not there on every connection (`load_hostkeys: fopen …/known_hosts2: No such file
+    /// or directory`), which says nothing about why a connection failed.
+    public private(set) var sshSaid: [String] = []
 
     /// The server's host key differs from the trusted one (ssh refused to connect). Read only from
     /// ssh's own log: text printed by the server could imitate the warning.
@@ -61,6 +65,10 @@ public struct ConnectionProgress: Equatable, Sendable {
     /// Updates the step from one line of `ssh -v` output.
     mutating func ingest(_ raw: String) {
         let line = raw.hasPrefix("debug1: ") ? String(raw.dropFirst(8)) : raw
+        if !raw.hasPrefix("debug") {
+            sshSaid.append(raw)
+            if sshSaid.count > 100 { sshSaid.removeFirst(sshSaid.count - 100) }
+        }
         append(line)
         sshLog.append(line)
         if sshLog.count > 400 { sshLog.removeFirst(sshLog.count - 400) }
@@ -94,25 +102,58 @@ public struct ConnectionProgress: Equatable, Sendable {
             step = .startSession
             detail = "Opening a shell"
         }
-        if let (problem, hint) = Self.diagnose(line) {
+        // A clearer cause said before is kept: the jump host's "cannot reach the server" is
+        // followed by ssh's generic "connection closed during the handshake".
+        if let (problem, hint) = Self.diagnose(line), Self.rank(line) >= failureRank {
             failure = problem
             self.hint = hint
+            failureRank = Self.rank(line)
         }
+    }
+
+    private var failureRank = 0
+
+    /// How much a line says about the cause: what the jump host said beats the generic end that
+    /// follows it.
+    static func rank(_ line: String) -> Int {
+        // The jump host's line with its reason beats ssh's "stdio forwarding failed" after it.
+        if SSHFailure.jumpFailureReason(line) != nil { return 4 }
+        if SSHFailure.isJumpCannotReachTarget(line) { return 3 }
+        let l = line.lowercased()
+        if l.contains("kex_exchange_identification") || l.contains("connection closed by") { return 1 }
+        return 2
+    }
+
+    /// The most telling diagnosis among `lines` (the last of the most telling, as ssh said them).
+    public static func diagnose(lines: [String]) -> (String, String)? {
+        var best: (rank: Int, found: (String, String))?
+        for line in lines {
+            guard let found = diagnose(line) else { continue }
+            let r = rank(line)
+            if best == nil || r >= best!.rank { best = (r, found) }
+        }
+        return best?.found
     }
 
     /// ssh's words for a server it could not reach at all (no answer, refused, no route, no such
     /// name, the connection closed before ssh's greeting): the same for every tab to that server,
     /// unlike a refused sign-in or a cancelled question, which belong to one login.
-    public static func isUnreachable(_ text: String) -> Bool {
-        let l = text.lowercased()
-        return ["connection timed out", "operation timed out", "connection refused", "no route to host",
-                "network is unreachable", "host is down", "could not resolve hostname",
-                "kex_exchange_identification", "banner exchange"].contains { l.contains($0) }
-    }
+    public static func isUnreachable(_ text: String) -> Bool { SSHFailure.isUnreachable(text) }
 
     /// Recognises well-known ssh failures and suggests what to do.
     public static func diagnose(_ line: String) -> (String, String)? {
         let l = line.lowercased()
+        // Before the plain words below ("connection refused", "no route to host"): here they are
+        // the jump host's about the server behind it, not this Mac's about the jump host.
+        if SSHFailure.isJumpCannotReachTarget(line) {
+            if l.contains("administratively prohibited") {
+                return ("The jump host does not allow connections through it to this server.",
+                        "Its sshd may forbid forwarding (AllowTcpForwarding), or only allow some destinations.")
+            }
+            let why = SSHFailure.jumpFailureReason(line).map { " (\($0))" } ?? ""
+            return ("The jump host answered, but could not reach the server\(why).",
+                    "Check the server's address and port as the jump host sees them, and that the server is up.")
+        }
         if l.contains("permission denied") {
             return ("The server rejected the sign-in.", "Check the user name, password or key. Use “Edit Host…” or “Set Up SSH Key…”.")
         }

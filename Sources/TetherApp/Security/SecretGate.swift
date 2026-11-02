@@ -39,10 +39,27 @@ final class SecretGate {
 
     var isRequired: Bool { AppModel.shared.settings.requireAuthForSavedPasswords }
 
+    /// A saved password read now would ask for Touch ID (required, and not just confirmed).
+    var needsCheck: Bool {
+        let settings = AppModel.shared.settings
+        guard settings.requireAuthForSavedPasswords else { return false }
+        if let last = lastSuccess, Date().timeIntervalSince(last) < Double(settings.authGraceSeconds) { return false }
+        return true
+    }
+
+    /// The user just proved who they are (unlocked Tether): counts as a Touch ID check.
+    func noteAuthenticated() { lastSuccess = Date() }
+
     /// True when the user confirmed (or no confirmation is required right now).
-    func authorize(_ reason: String) async -> Bool {
-        // Behind the lock screen nobody should be asked (a reconnect needing a saved password waits).
-        await AppLock.shared.waitUntilUnlocked()
+    /// `byUser`: asked for by a click (Fill, a passphrase change): the user is there, whatever a
+    /// missed wake or unlock notice left `screenAway` saying.
+    func authorize(_ reason: String, byUser: Bool = false) async -> Bool {
+        // Behind the lock screen nobody should be asked (a reconnect needing a saved password waits),
+        // nor while nobody is at the Mac: the request would fail unseen.
+        if !byUser {
+            await AppLock.shared.waitUntilUnlocked()
+            if needsCheck { await AppLock.shared.waitUntilPresent() }
+        }
         let settings = AppModel.shared.settings
         guard settings.requireAuthForSavedPasswords else { return true }
         if let last = lastSuccess, Date().timeIntervalSince(last) < Double(settings.authGraceSeconds) { return true }
@@ -53,6 +70,9 @@ final class SecretGate {
             ctx.localizedCancelTitle = "Type It Instead"
             var error: NSError?
             guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return false }
+            // While the sheet is up the user is being asked: sign-ins waiting for it may wait.
+            AskPassBridge.shared.beginUserCheck()
+            defer { AskPassBridge.shared.endUserCheck() }
             do {
                 try await ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
                 return true
@@ -69,13 +89,20 @@ final class SecretGate {
 
     /// Ends the grace period: the next saved password needs a new check.
     func lock() {
-        lastSuccess = nil
-        // Saved passwords remembered for this run need Touch ID again too; with "forget when
-        // locking", typed ones go as well.
         let model = AppModel.shared
+        if lastSuccess != nil || model.settings.forgetSignInPasswordsOnLock {
+            ConnectionLog.shared.info("The screen locked, the display slept or the Mac went to sleep", .app,
+                                      detail: model.settings.forgetSignInPasswordsOnLock
+                                          ? "remembered passwords are forgotten (Also forget them when the screen locks)"
+                                          : "remembered passwords are kept; a saved one read from the keychain asks for \(methodName) again")
+        }
+        lastSuccess = nil
+        // Passwords remembered for this run (typed, or read from the keychain after Touch ID) stay:
+        // reconnecting after sleep does not ask again. With "forget when locking" they all go.
         model.quickConnectPasswords.removeAll()
-        if model.settings.forgetSignInPasswordsOnLock { model.passwordCache.removeAll() }
-        else if isRequired { model.passwordCache.removeKeychainEntries() }
+        if model.settings.forgetSignInPasswordsOnLock {
+            model.passwordCache.removeAll(reason: "the screen locked or the Mac slept (Settings ▸ Passwords)")
+        }
     }
 }
 

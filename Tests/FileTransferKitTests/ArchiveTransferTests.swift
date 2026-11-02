@@ -10,7 +10,9 @@ import SSHTransport
 @Suite(.serialized) final class ArchiveTransferTests {
     let root: URL
     let shim: URL
-    let target = ConnectionTarget.adhoc(user: "user", host: "example.invalid", port: nil, jump: nil)
+    /// A host name of this test's own: what is kept per host (retry rounds, the platform, a
+    /// cancelled sign-in, reachability) is shared by every test running at the same time.
+    let target = ConnectionTarget.adhoc(user: "user", host: "archive-\(UUID().uuidString.prefix(6)).invalid", port: nil, jump: nil)
 
     init() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("tether-archive-\(UUID().uuidString)")

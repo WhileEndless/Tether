@@ -29,6 +29,10 @@ import TestSupport
         #expect(text.contains("defscrollback 50000"))
         #expect(!text.contains("PLANTED"))
         #expect(!text.contains(".tether-screenrc-\(getuid())"))
+        // A display that stopped reading (a connection gone dead) never holds the session up.
+        #expect(text.contains("defnonblock 5"))
+        // Alongside another display of the session, never pushing it out (the two would take turns).
+        #expect(command.contains("-x -RR") && !command.contains("-D -RR"))
     }
 
     /// Re-attaching: the session is reported gone only when tmux says so (it answers without the

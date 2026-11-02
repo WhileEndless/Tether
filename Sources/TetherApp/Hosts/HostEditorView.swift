@@ -243,8 +243,8 @@ struct HostEditorView: View {
                     // Read off the main thread: macOS may ask whether Tether may use the item first.
                     Task {
                         if let pw = await PasswordVault.passwordOffThread(for: old) {
-                            PasswordVault.setPassword(pw, for: newAlias)
-                            PasswordVault.deletePassword(for: old)
+                            Credentials.save(pw, for: newAlias)
+                            Credentials.remove(old)
                         }
                     }
                 }
@@ -258,9 +258,9 @@ struct HostEditorView: View {
                 $0.notes = notes
             }
             if auth == .password && !password.isEmpty {
-                PasswordVault.setPassword(password, for: newAlias)
+                Credentials.save(password, for: newAlias)
             } else if auth != .password {
-                PasswordVault.deletePassword(for: newAlias)
+                Credentials.remove(newAlias)
             }
             dismiss()
             if setUpKeyAfterSave {

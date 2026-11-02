@@ -25,6 +25,54 @@ import Testing
     }
 }
 
+/// Recordings never fill the disk: short of the free space kept, the oldest closed ones go even
+/// below the storage limit, until that much is free again.
+@Suite struct FreeSpaceTests {
+    @Test func theOldestGoWhenTheDiskRunsShort() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-test-\(UUID())")
+        let host = dir.appendingPathComponent("host")
+        try FileManager.default.createDirectory(at: host, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for i in 0..<4 {
+            let url = host.appendingPathComponent("r\(i).\(RecordingStore.fileExtension)")
+            try Data(repeating: 0x41, count: 1000).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(1000 + i))],
+                                                  ofItemAtPath: url.path)
+        }
+        // Room within the limit, and on the disk: nothing goes.
+        #expect(RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 500, free: { _ in 10_000 }).isEmpty)
+        // 1,500 bytes short of the free space kept: the two oldest go (the disk then has it).
+        var free: Int64 = 0
+        let removed = RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 2_000, free: { _ in free == 0 ? 500 : free })
+        free = 2_500
+        #expect(removed.map(\.lastPathComponent).sorted() == ["r0.ttylog", "r1.ttylog"])
+        // Not watched (0): the limit alone decides.
+        #expect(RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 0, free: { _ in 1 }).isEmpty)
+    }
+
+    /// Something else filled the disk: the recordings are not thrown away for it — none when even
+    /// all of them would not free enough (the disk completely full included), and never below a
+    /// quarter of the limit.
+    @Test func recordingsAreNotThrownAwayForADiskSomethingElseFilled() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-test-\(UUID())")
+        let host = dir.appendingPathComponent("host")
+        try FileManager.default.createDirectory(at: host, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for i in 0..<4 {
+            let url = host.appendingPathComponent("r\(i).\(RecordingStore.fileExtension)")
+            try Data(repeating: 0x41, count: 1000).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(1000 + i))],
+                                                  ofItemAtPath: url.path)
+        }
+        // 4,000 bytes of recordings, 9,000 short: removing them all would not help.
+        #expect(RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 10_000, free: { _ in 1_000 }).isEmpty)
+        #expect(RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 10_000, free: { _ in 0 }).isEmpty)
+        // 3,500 short: down to a quarter of the 10,000 limit (2,500), not to 500 — two go, not three.
+        let removed = RecordingStore.enforceQuota(in: dir, quota: 10_000, keepFree: 3_600, free: { _ in 100 })
+        #expect(removed.map(\.lastPathComponent).sorted() == ["r0.ttylog", "r1.ttylog"], "\(removed.map(\.lastPathComponent))")
+    }
+}
+
 @Suite struct RecordingCompressionTests {
     @Test func compressesOldRecordingsAndReadsThemBack() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-z-\(UUID())")

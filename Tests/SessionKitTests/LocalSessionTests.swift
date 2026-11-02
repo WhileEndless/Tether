@@ -40,6 +40,10 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 /// A fake `ssh` executes the remote command with `sh` on this machine, using a private tmux server.
 @MainActor
 @Suite(.serialized) final class LocalSessionTests {
+    /// A host name of this suite's own: per-host state (the sign-in queue, retry rounds, platform
+    /// cache) is shared by every test running at the same time, and the fake ssh ignores the name.
+    let host = ConnectionTarget.alias("local-" + String(UUID().uuidString.prefix(6)))
+
     let dir: URL
     let fakeSSH: URL
 
@@ -148,7 +152,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         settings.recordingEnabled = false
         settings.autoReconnect = false
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         session.attach(sink: RecordingSink())
         session.start()
         try await Task.sleep(for: .milliseconds(800))
@@ -160,13 +164,59 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         session.close(killRemote: true)
     }
 
+    /// The terminal's ssh hangs before the server ever answers (a connection that died mid-way, a
+    /// server that stopped answering): the attempt's clock stops it — the tab says why, and does
+    /// not sit on "Connecting" until someone presses Retry.
+    @Test func aHangingAttemptIsStoppedAndSaysWhy() async throws {
+        let hanging = dir.appendingPathComponent("ssh-hangs")
+        try """
+        #!/bin/sh
+        for a in "$@"; do [ "$a" = "-tt" ] && exec sleep 60; done
+        exec "\(fakeSSH.path)" "$@"
+        """.write(to: hanging, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hanging.path)
+        var settings = AppSettings()
+        settings.sshBinary = hanging.path
+        settings.useControlMaster = false
+        settings.recordingEnabled = false
+        settings.autoReconnect = false
+        let cfg = SessionConfiguration(settings: settings)
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
+        session.attemptBudgetScale = 0.03        // "starting" allows 90 s: 2.7 s here
+        session.attach(sink: RecordingSink())
+        session.start()
+        try await wait("the attempt stopped", timeout: 15) { session.lastError?.hasPrefix("No answer from") == true }
+        #expect(session.lastError?.contains("while starting the session") == true, "\(session.lastError ?? "")")
+        #expect(!session.phase.isOnline && !session.phase.isDead, "waits to try again, not ended")
+        session.close(killRemote: false)
+    }
+
+    /// A tab closed while its server could not be reached: whether its tmux session still runs
+    /// there is asked quietly (never attaching), and a session ended there is told apart.
+    @Test(.enabled(if: LocalSessionTests.hasTmux)) func aClosedTabsSessionIsLookedForOnTheServer() async throws {
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { self.config() }
+        session.attach(sink: RecordingSink())
+        session.start()
+        try await wait("online") { session.phase.isOnline }
+        session.suspend()
+        #expect(await session.remoteSessionStillThere() == true)
+        // Another session keeps the tmux server answering: then "gone" is certain. (With no server
+        // answering, a tmux process still running — this test's own, others' — leaves it unknown.)
+        tmux(["new-session", "-d", "-s", "keep"])
+        tmux(["kill-session", "-t", "=" + session.descriptor.remoteSessionName])
+        #expect(await session.remoteSessionStillThere() == false)
+        session.close(killRemote: true)
+        try await Task.sleep(for: .milliseconds(300))
+        tmux(["kill-server"])
+    }
+
     /// ⌘T: the new tab starts where the current tab's shell is now (asked from tmux, not a stale value).
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func newTabStartsInTheCurrentFolder() async throws {
         let cfg = config()
         let folder = dir.appendingPathComponent("work dir")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let real = URL(fileURLWithPath: realpath(folder.path, nil).map { p in defer { free(p) }; return String(cString: p) } ?? folder.path)
-        let first = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let first = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let sink1 = RecordingSink()
         first.attach(sink: sink1)
         first.start()
@@ -177,7 +227,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         let current = await first.workingDirectory()
         #expect(current == real.path, "got \(current ?? "nil")")
 
-        var descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        var descriptor = SessionDescriptor(target: host, persistence: .tmux)
         descriptor.initialDirectory = current
         let second = TerminalSession(descriptor: descriptor) { cfg }
         let sink2 = RecordingSink()
@@ -227,7 +277,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 
     @Test func plainShellRoundTrip() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         let sink = RecordingSink()
         session.attach(sink: sink)
         session.start()
@@ -242,7 +292,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func tmuxControlModePersistsAcrossReattach() async throws {
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let sink1 = RecordingSink()
         first.attach(sink: sink1)
@@ -268,7 +318,11 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         try await wait("state survived") { sink2.text.contains("again-persist") }
 
         second.close(killRemote: true)
-        try await Task.sleep(for: .milliseconds(800))
+        // Ended on the server through its own ssh, which on a busy Mac can take more than a moment.
+        let name = descriptor.remoteSessionName
+        try await wait("ended on the server", timeout: 15) {
+            !tmux(["list-sessions", "-F", "#{session_name}"]).split(separator: "\n").contains { $0 == name }
+        }
 
         // The remote session is gone now; a re-attach must report it dead.
         let third = TerminalSession(descriptor: descriptor) { cfg }
@@ -277,7 +331,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         third.onDeath = { _ in archived = true }
         third.restore(previous: .tmux)
         try await wait("gone") { third.phase.isDead }
-        #expect(archived)
+        #expect(archived, "phase=\(third.phase) error=\(third.lastError ?? "-") paused=\(third.retryPausedReason ?? "-") log=\(third.progress?.log.suffix(6) ?? [])")
         tmux(["kill-server"])
     }
 
@@ -290,7 +344,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         settings.reconnectBaseDelay = 1
         settings.stallTimeout = 3
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let sink = RecordingSink()
         session.attach(sink: sink)
         session.start()
@@ -310,7 +364,8 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         defer { kill(pid, SIGCONT) }
         let stoppedAt = Date()
         try await wait("waiting", timeout: 10) { if case .waiting = session.phase { true } else { false } }
-        #expect(Date().timeIntervalSince(stoppedAt) < 8, "stall should be detected within a few seconds")
+        // Two silent checks in a row (one late check never counts), under a busy test run too.
+        #expect(Date().timeIntervalSince(stoppedAt) < 10, "stall should be detected within a few seconds")
         kill(pid, SIGCONT)
         try await wait("back online", timeout: 15) { session.phase.isOnline }
         session.close(killRemote: true)
@@ -329,7 +384,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         settings.reconnectBaseDelay = 1
         settings.stallTimeout = 3
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         session.attach(sink: RecordingSink())
         session.start()
         try await wait("online") { session.phase.isOnline }
@@ -352,6 +407,29 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 
     /// Typed while the connection was away: sent once the tab is back in the same tmux session;
     /// Ctrl-C drops it.
+    /// Keys typed before the tab is there (right after ⌘T, or while a tab comes back after a
+    /// relaunch) are held and reach the shell once tmux has taken over the terminal — never tmux's
+    /// control mode, where they would be commands and could leave the tab deaf to every key.
+    @Test(.enabled(if: LocalSessionTests.hasTmux)) func keysTypedWhileConnectingReachTheShell() async throws {
+        var settings = AppSettings()
+        settings.sshBinary = fakeSSH.path
+        settings.useControlMaster = false
+        settings.recordingEnabled = false
+        settings.autoReconnect = false
+        let cfg = SessionConfiguration(settings: settings)
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
+        let sink = RecordingSink()
+        session.attach(sink: sink)
+        session.start()
+        defer { session.close(killRemote: true) }
+        session.send(Array("echo early-$((20+1))\r".utf8)[...])
+        try await wait("online") { session.phase.isOnline }
+        try await wait("held text ran") { sink.text.contains("early-21") }
+        // The tab still takes keys afterwards.
+        session.send(Array("echo later-$((30+2))\r".utf8)[...])
+        try await wait("later text ran") { sink.text.contains("later-32") }
+    }
+
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func textTypedWhileAwayIsSentOnReattach() async throws {
         var settings = AppSettings()
         settings.sshBinary = fakeSSH.path
@@ -359,7 +437,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         settings.recordingEnabled = false
         settings.autoReconnect = false
         let cfg = SessionConfiguration(settings: settings)
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let sink = RecordingSink()
         session.attach(sink: sink)
         session.start()
@@ -381,7 +459,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
     /// A plain shell ends with its connection: nothing typed meanwhile is kept for the next one.
     @Test func plainShellsKeepNothingTypedWhileAway() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         session.attach(sink: RecordingSink())
         session.start()
         defer { session.close(killRemote: true) }
@@ -410,7 +488,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
     /// again (not recorded twice), and what the server printed while Tether was closed is added once.
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func restoredTabContinuesItsRecording() async throws {
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let sink1 = RecordingSink()
         first.attach(sink: sink1)
@@ -544,7 +622,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func suspendKeepsRemoteSessionAndResumes() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .tmux)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .tmux)) { cfg }
         let sink = RecordingSink()
         session.attach(sink: sink)
         session.start()
@@ -683,7 +761,7 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
 
     @Test func sessionIsUnusedUntilACommandIsRun() async throws {
         let cfg = config()
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) { cfg }
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
         session.attach(sink: RecordingSink())
         session.start()
         try await wait("online") { session.phase.isOnline }

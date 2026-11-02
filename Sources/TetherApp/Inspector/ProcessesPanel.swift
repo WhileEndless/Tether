@@ -86,7 +86,7 @@ struct ProcessesPanel: View {
         .task {
             while !Task.isCancelled {
                 await monitor.refreshProcesses()
-                try? await Task.sleep(for: .seconds(max(model.settings.monitorRefreshInterval, 3)))
+                try? await Task.sleep(for: .seconds(monitor.panelWait(max(model.settings.monitorRefreshInterval, 3))))
             }
         }
     }

@@ -1,4 +1,5 @@
 import Foundation
+import SSHTransport
 
 /// When the waiting tabs of one server try again: one schedule per server, not one per tab. The
 /// first failure plans a round a moment later; further failures plan each round further away (up
@@ -37,7 +38,7 @@ public final class HostRetryClock {
         // Quiet for a long while since the last failure: a new outage starts again at the shortest wait.
         let previous = rounds[host].flatMap { now.timeIntervalSince($0.failedAt) < longest * 2 ? $0.level : nil } ?? 0
         let level = previous + 1
-        let delay = min(base * pow(2, Double(min(level - 1, 16))), longest)
+        let delay = Backoff.delay(base: base, doublings: level - 1, longest: longest)
         let at = now.addingTimeInterval(delay)
         rounds[host] = Round(level: level, at: at, failedAt: now, why: why)
         return (at, true)

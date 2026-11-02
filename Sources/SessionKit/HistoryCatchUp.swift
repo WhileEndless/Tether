@@ -16,6 +16,19 @@ enum HistoryCatchUp {
         var cursorRow: Int? = nil
     }
 
+    /// A line Tether itself wrote into the terminal (a recording's mark, a notice): never in the
+    /// server's history, so never part of what is looked for there.
+    /// Only Tether's own marks (`SessionRecorder.mark`: what happened, then the time): a program's
+    /// own "── Summary ──" line is the server's output and stays part of what is looked for.
+    static func isTetherLine(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("[Tether] ") { return true }
+        guard t.hasPrefix("── "), t.hasSuffix(" ──") else { return false }
+        let inner = t.dropFirst(3).dropLast(3)
+        return ["Connection lost ", "Paused while the Mac slept ", "Reconnected ", "Disconnected (suspended) ", "Detached ", "New session "]
+            .contains { inner.hasPrefix($0) } || inner.hasSuffix("could not be recorded (the disk was full)")
+    }
+
     /// A captured line as plain text: escape sequences removed, trailing spaces trimmed.
     static func plainText(_ line: [UInt8]) -> String {
         var out: [UInt8] = []

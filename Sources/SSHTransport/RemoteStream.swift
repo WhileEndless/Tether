@@ -31,22 +31,36 @@ public final class RemoteStream: @unchecked Sendable {
     }
 
     /// Starts the variant of `script` for `platform` (resolve it first with `resolvedPlatform()`).
-    /// A remote stream first gets its host's shared connection (it never signs in for quiet work).
+    /// A remote stream first gets its host's shared connection (it never signs in for quiet work);
+    /// without sharing, it waits for a sign-in in progress and for the host to need nobody.
     public func start(executor: RemoteExecutor, script remoteScript: RemoteScript, platform: RemotePlatform,
                       arguments: [String], purpose: String) {
-        guard !executor.target.isLocal, executor.options.useControlMaster else {
+        guard !executor.target.isLocal else {
             launch(executor: executor, script: remoteScript, platform: platform, arguments: arguments, purpose: purpose)
             return
         }
-        Task {
-            switch await executor.prepared(purpose: purpose) {
-            case .ready(let ready):
+        // Getting the connection has a limit of its own (the user answering a question does not
+        // count), and `stop` ends the wait.
+        let host = ConnectionGate.key(executor.target.key)
+        let preparing = Task {
+            let prepared = await Deadline.run(seconds: 90, paused: { AskPassBridge.shared.waitsOnUser(where: { ConnectionGate.key($0) == host }) }) {
+                await executor.prepared(purpose: purpose)
+            }
+            guard !Task.isCancelled, !self.lock.withLock({ self.stopped }) else { return }
+            switch prepared {
+            case .ready(let ready)?:
                 self.launch(executor: ready, script: remoteScript, platform: platform, arguments: arguments, purpose: purpose)
-            case .refused(let result):
+            case .refused(let result)?:
                 DispatchQueue.main.async { self.onEnd?(result.status, result.errorOutput) }
+            case nil:
+                DispatchQueue.main.async { self.onEnd?(255, RemoteExecutor.noAnswerMessage(executor.target)) }
             }
         }
+        lock.withLock { self.preparing = preparing }
     }
+
+    /// The connection being got for it (ended by `stop`).
+    private var preparing: Task<Void, Never>?
 
     private func launch(executor: RemoteExecutor, script remoteScript: RemoteScript, platform: RemotePlatform,
                         arguments: [String], purpose: String) {
@@ -143,6 +157,7 @@ public final class RemoteStream: @unchecked Sendable {
         defer { lock.unlock() }
         guard !stopped else { return }
         stopped = true
+        preparing?.cancel()
         if process.isRunning { process.terminate() }
     }
 

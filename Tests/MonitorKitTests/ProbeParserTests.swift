@@ -97,18 +97,18 @@ import TetherCore
     @Test func parsesRemoteSessions() {
         let text = """
         @@tmux
-        tether-abc|1700000000|0
+        tether-0000abcd|1700000000|0
         work|1700000000|1
         @@screen
         There are screens on:
-        \t1234.tether-def\t(Detached)
+        \t1234.tether-0000def0\t(Detached)
         @@end
         """
         let all = ProbeParser.remoteSessions(text)
-        #expect(all.map(\.name) == ["tether-abc", "work", "tether-def"])
+        #expect(all.map(\.name) == ["tether-0000abcd", "work", "tether-0000def0"])
         #expect(all.filter(\.isTether).count == 2)
         let tether = ProbeParser.remoteSessions(text, prefix: "tether-")
-        #expect(tether.map(\.name) == ["tether-abc", "tether-def"])
+        #expect(tether.map(\.name) == ["tether-0000abcd", "tether-0000def0"])
         #expect(tether[0].attached == false)
     }
 

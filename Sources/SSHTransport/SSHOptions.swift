@@ -53,13 +53,35 @@ public struct SSHOptions: Sendable, Equatable {
     /// Whether ssh built from these options rides on a prepared shared connection (see `controlPath`).
     public var usesSharedConnection: Bool { useControlMaster && controlPath != nil }
 
-    /// Keep-alive options: none unless the user asked for them (Settings ▸ Connection), like plain
-    /// `ssh`. Forced keep-alives end a connection after a short silence — a Wi-Fi hand-over, a VPN
-    /// reconnecting, the Mac waking from sleep — that plain ssh survives; the user's ssh_config
-    /// still applies when Tether sends none.
+    /// Keep-alive options (Settings ▸ Sessions; 60 s by default): enough traffic that a firewall or
+    /// NAT does not forget an idle connection, and patient — a connection ends only after about ten
+    /// minutes without any answer, so a Wi-Fi hand-over, a VPN reconnecting or the first moments
+    /// after waking do not end it. 0 sends none.
     func keepAliveOptions() -> [String] {
         guard serverAliveInterval > 0 else { return [] }
-        return ["-o", "ServerAliveInterval=\(serverAliveInterval)", "-o", "ServerAliveCountMax=\(max(serverAliveCountMax, 1))"]
+        let count = Self.patientCount(interval: serverAliveInterval, count: serverAliveCountMax)
+        return ["-o", "ServerAliveInterval=\(serverAliveInterval)", "-o", "ServerAliveCountMax=\(count)"]
+    }
+
+    /// The shortest time without any answer before keep-alives end a connection.
+    public static let keepAliveTolerance = 600
+
+    /// A count of unanswered keep-alives that lasts at least `keepAliveTolerance`.
+    static func patientCount(interval: Int, count: Int) -> Int {
+        max(count, 1, Int((Double(keepAliveTolerance) / Double(max(interval, 1))).rounded(.up)))
+    }
+
+    /// The shared connection's keep-alives. The user's own ssh_config interval is kept (a short one
+    /// is usually there for a firewall that forgets idle connections fast) and only its count is
+    /// raised to last `keepAliveTolerance`; without one, Tether's setting applies. A network device
+    /// gets none from Tether (some do not understand them).
+    func keepAliveOptions(config: UserConfig, device: Bool) -> [String] {
+        if device { return [] }
+        if config.serverAliveInterval > 0 {
+            let count = Self.patientCount(interval: config.serverAliveInterval, count: config.serverAliveCountMax)
+            return ["-o", "ServerAliveInterval=\(config.serverAliveInterval)", "-o", "ServerAliveCountMax=\(count)"]
+        }
+        return keepAliveOptions()
     }
 
     /// Options shared by ssh and scp (`-o` style, valid for both).
@@ -82,6 +104,9 @@ public struct SSHOptions: Sendable, Equatable {
             args += keepAliveOptions()
         }
         if hostKeyPolicy == .acceptNew { args += ["-o", "StrictHostKeyChecking=accept-new"] }
+        // Every ssh Tether starts runs its own command (a terminal's start-up, a file listing, the
+        // silent channel); a RemoteCommand in ssh_config would make ssh refuse it.
+        args += ["-o", "RemoteCommand=none"]
         return args
     }
 
@@ -89,12 +114,22 @@ public struct SSHOptions: Sendable, Equatable {
     /// to the background (`-N` + ControlPersist) and exits 0. `-N` runs nothing on the server, so it
     /// also suits Windows and network devices. `proxyCommand` replaces the jump-host hop with one
     /// through the jump host's own shared connection (one sign-in there for every host behind it).
-    public func masterArguments(target: ConnectionTarget, controlPath: String, logFile: String?, proxyCommand: String?) -> [String] {
+    ///
+    /// `config`: what the user's ssh_config sets — their ConnectTimeout is kept (a slow sign-in
+    /// through a browser-based proxy needs longer), their keep-alive interval too (see
+    /// `keepAliveOptions(config:device:)`). Forwards from ssh_config are set up by the first
+    /// connection only (a further one would find the ports taken), and one that cannot be set up
+    /// never fails the sign-in.
+    public func masterArguments(target: ConnectionTarget, controlPath: String, logFile: String?, proxyCommand: String?,
+                                config: UserConfig = UserConfig(), device: Bool = false) -> [String] {
         var args: [String] = []
         if let configFile { args += ["-F", configFile.path] }
         args += ["-o", "ControlMaster=yes", "-o", "ControlPath=\(controlPath)",
-                 "-o", "ControlPersist=\(max(controlPersistSeconds, 30))", "-o", "ConnectTimeout=\(connectTimeout)"]
-        args += keepAliveOptions()
+                 "-o", "ControlPersist=\(max(controlPersistSeconds, 30))"]
+        if !config.setsConnectTimeout { args += ["-o", "ConnectTimeout=\(connectTimeout)"] }
+        args += ["-o", "ExitOnForwardFailure=no"]
+        if controlSlot > 0 { args += ["-o", "ClearAllForwardings=yes"] }
+        args += keepAliveOptions(config: config, device: device)
         if hostKeyPolicy == .acceptNew { args += ["-o", "StrictHostKeyChecking=accept-new"] }
         if let proxyCommand { args += ["-o", "ProxyCommand=\(proxyCommand)"] }
         if let logFile { args += ["-v", "-E", logFile] }

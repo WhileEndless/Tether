@@ -6,7 +6,9 @@ import SSHTransport
 
 /// A cancelled or failed copy removes only what it made itself, never what was there before.
 @MainActor @Suite struct PartialCleanupTests {
-    let target = ConnectionTarget.adhoc(user: "user", host: "example.invalid", port: nil, jump: nil)
+    /// A host name of this test's own: what is kept per host (retry rounds, the platform, a
+    /// cancelled sign-in, reachability) is shared by every test running at the same time.
+    let target = ConnectionTarget.adhoc(user: "user", host: "partial-\(UUID().uuidString.prefix(6)).invalid", port: nil, jump: nil)
 
     @Test func downloadRemovesOnlyItsOwnFile() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-partial-\(UUID())")

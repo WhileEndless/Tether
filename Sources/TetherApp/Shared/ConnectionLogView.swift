@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import SSHTransport
+import TetherCore
 
 /// Help ▸ Connection Log: what happened to connections (sign-ins and how long they took, checks,
 /// connections closed, tabs connecting, letting go and re-attaching, sleep and network events),
@@ -42,13 +43,20 @@ struct ConnectionLogView: View {
         let words = search.trimmingCharacters(in: .whitespaces)
         return entries.reversed().filter { e in
             e.level >= severity.lowest
-                && (host == nil || e.host == host)
+                // Events of no host (sleep, the network, Tether itself) stay: they explain the host's.
+                && (host == nil || e.host == host || e.host == nil)
                 && (category == nil || e.category == category)
                 && (words.isEmpty || [e.message, e.host, e.tab, e.detail].contains { $0?.localizedCaseInsensitiveContains(words) == true })
         }
     }
 
     private var filtered: Bool { severity != .all || host != nil || category != nil || !search.isEmpty }
+
+    /// What Copy and Save give: a header (versions, time zone, span, events let go), then the events.
+    private func exportText(_ shown: [ConnectionLog.Entry]) -> String {
+        let events = Array(shown.reversed())
+        return ConnectionLog.shared.header(version: AppInfo.version, shown: events, filtered: filtered) + "\n\n" + ConnectionLog.text(events)
+    }
 
     var body: some View {
         let shown = self.shown
@@ -227,11 +235,11 @@ struct ConnectionLogView: View {
 
     private func copy(_ shown: [ConnectionLog.Entry]) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(ConnectionLog.text(shown.reversed()), forType: .string)
+        NSPasteboard.general.setString(exportText(shown), forType: .string)
     }
 
     private func save(_ shown: [ConnectionLog.Entry]) {
-        let text = ConnectionLog.text(shown.reversed())
+        let text = exportText(shown)
         let panel = NSSavePanel()
         panel.title = "Save Connection Log"
         panel.allowedContentTypes = [.plainText]

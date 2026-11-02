@@ -1,4 +1,5 @@
 import Foundation
+import TetherCore
 
 /// Pure functions that turn probe output into models. Kept separate for unit testing.
 public enum ProbeParser {
@@ -415,27 +416,45 @@ public enum ProbeParser {
     }
 
     /// tmux/screen sessions on the host. An empty prefix lists all of them.
+    /// Limits on what a list of server sessions may hold: anyone who can run programs on the
+    /// server decides what it says, and the list is kept and shown for every host.
+    enum SessionLimits {
+        static let sessions = 500
+        static let panesPerSession = 64
+        static let paneLines = 4_000
+        static let nameLength = 256
+        static let pathLength = 4_096
+    }
+
     public static func remoteSessions(_ text: String, prefix: String = "") -> [RemoteSessionEntry] {
         let s = sections(text)
         var out: [RemoteSessionEntry] = []
+        var seen = Set<String>()
         let panes = tmuxPanes(s["tmuxpanes"] ?? [], foreground: s["fg"] ?? [], agents: s["agents"] ?? [],
                               titles: s["tmuxtitles"] ?? [])
+        /// A name Tether can show and attach to: not absurdly long, nothing a line cannot hold.
+        func usable(_ name: String) -> Bool {
+            !name.isEmpty && name.count <= SessionLimits.nameLength && !name.unicodeScalars.contains { $0.properties.generalCategory == .control }
+        }
         for line in s["tmux"] ?? [] {
+            guard out.count < SessionLimits.sessions else { break }
             let f = line.split(separator: "|").map(String.init)
-            guard f.count >= 3, prefix.isEmpty || f[0].hasPrefix(prefix) else { continue }
+            guard f.count >= 3, usable(f[0]), prefix.isEmpty || f[0].hasPrefix(prefix),
+                  seen.insert("tmux:" + f[0]).inserted else { continue }
             let created = Double(f[1]).map { Date(timeIntervalSince1970: $0) }
             out.append(RemoteSessionEntry(kind: .tmux, name: f[0], created: created, attached: f[2] != "0",
                                           windows: f.count > 3 ? Int(f[3]) : nil,
                                           lastActivity: f.count > 4 ? Double(f[4]).map { Date(timeIntervalSince1970: $0) } : nil,
-                                          panes: panes[f[0]] ?? []))
+                                          panes: Array((panes[f[0]] ?? []).prefix(SessionLimits.panesPerSession))))
         }
         for line in s["screen"] ?? [] {
+            guard out.count < SessionLimits.sessions else { break }
             // "\t12345.tether-abc\t(Detached)"
             let t = line.trimmingCharacters(in: .whitespaces)
             guard let first = t.split(whereSeparator: { $0 == "\t" || $0 == " " }).first,
                   let dot = first.firstIndex(of: ".") else { continue }
             let name = String(first[first.index(after: dot)...])
-            guard prefix.isEmpty || name.hasPrefix(prefix) else { continue }
+            guard usable(name), prefix.isEmpty || name.hasPrefix(prefix), seen.insert("screen:" + name).inserted else { continue }
             out.append(RemoteSessionEntry(kind: .screen, name: name, created: nil, attached: t.contains("Attached")))
         }
         return out
@@ -462,19 +481,22 @@ public enum ProbeParser {
             titleByPane[f[0]] = f[2]
         }
         var out: [String: [RemoteSessionPane]] = [:]
-        for line in lines {
+        for line in lines.prefix(SessionLimits.paneLines) {
             // The path is last so a "|" in it survives.
             let f = line.split(separator: "|", maxSplits: 8, omittingEmptySubsequences: false).map(String.init)
             guard f.count == 9, let window = Int(f[1]) else { continue }
-            let command = f[7]
+            guard (out[f[0]]?.count ?? 0) < SessionLimits.panesPerSession else { continue }
+            let command = DisplayText.clean(f[7], limit: 100)
             let candidates = byTTY[ttyKey(f[6])] ?? []
             let match = candidates.last { c in
                 let program = c.args.split(separator: " ").first.map { $0.split(separator: "/").last.map(String.init) ?? "" } ?? ""
                 return !command.isEmpty && (program == command || program.hasPrefix(command) || program == "-" + command)
             }
-            var pane = RemoteSessionPane(windowIndex: window, windowName: f[2], windowActive: f[3] == "1",
-                                         paneActive: f[4] == "1", command: command, commandLine: match?.args, path: f[8],
-                                         title: titleByPane[f[5]] ?? "")
+            var pane = RemoteSessionPane(windowIndex: window, windowName: DisplayText.clean(f[2], limit: 100), windowActive: f[3] == "1",
+                                         paneActive: f[4] == "1", command: command,
+                                         commandLine: match.map { DisplayText.clean($0.args, limit: 500) },
+                                         path: f[8].count <= SessionLimits.pathLength ? f[8] : "",
+                                         title: DisplayText.clean(titleByPane[f[5]] ?? ""))
             // Wrappers (node, sh) and their children share the tty: prefer the agent with a known name.
             let found = candidates.compactMap { agentsByPID[$0.pid] }
             pane.agent = agentsByPID.values.first { $0.paneID == f[5] }

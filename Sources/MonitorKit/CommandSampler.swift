@@ -178,7 +178,7 @@ public final class CommandSampler {
     func isDue(at now: Date) -> Bool {
         guard shouldLook else { return false }
         guard let last = lastLookAt else { return true }
-        let wait = failures > 0 ? min(interval * pow(2, Double(min(failures, 4))), 30) : interval
+        let wait = failures > 0 ? Backoff.delay(base: interval, doublings: failures, longest: 30, maxDoublings: 4) : interval
         return now.timeIntervalSince(last) >= wait - 0.05
     }
 

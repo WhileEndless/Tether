@@ -39,7 +39,8 @@ final class FileTabStore {
 
     func close(_ id: UUID) {
         tabs[id] = nil
-        browsers[id] = nil
+        // What it had under way on the server (a listing, a search) stops with it.
+        browsers.removeValue(forKey: id)?.stopWork()
         save()
     }
 
@@ -49,6 +50,14 @@ final class FileTabStore {
         let b = FileBrowserModel(target: tab.target, fs: RemoteFileSystem(executor: AppModel.shared.executor(for: tab.target)))
         browsers[tab.id] = b
         return b
+    }
+
+    /// The ssh settings changed (program, connection sharing): open file tabs use them from now on.
+    func settingsChanged() {
+        for b in browsers.values {
+            let executor = AppModel.shared.executor(for: b.target)
+            if b.fs.executor.options != executor.options { b.fs = RemoteFileSystem(executor: executor) }
+        }
     }
 
     /// Title for tab bars and the sidebar: the directory name.

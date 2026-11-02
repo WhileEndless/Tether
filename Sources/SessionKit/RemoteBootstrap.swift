@@ -74,15 +74,20 @@ public enum RemoteBootstrap {
             "if [ \"$M\" = tmux ] && [ \"$A\" = 1 ]; then mark \"unreachable;why=tmux 3 or later was not found\"; exit 0; fi",
             // GNU screen with the alternate screen disabled so local scrollback keeps history
             "if [ \"$M\" = auto ] || [ \"$M\" = screen ]; then if command -v screen >/dev/null 2>&1; then "
-                + "if [ \"$A\" = 1 ] && ! screen -ls 2>/dev/null | grep -q \"[.]$N[[:space:]]\"; then mark gone; exit 0; fi; "
+                + "if [ \"$A\" = 1 ] && ! screen -ls 2>/dev/null | N=\"$N\" " + TerminalSession.screenListed + "; then mark gone; exit 0; fi; "
                 // A private settings file with a random name: /tmp is shared, and a file planted
                 // there by another account must never be read as this user's screen settings.
                 + "R=$(umask 077; mktemp \"${TMPDIR:-/tmp}/.tether-screenrc.XXXXXXXX\" 2>/dev/null) || R=\"\"; "
                 + "if [ -n \"$R\" ] && [ -O \"$R\" ] && [ ! -L \"$R\" ] && "
-                + "printf 'termcapinfo xterm* ti@:te@\\ndefscrollback %s\\nstartup_message off\\nvbell off\\n' \"${L:-10000}\" > \"$R\"; then "
+                // `defnonblock`: a display that stopped reading (a connection gone dead) never holds
+                // the session up for the others.
+                + "printf 'termcapinfo xterm* ti@:te@\\ndefscrollback %s\\nstartup_message off\\nvbell off\\ndefnonblock 5\\n' \"${L:-10000}\" > \"$R\"; then "
                 + "(sleep 10; rm -f \"$R\") >/dev/null 2>&1 & "
-                + "mark mode=screen; exec screen -c \"$R\" -D -RR -S \"$N\"; fi; "
-                + "mark mode=screen; exec screen -D -RR -S \"$N\"; "
+                // `-x -RR`: alongside any other display of the session (another Mac, the user's own
+                // terminal), never pushing it out — pushed out, it would take the session back, and
+                // the two would take turns for ever.
+                + "mark mode=screen; exec screen -c \"$R\" -x -RR -S \"$N\"; fi; "
+                + "mark mode=screen; exec screen -x -RR -S \"$N\"; "
                 + "fi; fi",
             "if [ \"$M\" = screen ] && [ \"$A\" = 1 ]; then mark \"unreachable;why=GNU screen was not found\"; exit 0; fi",
             // Plain shell: nothing survives a disconnect, so a re-attach always reports gone.

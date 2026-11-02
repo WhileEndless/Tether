@@ -36,7 +36,8 @@ public enum WatchEvent: Equatable, Sendable {
 /// is stopped with its stream), looks are single commands. Without terminals the hub is idle.
 @MainActor
 public final class CommandHub {
-    private let executor: RemoteExecutor
+    /// Replaced when the ssh settings change (the next watcher and looks use it).
+    public var executor: RemoteExecutor
     private var samplers: [UUID: CommandSampler] = [:]
     private var loop: Task<Void, Never>?
     private var nap: Task<Void, Never>?

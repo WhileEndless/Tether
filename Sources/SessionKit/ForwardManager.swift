@@ -35,13 +35,15 @@ public final class ForwardManager {
     /// that made them, so they are made again on the new one. Only Tether's own state and the
     /// socket are asked: a channel that printed something every few seconds made the server give
     /// up on the connection while the Mac slept (nothing acknowledged what it sent).
-    private func watchConnection(_ target: ConnectionTarget) {
+    private func watchConnection(_ target: ConnectionTarget, firstCheckAfter first: Duration = .seconds(30)) {
         guard deviceWatch[target.key] == nil else { return }
         let executor = RemoteExecutor(target: target, options: optionsProvider())
         let options = optionsProvider()
         deviceWatch[target.key] = Task { [weak self] in
+            var wait = first
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: wait)
+                wait = .seconds(30)
                 guard !Task.isCancelled else { return }
                 let alive = await executor.isMasterAlive()
                 let generation = await SharedConnections.shared.generation(of: target, options: options)
@@ -57,8 +59,12 @@ public final class ForwardManager {
                     self.owners[id] = nil
                     self.madeOn[id] = nil
                     self.status[id] = alive ? .inactive : .failed("Connection lost — will restore on reconnect")
-                    if alive { Task { await self.start(owner.forward, on: target) } } else { self.pendingRestore.insert(id) }
+                    if alive { Task { await self.start(owner.forward, on: target) } } else {
+                        self.pendingRestore.insert(id)
+                        self.pendingTargets[id] = owner
+                    }
                 }
+                self.wantedChanged()
                 if !alive || self.owners.values.allSatisfy({ $0.target != target }) {
                     self.deviceWatch[target.key] = nil
                     return
@@ -66,8 +72,42 @@ public final class ForwardManager {
             }
         }
     }
+    /// A connection of `host` ended (its silent channel saw it go): its forwards are looked at now,
+    /// not at the next check.
+    public func connectionEnded(_ host: String) {
+        let targets = Set(owners.values.map(\.target)).filter { HostLinks.sameServer($0.key, host) }
+        for target in targets {
+            deviceWatch.removeValue(forKey: target.key)?.cancel()
+            watchConnection(target, firstCheckAfter: .zero)
+        }
+    }
+
     /// Forwards that were active when their connection died; restored on the next connect.
     @ObservationIgnored private var pendingRestore: Set<UUID> = []
+    /// Where each of those belongs: restored also for a host without a tab (`retryPending`).
+    @ObservationIgnored private var pendingTargets: [UUID: (target: ConnectionTarget, forward: PortForward)] = [:]
+    /// Told the forwards that should be running — active, or waiting for their connection — when
+    /// that changes (saved, so they come back after a relaunch).
+    @ObservationIgnored public var onWantedChanged: ((Set<UUID>) -> Void)?
+    @ObservationIgnored private var lastWanted: Set<UUID>?
+
+    private func wantedChanged() {
+        let wanted = Set(status.filter { $0.value == .active || $0.value == .starting }.keys).union(pendingRestore)
+        guard wanted != lastWanted else { return }
+        lastWanted = wanted
+        onWantedChanged?(wanted)
+    }
+
+    /// The network is back (or changed, or the Mac woke): forwards that stopped with their connection
+    /// are made again, also for hosts no tab is connected to.
+    /// `host`: only that server's (it just signed in); nil: all of them.
+    public func retryPending(host: String? = nil) {
+        for (id, owner) in pendingTargets where owners[id] == nil && (host.map { HostLinks.sameServer(owner.target.key, $0) } ?? true) {
+            pendingRestore.remove(id)
+            pendingTargets[id] = nil
+            Task { await start(owner.forward, on: owner.target, restoring: true) }
+        }
+    }
     @ObservationIgnored private let optionsProvider: () -> SSHOptions
 
     public init(options: @escaping () -> SSHOptions) {
@@ -76,15 +116,26 @@ public final class ForwardManager {
 
     public func status(of forward: PortForward) -> Status { status[forward.id] ?? .inactive }
 
+    /// The forwards running now.
+    public var activeForwards: [PortForward] {
+        owners.values.filter { status[$0.forward.id] == .active }.map(\.forward)
+    }
+
     public func activeCount(for target: ConnectionTarget) -> Int {
         owners.values.filter { $0.target == target && status[$0.forward.id] == .active }.count
     }
 
     /// Starts a forward. Returns an error message (also stored in `status`) on failure.
+    /// `restoring`: brought back after a relaunch — a server that cannot be reached yet (the network
+    /// still coming up) leaves it waiting for the connection, as one that stopped with it.
     @discardableResult
-    public func start(_ forward: PortForward, on target: ConnectionTarget) async -> String? {
+    public func start(_ forward: PortForward, on target: ConnectionTarget, restoring: Bool = false) async -> String? {
+        defer { wantedChanged() }
         if status[forward.id] == .active || status[forward.id] == .starting { return nil }
         if let conflict = localConflict(forward, target: target) {
+            // The port is taken by this very forward, still made on a connection kept from the last
+            // run (*Keep connections open after quitting*): taken over instead of reported.
+            if forward.listensLocally, !owners.keys.contains(forward.id), await adopt(forward, on: target) { return nil }
             status[forward.id] = .failed(conflict)
             return conflict
         }
@@ -103,6 +154,12 @@ public final class ForwardManager {
             ready = executor.options
         case .refused(let result):
             let msg = Self.clean(result.errorOutput, fallback: "Could not connect to \(target.displayName).")
+            if restoring, status[forward.id] == .starting {
+                status[forward.id] = .failed("Waiting for the connection — will restore on reconnect")
+                pendingRestore.insert(forward.id)
+                pendingTargets[forward.id] = (target, forward)
+                return msg
+            }
             status[forward.id] = .failed(msg)
             return msg
         }
@@ -131,6 +188,9 @@ public final class ForwardManager {
     }
 
     public func stop(_ forward: PortForward) async {
+        defer { wantedChanged() }
+        pendingRestore.remove(forward.id)
+        pendingTargets[forward.id] = nil
         madeOn[forward.id] = nil
         guard let owner = owners.removeValue(forKey: forward.id) else {
             status[forward.id] = .inactive
@@ -152,8 +212,26 @@ public final class ForwardManager {
     public func sessionConnected(to target: ConnectionTarget, saved: [PortForward]) {
         for f in saved where f.autoStart || pendingRestore.contains(f.id) {
             pendingRestore.remove(f.id)
+            pendingTargets[f.id] = nil
             Task { await start(f, on: target) }
         }
+    }
+
+    /// The same forward is still made on the host's open connection (one kept from the last run):
+    /// asked for again, which ssh accepts for a forward it already has — then it is this one's.
+    private func adopt(_ forward: PortForward, on target: ConnectionTarget) async -> Bool {
+        let options = optionsProvider()
+        guard options.useControlMaster, let ready = await SharedConnections.shared.readyOptions(target, options: options) else { return false }
+        let args = ready.commonOptions() + ["-O", "forward", forward.kind.flag, forward.specification] + ready.destination(target)
+        let r = await ProcessRunner.run(options.sshBinary, arguments: args, timeout: 10)
+        guard r.status == 0 else { return false }
+        owners[forward.id] = (target, forward)
+        madeOn[forward.id] = await SharedConnections.shared.generation(of: target, options: options)
+        status[forward.id] = .active
+        ConnectionLog.shared.info("Port forward taken over from the connection kept open", .forward, host: target.key,
+                                  detail: forward.kind.flag + " " + forward.specification)
+        watchConnection(target)
+        return true
     }
 
     // MARK: Conflicts

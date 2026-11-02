@@ -6,6 +6,54 @@ import SSHTransport
 
 /// The conflict-free naming script, run with the local shell (a "local" target needs no ssh).
 @Suite struct UniqueNameTests {
+    /// Renaming never replaces what is there (a file, or a folder `mv` would move it into).
+    @Test func renameNeverReplaces() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-names-\(UUID())")
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("folder"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "a".write(to: dir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try "b".write(to: dir.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8)
+        let fs = RemoteFileSystem(executor: RemoteExecutor(target: .local, options: SSHOptions()))
+        await #expect(throws: (any Error).self) { try await fs.rename(dir.appendingPathComponent("a.txt").path, to: dir.appendingPathComponent("b.txt").path) }
+        await #expect(throws: (any Error).self) { try await fs.rename(dir.appendingPathComponent("a.txt").path, to: dir.appendingPathComponent("folder").path) }
+        #expect((try? String(contentsOf: dir.appendingPathComponent("b.txt"), encoding: .utf8)) == "b")
+        #expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("a.txt").path))
+        try await fs.rename(dir.appendingPathComponent("a.txt").path, to: dir.appendingPathComponent("c.txt").path)
+        #expect((try? String(contentsOf: dir.appendingPathComponent("c.txt"), encoding: .utf8)) == "a")
+    }
+
+    /// A new spelling of the same name is that item, not another one: allowed (on a disk that
+    /// ignores case, as the Mac's usually does, `[ -e ]` says the new name is "there").
+    @Test func renameChangesOnlyTheCase() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-names-\(UUID())")
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("folder"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "a".write(to: dir.appendingPathComponent("readme.txt"), atomically: true, encoding: .utf8)
+        let fs = RemoteFileSystem(executor: RemoteExecutor(target: .local, options: SSHOptions()))
+        try await fs.rename(dir.appendingPathComponent("readme.txt").path, to: dir.appendingPathComponent("README.txt").path)
+        try await fs.rename(dir.appendingPathComponent("folder").path, to: dir.appendingPathComponent("Folder").path)
+        try await fs.rename(dir.appendingPathComponent("Folder").path, to: dir.appendingPathComponent("Folder").path)
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
+        #expect(names == ["Folder", "README.txt"])
+        #expect((try? String(contentsOf: dir.appendingPathComponent("README.txt"), encoding: .utf8)) == "a")
+    }
+
+    /// A symbolic link renamed to the name of what it points to (or the other way round) is another
+    /// item, not a new spelling of the same one: refused, and the file's data is untouched.
+    @Test func aLinkIsNeverRenamedOverWhatItPointsTo() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-names-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fs = RemoteFileSystem(executor: RemoteExecutor(target: .local, options: SSHOptions()))
+        let file = dir.appendingPathComponent("release.tar"), link = dir.appendingPathComponent("current")
+        try "data".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "release.tar")
+        await #expect(throws: (any Error).self) { try await fs.rename(link.path, to: file.path) }
+        await #expect(throws: (any Error).self) { try await fs.rename(file.path, to: link.path) }
+        #expect((try? String(contentsOf: file, encoding: .utf8)) == "data")
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == "release.tar")
+    }
+
     @Test func neverOverwritesAndKeepsExtensions() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-names-\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

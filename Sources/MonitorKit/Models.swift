@@ -128,10 +128,35 @@ public struct RemoteSessionEntry: Identifiable, Hashable, Sendable {
     public var panes: [RemoteSessionPane] = []
     public var id: String { kind.rawValue + ":" + name }
     /// Created by Tether (as opposed to the user's own tmux/screen sessions).
-    public var isTether: Bool { name.hasPrefix("tether-") }
+    public var isTether: Bool { Self.isTetherName(name) }
+
+    /// The names Tether gives its sessions: `tether-` and 8 lowercase hex digits (see
+    /// `SessionDescriptor`). Any other name is the user's own, however it starts.
+    public static func isTetherName(_ name: String) -> Bool {
+        let rest = name.utf8.dropFirst(7)
+        return name.hasPrefix("tether-") && rest.count == 8 && rest.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+    }
     /// The pane the user sees when attaching: the active pane of the active window.
     public var activePane: RemoteSessionPane? {
         panes.first { $0.windowActive && $0.paneActive } ?? panes.first { $0.windowActive } ?? panes.first
+    }
+
+    /// The order sessions are listed under a host: those tabs closed on this Mac left running
+    /// (`mine`) first, then Tether's other detached sessions, each the most recently used first;
+    /// then the rest as the server lists them.
+    public static func listOrder(_ entries: [RemoteSessionEntry], mine: (RemoteSessionEntry) -> Bool = { _ in false }) -> [RemoteSessionEntry] {
+        let ranked = entries.enumerated().map { i, e in
+            (offset: i, entry: e, rank: e.isTether && !e.attached ? (mine(e) ? 0 : 1) : 2)
+        }
+        return ranked.sorted { a, b in
+            if a.rank != b.rank { return a.rank < b.rank }
+            if a.rank < 2 {
+                let x = a.entry.lastActivity ?? a.entry.created ?? .distantPast
+                let y = b.entry.lastActivity ?? b.entry.created ?? .distantPast
+                if x != y { return x > y }
+            }
+            return a.offset < b.offset
+        }.map(\.entry)
     }
 
     public init(kind: Kind, name: String, created: Date?, attached: Bool, windows: Int? = nil,
@@ -172,7 +197,7 @@ public struct RemoteSessionPane: Hashable, Sendable {
     }
 
     /// `python train.py — /srv/ml`
-    public var summary: String { path.isEmpty ? displayCommand : "\(displayCommand) — \(path)" }
+    public var summary: String { path.isEmpty ? displayCommand : "\(displayCommand) — \(DisplayText.clean(path, limit: 300))" }
 }
 
 /// A coding agent running in a pane and the name of its session.
@@ -214,7 +239,7 @@ public struct CodingAgent: Hashable, Sendable {
     public var activity: AgentActivity {
         switch status {
         case "busy": .working
-        case "waiting": .waiting(waitingFor.map { "is waiting: \($0)" } ?? "is waiting for you")
+        case "waiting": .waiting(waitingFor.map { "is waiting: \(DisplayText.clean($0, limit: 100))" } ?? "is waiting for you")
         default: .idle
         }
     }
@@ -230,7 +255,7 @@ public struct CodingAgent: Hashable, Sendable {
 
     /// `Claude Code: Fix login bug` — the terminal title stands in when no name is known.
     public func label(fallbackTitle: String = "") -> String {
-        let name = sessionName ?? Self.cleanTitle(fallbackTitle)
+        let name = DisplayText.clean(sessionName ?? Self.cleanTitle(fallbackTitle))
         return name.isEmpty ? kind.title : "\(kind.title): \(name)"
     }
 

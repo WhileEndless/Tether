@@ -33,6 +33,9 @@ struct HostStatusStrip: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.width.rounded() } action: { width = $0 }
                     .overlay(alignment: .leading) { row(s, monitor, density) }
                     .clipped()
+                    // Not updated for a while (its connection may be gone): shown faded, with when.
+                    .opacity(monitor.stale ? 0.45 : 1)
+                    .help(monitor.stale ? "Not updated since \(monitor.lastUpdate?.formatted(date: .omitted, time: .standard) ?? "a while"); reconnecting" : "")
             } else {
                 HStack {
                     let signIn = monitor.error?.hasPrefix(BackgroundSignIn.marker) == true

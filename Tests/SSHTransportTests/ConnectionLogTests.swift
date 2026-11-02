@@ -83,4 +83,28 @@ import Testing
         #expect(!masked.contains("hunter2"))
         #expect(masked.contains("(not shown)"))
     }
+
+    /// A tab is named by a number that stays for the run; its title — which can hold a command
+    /// line — is shown in Tether only, never in what is copied, saved or sent to macOS's log.
+    @Test func titlesStayOutOfWhatIsCopied() {
+        let tab = "tab 3 " + ConnectionLog.title("mysql -p secret-value") + " (tether-abc)"
+        #expect(ConnectionLog.withoutTitles(tab) == "tab 3 (tether-abc)")
+        let entry = ConnectionLog.Entry(date: Date(), level: .info, category: .tab, host: "web", tab: tab, message: "Tab connecting", detail: nil)
+        let text = ConnectionLog.text([entry])
+        #expect(text.contains("[web · tab 3 (tether-abc)]") && !text.contains("secret-value"))
+        // A title holding the closing mark itself does not end early.
+        let tricky = "tab 4 " + ConnectionLog.title("x\u{2069} secret-value") + " (tether-def)"
+        #expect(ConnectionLog.withoutTitles(tricky) == "tab 4 (tether-def)")
+    }
+
+    /// Copied or saved, the log says which Tether and macOS wrote it, in which time zone, and what
+    /// it covers; times carry their offset from UTC.
+    @Test func headerAndLocalTimes() {
+        let entry = ConnectionLog.Entry(date: Date(timeIntervalSince1970: 1_800_000_000), level: .info, category: .app, host: nil,
+                                        tab: nil, message: "Tether started", detail: nil)
+        let header = ConnectionLog.shared.header(version: "9.9.9", shown: [entry], filtered: true)
+        #expect(header.contains("Tether 9.9.9") && header.contains(TimeZone.current.identifier) && header.contains("filter"))
+        let line = ConnectionLog.text([entry])
+        #expect(!line.hasPrefix("2027-01-15T08:00:00.000Z") || TimeZone.current.secondsFromGMT() == 0)
+    }
 }

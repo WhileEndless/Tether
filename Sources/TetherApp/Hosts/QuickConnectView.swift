@@ -283,8 +283,11 @@ private struct DirectConnectForm: View {
         }
         if auth == .password && !password.isEmpty {
             // Saved only when asked to ("Save as host" alone does not store the password).
-            if rememberPassword { PasswordVault.setPassword(password, for: target.key) }
-            else { model.offerQuickConnectPassword(password, for: target.key) }
+            if rememberPassword {
+                Credentials.save(password, for: target.key)
+            }
+            // Handed to the connection it starts either way: no Touch ID for a password just typed.
+            model.offerQuickConnectPassword(password, for: target.key)
         }
         onDone()
         state.connect(target)

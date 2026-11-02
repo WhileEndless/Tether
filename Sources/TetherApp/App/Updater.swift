@@ -281,17 +281,16 @@ final class Updater {
     func restartToUpdate() {
         guard case .ready(let release) = state else { return }
         // Shells nothing keeps running end with Tether: said first.
-        let plain = AppModel.shared.sessions.sessions.filter {
-            $0.phase.isOnline && ($0.persistence == .plain || $0.persistence == .unknown)
-        }.count
+        let lost = AppModel.shared.workEndingOnQuit()
         let alert = NSAlert()
         alert.messageText = "Restart Tether to install \(release.version)?"
         alert.informativeText = "Tabs in tmux or screen come back after the restart."
-            + (plain > 0 ? " \(plain) tab\(plain == 1 ? "" : "s") without tmux or screen will end." : "")
+            + (lost.map { " " + $0.description + "." } ?? "")
         alert.addButton(withTitle: "Restart to Update")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         launchInstaller(reopen: true)
+        AppDelegate.quitAlreadyConfirmed = true
         NSApp.terminate(nil)
     }
 

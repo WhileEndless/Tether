@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 
 /// Encrypts and decrypts with a key the process cannot read (see `SecureEnclaveSealer`).
 public protocol PasswordSealer: Sendable {
@@ -43,22 +44,68 @@ public final class SecureEnclaveSealer: PasswordSealer, @unchecked Sendable {
     }
 }
 
+/// A key made in memory for this run only (AES-GCM), on a Mac without a Secure Enclave: used for
+/// the minute a typed answer is handed to further sign-ins of the same connection, never for
+/// passwords remembered longer (those need the Secure Enclave).
+public final class MemorySealer: PasswordSealer, @unchecked Sendable {
+    private let key = SymmetricKey(size: .bits256)
+    public init() {}
+    public func seal(_ plain: Data) -> Data? { try? AES.GCM.seal(plain, using: key).combined }
+    public func open(_ sealed: Data) -> Data? {
+        guard let box = try? AES.GCM.SealedBox(combined: sealed) else { return nil }
+        return try? AES.GCM.open(box, using: key)
+    }
+}
+
+/// How a sign-in ended, for what it was answered with (see `SealedPasswordCache.discard`).
+public enum SignInEnd: Sendable, Equatable {
+    case succeeded
+    /// The server said no, or hung up after an answer was sent (fail2ban, pam_faillock, network
+    /// devices hang up instead of asking again): what was sent is not sent again.
+    case failed
+    /// Ended before the server could judge what it was sent: the way to it failed (no answer, no
+    /// route, the network changed), or Tether stopped it (a tab closed, Retry, a sign-in stuck before
+    /// any question, Tether locked). What was answered stays.
+    case notJudged
+    /// An answer was sent and the server then said nothing at all until Tether gave up: perhaps a
+    /// slow server, perhaps one that goes silent instead of refusing. A remembered password is sent
+    /// once more, then forgotten.
+    case unanswered
+}
+
 /// Sign-in passwords remembered while the app runs, so one typed password signs in every
 /// connection the same server needs — further shared connections past the server's session limit,
 /// reconnects after the connection really ended — without asking again.
 ///
 /// Rules (see docs/connections-and-passwords.md):
 /// - Only sealed (`PasswordSealer`); nothing unsealed is ever kept.
-/// - Per connection: an entry belongs to the connection the sign-in was for (`bind`: ssh's own
-///   socket name, derived from host name, port, user and jump host) and to the login ssh named in
-///   its question (the caller's `savedPasswordKey`). Another port, another jump host, another user
-///   is another entry — a password is never offered to a different server.
+/// - Per connection: an entry belongs to the connection the sign-in was for (`bind`:
+///   `SharedConnections.Resolution.identity` — host name, port, user and jump hosts as ssh works them
+///   out) and to the login ssh named in its question (the caller's `savedPasswordKey`). Another port,
+///   another jump host, another user is another entry — a password is never offered to a different
+///   server.
 /// - Kept only after the sign-in it was given to succeeded (`commit`); dropped when refused.
+/// - A typed answer is handed to the same connection's other sign-ins for a minute (`handOff`),
+///   also with remembering turned off: the further connections a server needs, a file window, a
+///   retry — one question per server, not one per connection.
+/// - Kept through sleep and screen lock (unless *Also forget them when the screen locks* is on),
+///   also one first read from the keychain: Touch ID is asked when the keychain is read, not again
+///   for every reconnect while it is remembered.
 /// - Never one-time codes or new-password questions; never terminal prompts such as sudo.
 public final class SealedPasswordCache: @unchecked Sendable {
     public enum Source: Sendable { case typed, keychain }
 
-    private struct Entry { var sealed: Data; var source: Source; var login: String; var at = Date() }
+    private struct Entry {
+        var sealed: Data
+        var source: Source
+        var login: String
+        /// The user@host ssh named in its question: the same server reached under another name
+        /// (another alias, Quick Connect) finds it too.
+        var named: String?
+        var at = Date()
+        /// Sent once and never judged (`SignInEnd.unanswered`): sent at most once more.
+        var unconfirmed = false
+    }
 
     /// What the settings show for an entry (never the password).
     public struct Item: Identifiable, Sendable {
@@ -68,6 +115,8 @@ public final class SealedPasswordCache: @unchecked Sendable {
         public var fromKeychain: Bool
     }
     private struct Pending { var key: String; var entry: Entry; var at: TimeInterval }
+    /// A typed answer handed to the same connection's further sign-ins for a short while.
+    private struct HandOff { var entry: Entry; var until: TimeInterval }
 
     private let lock = NSLock()
     private let sealer: PasswordSealer?
@@ -76,10 +125,16 @@ public final class SealedPasswordCache: @unchecked Sendable {
     /// succeeded. One sign-in can be given several (a key's passphrase, then the server's password;
     /// a jump host's and the target's).
     private var pending: [String: [String: Pending]] = [:]
+    private var handOffs: [String: HandOff] = [:]
     /// Which connection each sign-in's token is for.
     private var connections: [String: (connection: String, at: TimeInterval)] = [:]
-    /// The entries each sign-in was answered from (dropped if that sign-in is refused).
-    private var used: [String: Set<String>] = [:]
+    /// The entries each sign-in was answered from (true: from a hand-off), judged by how it ended.
+    private var used: [String: [String: Bool]] = [:]
+    /// Typed answers each sign-in handed on (also with remembering off): a failed sign-in takes its
+    /// hand-off back.
+    private var handedOn: [String: Set<String>] = [:]
+    /// Why an entry was let go, by entry (no password): told when ssh asks again (`whyNotRemembered`).
+    private var forgotten: [String: String] = [:]
     private var _checked = false
     private var _isEnabled = true
     private var _sshNamesItsQuestions = false
@@ -107,29 +162,52 @@ public final class SealedPasswordCache: @unchecked Sendable {
 
     /// How a key file's passphrase is named (`passphrase:<key file>`, as in the keychain).
     public static let passphrasePrefix = "passphrase:"
+    /// How long a typed answer is handed to the same connection's further sign-ins.
+    public static let handOffTime: TimeInterval = 60
 
     public init(sealer: PasswordSealer?) {
         self.sealer = sealer
+        handOffSealer = sealer ?? MemorySealer()
     }
+    /// Seals hand-offs: the Secure Enclave's key, or one in memory where there is none.
+    private let handOffSealer: PasswordSealer
 
     /// Whether passwords can be remembered at all (a Secure Enclave is there).
     public var isAvailable: Bool { sealer != nil }
 
+    /// A password held for a moment elsewhere (Quick Connect), sealed like the hand-offs (by the
+    /// Secure Enclave, or a key in memory where there is none).
+    public func seal(_ password: String) -> Data {
+        handOffSealer.seal(Data(password.utf8)) ?? Data()
+    }
+
+    /// The password `seal` made.
+    public func open(_ sealed: Data) -> String? {
+        guard var plain = handOffSealer.open(sealed) else { return nil }
+        defer { plain.resetBytes(in: 0..<plain.count) }
+        return String(decoding: plain, as: UTF8.self)
+    }
+
     /// Read inside the lock only.
     private var activeLocked: Bool { _isEnabled && _sshNamesItsQuestions && sealer != nil }
-    private var active: Bool { lock.withLock { activeLocked } }
+    /// Hand-offs work also with remembering turned off, and without a Secure Enclave (inside the lock only).
+    private var handsOffLocked: Bool { _sshNamesItsQuestions }
     private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// The sign-in with this askpass token is for this connection (only such sign-ins take part).
     public func bind(token: String, connection: String) {
         lock.withLock {
+            // Sign-ins still running (a question open for long, Tether locked meanwhile) keep theirs.
             let cutoff = Self.now - 600
-            connections = connections.filter { $0.value.at > cutoff }
+            func stale(_ token: String, _ at: TimeInterval) -> Bool { at <= cutoff && !AskPassBridge.shared.isLive(token) }
+            connections = connections.filter { !stale($0.key, $0.value.at) }
             pending = pending.compactMapValues { byKey in
                 let kept = byKey.filter { $0.value.at > cutoff }
                 return kept.isEmpty ? nil : kept
             }
             used = used.filter { connections[$0.key] != nil }
+            handedOn = handedOn.filter { connections[$0.key] != nil }
+            handOffs = handOffs.filter { $0.value.until > Self.now }
             connections[token] = (connection, Self.now)
         }
     }
@@ -141,65 +219,189 @@ public final class SealedPasswordCache: @unchecked Sendable {
         return connections[token].map { $0.connection + "\u{0}" + login }
     }
 
-    /// A password given to the sign-in with this token (kept only if that sign-in succeeds).
-    public func offer(_ password: String, login: String, token: String, source: Source) {
-        guard active, let sealer, let sealed = sealer.seal(Data(password.utf8)) else { return }
+    /// A password given to the sign-in with this token (kept only if that sign-in succeeds). A typed
+    /// one is also handed to the same connection's further sign-ins for `handOffTime`.
+    /// `named`: the user@host ssh named in its question.
+    public func offer(_ password: String, login: String, token: String, source: Source, named: String? = nil) {
+        guard lock.withLock({ handsOffLocked }), let sealed = handOffSealer.seal(Data(password.utf8)) else { return }
         lock.withLock {
             guard let key = key(token: token, login: login) else { return }
-            pending[token, default: [:]][key] = Pending(key: key, entry: Entry(sealed: sealed, source: source, login: login), at: Self.now)
+            let entry = Entry(sealed: sealed, source: source, login: login, named: named)
+            if source == .typed {
+                handOffs[key] = HandOff(entry: entry, until: Self.now + Self.handOffTime)
+                handedOn[token, default: []].insert(key)
+            }
+            guard activeLocked else { return }
+            pending[token, default: [:]][key] = Pending(key: key, entry: entry, at: Self.now)
         }
     }
 
     /// The sign-in with this token succeeded: what was given to it is remembered, from now on. (An
     /// answer taken from here is not given again — see `AppModel.answer` —, so *Forget them after …*
-    /// counts from when a password was typed, not from its last use.)
-    public func commit(token: String) {
+    /// counts from when a password was typed, not from its last use.) Returns the logins remembered.
+    @discardableResult
+    public func commit(token: String) -> [String] {
         lock.withLock {
             connections[token] = nil
-            used[token] = nil
-            guard let given = pending.removeValue(forKey: token), activeLocked else { return }
+            let usedKeys = used.removeValue(forKey: token) ?? [:]
+            // Handed on for another minute from now: further sign-ins of this server still waiting
+            // (more connections for many tabs, one after the other) take it — the server has just
+            // accepted it.
+            for key in (handedOn.removeValue(forKey: token) ?? []).union(usedKeys.filter(\.value).keys) {
+                handOffs[key]?.until = Self.now + Self.handOffTime
+            }
+            // What it was answered with worked: no longer in doubt.
+            for key in usedKeys.keys {
+                entries[key]?.unconfirmed = false
+                handOffs[key]?.entry.unconfirmed = false
+            }
+            guard let given = pending.removeValue(forKey: token), activeLocked else { return [] }
             for var p in given.values {
                 p.entry.at = Date()
+                p.entry.unconfirmed = false
                 entries[p.key] = p.entry
+                forgotten[p.key] = nil
+            }
+            return given.values.map(\.entry.login).sorted()
+        }
+    }
+
+    /// The sign-in with this token ended without success (`SignInEnd`).
+    /// - `failed`: a remembered or handed-off password it was answered with is never sent again,
+    ///   whatever the server did: it may have said no, or hung up instead of asking again (fail2ban,
+    ///   pam_faillock, network devices), and retrying it on every reconnect would lock the account.
+    ///   (It is looked up only when ssh asks for it, so a sign-in that never got that far — no
+    ///   route, host not found — forgets nothing.)
+    /// - `notJudged`: the server never judged it: everything stays, also a typed answer's hand-off.
+    /// - `unanswered`: sent, then silence: kept, but sent at most once more.
+    ///
+    /// A key's passphrase stays in every case: the key opened with it (a wrong one makes ssh ask
+    /// again, see `reject`); the server refused something else. One typed for this sign-in is kept
+    /// as if it had succeeded.
+    public func discard(token: String, end: SignInEnd = .failed) {
+        lock.withLock {
+            let given = pending.removeValue(forKey: token) ?? [:]
+            let handed = handedOn.removeValue(forKey: token) ?? []
+            connections[token] = nil
+            if activeLocked {
+                for p in given.values where Self.isPassphraseEntry(p.key) {
+                    var e = p.entry
+                    e.at = Date()
+                    entries[p.key] = e
+                    forgotten[p.key] = nil
+                }
+            }
+            let keys = used.removeValue(forKey: token) ?? [:]
+            switch end {
+            case .succeeded, .notJudged:
+                return
+            case .failed:
+                for key in keys.keys where !Self.isPassphraseEntry(key) {
+                    if let gone = entries.removeValue(forKey: key) {
+                        forgotten[key] = "a sign-in it was sent to failed"
+                        Self.logForgotten(gone.login, "a sign-in it was sent to failed (the server refused it or hung up)")
+                    }
+                    handOffs[key] = nil
+                }
+                // A typed answer the server refused or hung up on: not handed on either.
+                for key in Set(given.keys).union(handed) where !Self.isPassphraseEntry(key) { handOffs[key] = nil }
+            case .unanswered:
+                for (key, fromHandOff) in keys where !Self.isPassphraseEntry(key) {
+                    if fromHandOff {
+                        if handOffs[key]?.entry.unconfirmed == true { handOffs[key] = nil } else { handOffs[key]?.entry.unconfirmed = true }
+                    } else if entries[key]?.unconfirmed == true {
+                        if let gone = entries[key] { Self.logForgotten(gone.login, "it was sent twice and the server never answered") }
+                        entries[key] = nil
+                        handOffs[key] = nil
+                        forgotten[key] = "it was sent twice and the server never answered"
+                    } else {
+                        entries[key]?.unconfirmed = true
+                    }
+                }
             }
         }
     }
 
-    /// The sign-in with this token ended without success. A remembered password it was answered
-    /// with is never sent again, whatever the reason: the server may have said no, or hung up
-    /// instead of asking again (fail2ban, pam_faillock, network devices), and retrying it on every
-    /// reconnect would lock the account. (It is looked up only when ssh asks for it, so a sign-in
-    /// that never got that far — no route, host not found — forgets nothing.) A key's passphrase
-    /// stays: the key opened with it (a wrong one makes ssh ask again, see `reject`); the server
-    /// refused something else — the key itself, or a password.
-    public func discard(token: String) {
-        lock.withLock {
-            pending[token] = nil
-            connections[token] = nil
-            guard let keys = used.removeValue(forKey: token) else { return }
-            for key in keys where !Self.isPassphraseEntry(key) { entries[key] = nil }
-        }
+    /// An answer that looks like a one-time code (only digits, 4 to 10 of them), not a password: typed
+    /// for the same login question asked again, it is a second step, not a new password.
+    public static func looksLikeOneTimeCode(_ answer: String) -> Bool {
+        (4...10).contains(answer.count) && answer.allSatisfy { $0.isASCII && $0.isNumber }
     }
+
+    /// ssh's last words say the network failed (no answer, no route), not the server: a sign-in
+    /// that ended so keeps what it was answered with (see `discard`). A connection that was closed
+    /// or reset is not one of them: a server may hang up instead of saying no.
+    public static func isNetworkFailure(_ text: String) -> Bool { SSHFailure.isNetwork(text) }
 
     private static func isPassphraseEntry(_ key: String) -> Bool { key.hasPrefix("key\u{0}" + passphrasePrefix) }
 
-    /// The password remembered for this sign-in's connection and login, opened just for it.
-    public func password(token: String, login: String) -> (password: String, source: Source)? {
-        guard active, let sealer, let entry = lock.withLock({ () -> Entry? in
-            guard let key = key(token: token, login: login), let entry = entries[key] else { return nil }
-            if let maxAge = _maxAge, Date().timeIntervalSince(entry.at) > maxAge { entries[key] = nil; return nil }
-            used[token, default: []].insert(key)
-            return entry
-        }), var plain = sealer.open(entry.sealed) else { return nil }
+    /// The moment one is let go, and why (a key by its file name only: no folder in the log).
+    private static func logForgotten(_ login: String, _ why: String) {
+        let host = login.hasPrefix(passphrasePrefix) ? "key " + (String(login.dropFirst(passphrasePrefix.count)) as NSString).lastPathComponent : login
+        ConnectionLog.shared.notice("Forgot a remembered password", .signIn, host: host, detail: why)
+    }
+
+    /// The password remembered (or just typed, see `handOffTime`) for this sign-in's connection and
+    /// login, opened just for it. `named`: the user@host ssh named — an entry made under another
+    /// name for the same server and user answers too.
+    public func password(token: String, login: String, named: String? = nil) -> (password: String, source: Source)? {
+        let sealer = handOffSealer
+        guard let found = lock.withLock({ () -> Entry? in
+            guard handsOffLocked, let key = key(token: token, login: login) else { return nil }
+            if activeLocked, let (k, entry) = rememberedLocked(key: key, token: token, named: named) {
+                used[token, default: [:]][k] = false
+                return entry
+            }
+            // The same account under another name on the same connection (another alias) too.
+            var handKey = key
+            if handOffs[key] == nil, let named, let connection = connections[token]?.connection {
+                let prefix = connection + "\u{0}"
+                handKey = handOffs.keys.sorted().first { $0.hasPrefix(prefix) && handOffs[$0]?.entry.named == named } ?? key
+            }
+            if let h = handOffs[handKey], h.until > Self.now, _maxAge.map({ Date().timeIntervalSince(h.entry.at) <= $0 }) ?? true {
+                let key = handKey
+                used[token, default: [:]][key] = true
+                // Remembered once this sign-in works, as if typed for it (the one it was typed for
+                // may have been stopped before the server judged it).
+                if activeLocked { pending[token, default: [:]][key] = Pending(key: key, entry: h.entry, at: Self.now) }
+                return h.entry
+            }
+            return nil
+        }), var plain = sealer.open(found.sealed) else { return nil }
         defer { plain.resetBytes(in: 0..<plain.count) }
-        return (String(decoding: plain, as: UTF8.self), entry.source)
+        return (String(decoding: plain, as: UTF8.self), found.source)
+    }
+
+    /// Inside the lock: the remembered entry for this key — or for the same connection and the same
+    /// user@host under another login name — dropping one past its time.
+    private func rememberedLocked(key: String, token: String, named: String?) -> (String, Entry)? {
+        func fresh(_ k: String) -> Entry? {
+            guard let entry = entries[k] else { return nil }
+            if let maxAge = _maxAge, Date().timeIntervalSince(entry.at) > maxAge {
+                entries[k] = nil
+                forgotten[k] = "it was older than the time chosen in Settings ▸ Passwords"
+                return nil
+            }
+            return entry
+        }
+        if let e = fresh(key) { return (key, e) }
+        guard let named, let connection = connections[token]?.connection else { return nil }
+        let prefix = connection + "\u{0}"
+        for k in entries.keys.sorted() where k.hasPrefix(prefix) && entries[k]?.named == named {
+            if let e = fresh(k) { return (k, e) }
+        }
+        return nil
     }
 
     /// The server refused it (changed or wrong): never sent again.
     public func reject(token: String, login: String) {
         lock.withLock {
             guard let key = key(token: token, login: login) else { return }
-            entries[key] = nil
+            for k in (used[token] ?? [:]).keys where k == key || entries[k]?.login == login {
+                if entries.removeValue(forKey: k) != nil { forgotten[k] = "the server did not accept it"; Self.logForgotten(login, "the server did not accept it") }
+            }
+            if entries.removeValue(forKey: key) != nil { forgotten[key] = "the server did not accept it"; Self.logForgotten(login, "the server did not accept it") }
+            handOffs[key] = nil
             pending[token]?[key] = nil
         }
     }
@@ -209,18 +411,7 @@ public final class SealedPasswordCache: @unchecked Sendable {
         lock.withLock {
             guard let key = key(token: token, login: login) else { return }
             pending[token]?[key] = nil
-        }
-    }
-
-    /// Entries that came from the keychain (Touch ID locks again: they need it again), also those
-    /// still waiting for their sign-in to finish.
-    public func removeKeychainEntries() {
-        lock.withLock {
-            entries = entries.filter { $0.value.source != .keychain }
-            pending = pending.compactMapValues { byKey in
-                let kept = byKey.filter { $0.value.entry.source != .keychain }
-                return kept.isEmpty ? nil : kept
-            }
+            handOffs[key] = nil
         }
     }
 
@@ -230,11 +421,34 @@ public final class SealedPasswordCache: @unchecked Sendable {
         lock.withLock { connections[token]?.connection }
     }
 
-    /// Everything is forgotten (App Lock locks, the setting is turned off, "Forget Now").
-    public func removeAll() {
+    /// Everything is forgotten (the setting is turned off, "Forget All", the screen locked with
+    /// *Also forget them when the screen locks*). `reason`: told when ssh asks again (`whyNotRemembered`).
+    public func removeAll(reason: String = "all remembered passwords were forgotten") {
         lock.withLock {
+            if !entries.isEmpty {
+                ConnectionLog.shared.notice("Forgot \(entries.count) remembered password\(entries.count == 1 ? "" : "s")", .signIn, detail: reason)
+            }
+            for key in entries.keys { forgotten[key] = reason }
             entries.removeAll()
             pending.removeAll()
+            handOffs.removeAll()
+        }
+    }
+
+    /// Why the sign-in with this token found nothing to answer `login` with, in words for the
+    /// Connection Log (never a password, host or path).
+    public func whyNotRemembered(token: String, login: String) -> String {
+        lock.withLock {
+            if !_isEnabled { return "remembering sign-in passwords is turned off" }
+            if sealer == nil { return "this Mac has no Secure Enclave" }
+            if !_checked { return "the ssh program was still being checked" }
+            if !_sshNamesItsQuestions { return "the ssh program is older than OpenSSH 8.4" }
+            guard let key = key(token: token, login: login) else { return "this sign-in is not one Tether started for a shared connection" }
+            if let why = forgotten[key] { return "it was forgotten: " + why }
+            if entries.values.contains(where: { $0.login == login }) {
+                return "one is remembered for this login on another connection (another host name, port, user or jump host)"
+            }
+            return "nothing was remembered for this connection since Tether started"
         }
     }
 
@@ -250,12 +464,17 @@ public final class SealedPasswordCache: @unchecked Sendable {
     }
 
     /// Forgets one entry (Settings ▸ Passwords).
-    public func forget(_ id: String) { lock.withLock { _ = entries.removeValue(forKey: id) } }
+    public func forget(_ id: String) {
+        lock.withLock { if entries.removeValue(forKey: id) != nil { forgotten[id] = "it was forgotten in Settings ▸ Passwords" } }
+    }
 
-    /// Forgets every entry for this login (a key whose passphrase was just changed).
-    public func forget(login: String) {
+    /// Forgets every entry for this login (its saved password was removed or replaced, a key's
+    /// passphrase was changed). `reason`: told when ssh asks again.
+    public func forget(login: String, reason: String = "its saved password or passphrase was changed") {
         lock.withLock {
+            for (k, e) in entries where e.login == login { forgotten[k] = reason; Self.logForgotten(login, reason) }
             entries = entries.filter { $0.value.login != login }
+            handOffs = handOffs.filter { $0.value.entry.login != login }
             for token in pending.keys { pending[token] = pending[token]?.filter { $0.value.entry.login != login } }
         }
     }
@@ -270,10 +489,11 @@ public enum SSHVersion {
         return major > 8 || (major == 8 && minor >= 4)
     }
 
-    /// `ssh -V` of this program (it prints and exits at once; one that does not counts as no).
-    public static func namesItsQuestions(binary: String) async -> Bool {
-        let r = await ProcessRunner.run(binary, arguments: ["-V"], timeout: 3)
-        return !r.timedOut && namesItsQuestions(r.errorOutput + r.output)
+    /// `ssh -V` of this program; nil when it did not answer in time (a busy Mac at launch: asked
+    /// again later, never taken as a no).
+    public static func namesItsQuestions(binary: String) async -> Bool? {
+        let r = await ProcessRunner.run(binary, arguments: ["-V"], timeout: 5)
+        return r.timedOut ? nil : namesItsQuestions(r.errorOutput + r.output)
     }
 }
 
@@ -283,19 +503,25 @@ public final class SSHVersionCheck: @unchecked Sendable {
     public static let shared = SSHVersionCheck()
 
     private let lock = NSLock()
-    private var results: [String: (identity: String, answer: Task<Bool, Never>)] = [:]
+    private var results: [String: (identity: String, answer: Task<Bool?, Never>)] = [:]
 
     public init() {}
 
+    /// A program that did not answer in time counts as no for this question only: it is asked again
+    /// next time.
     public func namesItsQuestions(path: String) async -> Bool {
         guard let identity = Self.identity(of: path) else { return false }
-        let answer: Task<Bool, Never> = lock.withLock {
+        let answer: Task<Bool?, Never> = lock.withLock {
             if let known = results[path], known.identity == identity { return known.answer }
             let task = Task { await SSHVersion.namesItsQuestions(binary: path) }
             results[path] = (identity, task)
             return task
         }
-        return await answer.value
+        guard let known = await answer.value else {
+            lock.withLock { if results[path]?.answer == answer { results[path] = nil } }
+            return false
+        }
+        return known
     }
 
     /// The file as it is now (device, inode, size, modification time); nil when it is not there.

@@ -8,6 +8,7 @@ import SearchKit
 import RecordingKit
 import SSHTransport
 import TerminalUI
+import FileTransferKit
 
 /// Debug-only scripted UI run used to reproduce window/tab problems without a person at the keyboard.
 /// Enabled with TETHER_SELFTEST=<log file> and TETHER_SSH_BINARY=<fake ssh>; always combine with
@@ -41,6 +42,20 @@ enum SelfTest {
         try? rep.representation(using: .png, properties: [:])?.write(to: url)
     }
 
+    /// Waits for a process it started, for a few seconds at most (a hung tmux or ssh must not hold
+    /// the run, or quitting, up): then it is ended.
+    nonisolated static func wait(for process: Process, seconds: Double = 5) {
+        let end = Date().addingTimeInterval(seconds)
+        while process.isRunning, Date() < end { usleep(20_000) }
+        guard process.isRunning else { return }
+        process.terminate()
+        // Gone before anyone reads how it ended (reading that of a running process raises).
+        let killAt = Date().addingTimeInterval(2)
+        while process.isRunning, Date() < killAt { usleep(20_000) }
+        if process.isRunning, process.processIdentifier > 1 { kill(process.processIdentifier, SIGKILL) }
+        while process.isRunning { usleep(20_000) }
+    }
+
     static func runIfRequested(state: WindowState) {
         let env = ProcessInfo.processInfo.environment
         guard !started, let logPath = env["TETHER_SELFTEST"], let ssh = env["TETHER_SSH_BINARY"],
@@ -52,6 +67,21 @@ enum SelfTest {
         AppPaths.ensure(tmuxDir, permissions: 0o700)
         setenv("TMUX_TMPDIR", tmuxDir.path, 1)
         unsetenv("TMUX")
+        // Whatever the run did, its tmux server (by its own socket) and folder go when Tether quits.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+            let socket = tmuxDir.appendingPathComponent("tmux-\(getuid())/default").path
+            if FileManager.default.fileExists(atPath: socket) {
+                let end = Process()
+                end.executableURL = URL(fileURLWithPath: "/bin/sh")
+                end.arguments = ["-c", "unset TMUX; exec tmux -S \"$1\" kill-server", "sh", socket]
+                end.environment = ["PATH": ChildEnvironment.local["PATH"] ?? "/usr/bin:/bin:/opt/homebrew/bin"]
+                end.standardError = FileHandle.nullDevice
+                try? end.run()
+                SelfTest.wait(for: end)
+            }
+            // Only this run's own folder (named after its process).
+            if tmuxDir.path.hasPrefix("/tmp/tether-\(getuid())-tmux-") { try? FileManager.default.removeItem(at: tmuxDir) }
+        }
         FileManager.default.createFile(atPath: logPath, contents: nil)
         let log = FileHandle(forWritingAtPath: logPath)
         func say(_ s: String) {
@@ -62,6 +92,8 @@ enum SelfTest {
         model.settings.useControlMaster = env["TETHER_SELFTEST_MASTER"] != nil
         model.settings.recordingEnabled = false
         model.settings.confirmCloseOnlineSessions = env["TETHER_SELFTEST_CONFIRM"] != nil
+        // A run ends by quitting by itself: never held up by the question about what would end.
+        model.settings.confirmQuitWhenWorkWouldEnd = false
         if env["TETHER_SELFTEST_NOBLINK"] != nil { model.settings.cursorBlink = false }
         model.settings.showStatusStrip = env["TETHER_SELFTEST_NOSTRIP"] == nil
         model.settings.cursorBlink = env["TETHER_SELFTEST_NOBLINK"] == nil ? model.settings.cursorBlink : false
@@ -69,6 +101,90 @@ enum SelfTest {
         model.settings.requireAuthForSavedPasswords = false
         if env["TETHER_SELFTEST_NOINSPECTOR"] != nil { state.sidebarSelection = nil; state.showInspectorRequest = false }
         let target = ConnectionTarget.adhoc(user: nil, host: "selftest.local", port: nil, jump: nil)
+
+        // A server that cannot be reached at all (every ssh hangs, as on a network that went away):
+        // tabs and a file window to it, then quitting. The app must stay responsive the whole time
+        // and quit at once (checked from outside). TETHER_SELFTEST_OFFLINE=1.
+        if env["TETHER_SELFTEST_OFFLINE"] != nil {
+            Task { @MainActor in
+                let host = ConnectionTarget.adhoc(user: "user", host: "unreachable.example.com", port: nil, jump: nil)
+                let tabs = (0..<3).map { _ in state.connect(host, persistence: .tmux) }
+                state.browse(host, path: "/srv/app")
+                // How late the main thread answers, while everything waits on the server.
+                var worst = 0.0
+                for _ in 0..<40 {
+                    let asked = ProcessInfo.processInfo.systemUptime
+                    try? await Task.sleep(for: .milliseconds(200))
+                    worst = max(worst, ProcessInfo.processInfo.systemUptime - asked - 0.2)
+                }
+                say(worst < 1 ? "PASS the app stayed responsive while the server did not answer (worst delay \(Int(worst * 1000)) ms)"
+                              : "FAIL the main thread was held up for \(Int(worst * 1000)) ms")
+                say("tabs: " + tabs.map { "\($0.phase.label)" }.joined(separator: ", "))
+                say("QUITTING")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // The sign-in panel: showing it makes it key, which posts the notifications that ask for it
+        // again; that once recursed until the stack ran out (a frozen app, then a crash). One panel,
+        // shown once, however often it is asked for — new, hidden and shown again, and from inside
+        // the notifications. TETHER_SELFTEST_PROMPTPANEL=1.
+        if env["TETHER_SELFTEST_PROMPTPANEL"] != nil {
+            Task { @MainActor in
+                let panel = AskPassPanel.shared
+                func question(_ n: Int) -> PendingPrompt {
+                    PendingPrompt(request: AskPassRequest(token: "selftest-\(n)", targetKey: "selftest.local", purpose: "connect",
+                                                          prompt: "user@selftest.local's password: ", sequence: n))
+                }
+                // Every key change asks again from inside the notification, as a busy app would.
+                var reentered = 0
+                let watcher = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: nil) { _ in
+                    MainActor.assumeIsolated {
+                        if panel.isPresenting { reentered += 1 }
+                        panel.update(model.promptInFront)
+                        model.refreshPromptPanel()
+                    }
+                }
+                let first = question(1)
+                model.setPrompts([first])
+                try? await Task.sleep(for: .seconds(1))
+                let shown = NSApp.windows.filter { $0 is NSPanel && $0.isVisible && !$0.isSheet }
+                say(panel.panelsMade == 1 && shown.count == 1
+                    ? "PASS a new question shows one panel (asked again \(reentered) times while showing)"
+                    : "FAIL new question: \(panel.panelsMade) panels made, \(shown.count) visible")
+                // Hidden (its tab went to the background) and shown again: the same panel.
+                for window in shown { window.orderOut(nil) }
+                for _ in 0..<5 {
+                    model.refreshPromptPanel()
+                    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: state.window)
+                }
+                try? await Task.sleep(for: .seconds(1))
+                let again = NSApp.windows.filter { $0 is NSPanel && $0.isVisible && !$0.isSheet }
+                if !NSApp.isActive {
+                    // Another app is in front (a run started in the background): the panel is not
+                    // pulled forward over it — it comes back when Tether is active again.
+                    say(panel.panelsMade == 1 && again.isEmpty
+                        ? "PASS a hidden question waits while another app is in front (and is not made twice)"
+                        : "FAIL while inactive: \(panel.panelsMade) panels made, \(again.count) visible")
+                } else {
+                    say(panel.panelsMade == 1 && again.count == 1 ? "PASS a hidden question comes back in the same panel"
+                                                                  : "FAIL shown again: \(panel.panelsMade) panels made, \(again.count) visible")
+                }
+                // Another question while one is up, then none: the panel follows, and goes.
+                model.setPrompts([question(2)])
+                try? await Task.sleep(for: .milliseconds(500))
+                model.setPrompts([])
+                try? await Task.sleep(for: .milliseconds(500))
+                let gone = !NSApp.windows.contains { $0 is NSPanel && $0.isVisible && !$0.isSheet }
+                say(panel.panelsMade == 1 && gone ? "PASS the panel follows the questions and goes with the last"
+                                                  : "FAIL after questions: \(panel.panelsMade) panels made, gone=\(gone)")
+                NotificationCenter.default.removeObserver(watcher)
+                say("DONE")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
 
         // The menus while typing in a terminal: which item a ⌘ key reaches, and whether it is on.
         // TETHER_SELFTEST_MENUS=1.
@@ -124,6 +240,87 @@ enum SelfTest {
                 try? await Task.sleep(for: .seconds(3))
                 say("sessions \(tabs.map { "\($0.descriptor.remoteSessionName) \($0.persistence) \($0.phase.label)" })")
                 say("QUITTING")
+                if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
+            }
+            return
+        }
+
+        // Finder files dropped on a local terminal: their paths are typed. TETHER_SELFTEST_DROP=1.
+        if env["TETHER_SELFTEST_DROP"] != nil {
+            Task { @MainActor in
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-selftest-\(UUID().uuidString)")
+                let folder = dir.appendingPathComponent("a folder", isDirectory: true)
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let file = dir.appendingPathComponent("it's here.txt")
+                try? Data("x".utf8).write(to: file)
+                defer { try? FileManager.default.removeItem(at: dir) }
+                for persistence in [PersistenceMode.tmux, .off] {
+                    let s = state.connect(.local, persistence: persistence)
+                    for _ in 0..<100 where !s.phase.isOnline { try? await Task.sleep(for: .milliseconds(100)) }
+                    try? await Task.sleep(for: .seconds(1.5))
+                    let view = TerminalRegistry.shared.view(for: s)
+                    let pb = NSPasteboard(name: NSPasteboard.Name("tether-selftest-drop"))
+                    pb.clearContents()
+                    pb.writeObjects([file as NSURL, folder as NSURL])
+                    let drag = SelfTestDrag(pasteboard: pb)
+                    let entered = view.draggingEntered(drag)
+                    let performed = view.performDragOperation(drag)
+                    // Until the shell has shown it (a tmux pane's echo comes back through tmux).
+                    var lines: [String] = []
+                    for _ in 0..<30 {
+                        try? await Task.sleep(for: .milliseconds(200))
+                        lines = view.scrollbackText().lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        if lines.joined().contains("a folder") { break }
+                    }
+                    let typed = lines.joined().contains("here.txt") && lines.joined().contains("a folder")
+                    // What a real drag over the middle of the terminal reaches: the deepest view
+                    // there, and the views on the way up that take dragged files.
+                    if let content = view.window?.contentView {
+                        let mid = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+                        var hit = content.hitTest(content.convert(mid, from: nil))
+                        var chain: [String] = []
+                        while let h = hit {
+                            let takes = h.registeredDraggedTypes.contains(.fileURL)
+                            chain.append("\(type(of: h))\(takes ? "[files]" : "")\(h === view ? "<TERMINAL" : "")")
+                            hit = h.superview
+                        }
+                        say("hit chain: \(chain.prefix(8).joined(separator: " > "))")
+                    }
+                    say("\(typed ? "PASS" : "FAIL") drop on local \(persistence) entered=\(entered.rawValue) performed=\(performed) callbacks=\(view.onFiles != nil)")
+                    for l in lines.suffix(4) { say("  | \(l)") }
+                    say("  phase=\(s.phase.label) persistence=\(s.persistence)")
+                    pb.releaseGlobally()
+                    // Rows of this Mac's own file manager dropped here: their paths, nothing copied.
+                    let clip = RemoteClip(target: .local, items: [.init(path: folder.path, name: "a folder", isDirectory: true)])
+                    s.send(Array("\u{3}clear\r".utf8)[...])
+                    try? await Task.sleep(for: .seconds(0.8))
+                    _ = model.pasteRemoteClip(into: s, in: state, dropped: clip)
+                    try? await Task.sleep(for: .seconds(0.8))
+                    let rows = view.scrollbackText().lines.joined()
+                    say("\(rows.contains("a folder") && model.uploadBatches[s.id] == nil ? "PASS" : "FAIL") Mac file manager rows on local \(persistence)")
+                    // A full-screen program that takes pastes as pastes (vim, an agent's prompt): typed.
+                    s.send(Array("\u{3}printf '\\033[?1049h\\033[?2004h'; sleep 4; printf '\\033[?2004l\\033[?1049l'\r".utf8)[...])
+                    try? await Task.sleep(for: .seconds(1))
+                    let full = view.showsAlternateScreen && view.getTerminal().bracketedPasteMode
+                    let typedThere = model.typePaths([file.path], into: s, now: true)
+                    say("\(full && typedThere ? "PASS" : "FAIL") full-screen bracketed: fullScreen=\(full) typed=\(typedThere)")
+                    try? await Task.sleep(for: .seconds(4))
+                }
+                // A server's files saved for a terminal here: next to what is there, never over it.
+                let into = dir.appendingPathComponent("into", isDirectory: true)
+                try? FileManager.default.createDirectory(at: into, withIntermediateDirectories: true)
+                try? Data("old".utf8).write(to: into.appendingPathComponent("it's here.txt"))
+                let placed = await AppModel.place([file, folder], in: into, moving: false)
+                let old = (try? String(contentsOf: into.appendingPathComponent("it's here.txt"), encoding: .utf8)) == "old"
+                say("\(old && placed.map(\.lastPathComponent) == ["it's here 2.txt", "a folder"] ? "PASS" : "FAIL") saved beside: \(placed.map(\.lastPathComponent)) old kept=\(old)")
+                // This run's own tmux server ends with it (by its socket: never the user's).
+                let end = Process()
+                end.executableURL = URL(fileURLWithPath: "/bin/sh")
+                end.arguments = ["-c", "unset TMUX; exec tmux -S \"$1\" kill-server", "sh", tmuxDir.appendingPathComponent("tmux-\(getuid())/default").path]
+                end.environment = ["PATH": ChildEnvironment.local["PATH"] ?? "/usr/bin:/bin:/opt/homebrew/bin"]
+                try? end.run()
+                SelfTest.wait(for: end)
+                say("DONE")
                 if env["TETHER_SELFTEST_KEEP"] == nil { NSApp.terminate(nil) }
             }
             return
@@ -234,7 +431,7 @@ enum SelfTest {
                 ps.standardOutput = pipe
                 try? ps.run()
                 let list = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                ps.waitUntilExit()
+                SelfTest.wait(for: ps)
                 let mine = String(getpid())
                 let watchers = list.split(separator: "\n").filter { $0.contains("sh -s -- -i ") && $0.trimmingCharacters(in: .whitespaces).hasPrefix(mine + " ") }
                 say("watchers=\(watchers.count) for \(model.commandSamplers.count) terminals")
@@ -282,7 +479,7 @@ enum SelfTest {
                 model.settings.sshConfigPath = config.path
                 model.settings.useControlMaster = true
                 model.settings.requireAuthForSavedPasswords = false
-                PasswordVault.setPassword("pp-secret-456", for: CredentialKey.passphrase(keyPath: keyURL.path))
+                Credentials.save("pp-secret-456", for: CredentialKey.passphrase(keyPath: keyURL.path))
                 let s = state.connect(.alias("pptest"), persistence: .off)
                 for _ in 0..<150 where !s.phase.isOnline && !s.phase.isDead { try? await Task.sleep(for: .milliseconds(100)) }
                 say(s.phase.isOnline ? "PASS signed in with the saved passphrase (token bound to its ssh)"
@@ -299,7 +496,7 @@ enum SelfTest {
                 direct.arguments = ["Enter passphrase for key '\(keyURL.path)': "]
                 direct.environment = e
                 let out = Pipe(); direct.standardOutput = out
-                try? direct.run(); direct.waitUntilExit()
+                try? direct.run(); SelfTest.wait(for: direct)
                 let answer = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
                 AskPassBridge.shared.revoke(environment: stolen)
                 say(direct.terminationStatus != 0 && !answer.contains("pp-secret") && !r.succeeded
@@ -331,7 +528,7 @@ enum SelfTest {
                                                         : "FAIL fresh sign-in online=\(fresh.online) asked=\(fresh.asked.map(\.request.prompt))")
 
                 // Not kept: asked once; with "remember" the answer is kept and the next sign-in asks nothing.
-                PasswordVault.deletePassword(for: account)
+                Credentials.remove(account)
                 let typed = await signIn("pptest") { model.resolvePrompt($0, answer: "pp-secret-456", save: true) }
                 let kept = PasswordVault.password(for: account) == "pp-secret-456"
                 let after = await signIn("pptest")
@@ -340,7 +537,7 @@ enum SelfTest {
                     : "FAIL remember typed=\(typed.online)/\(typed.asked.count) kept=\(kept) after=\(after.online)/\(after.asked.count)")
 
                 // A kept passphrase that is wrong (the key was changed elsewhere): sent once, then asked.
-                PasswordVault.setPassword("not-the-passphrase", for: account)
+                Credentials.save("not-the-passphrase", for: account)
                 let wrong = await signIn("pptest") { model.resolvePrompt($0, answer: "pp-secret-456", save: true) }
                 say(wrong.online && wrong.asked.count == 1 && wrong.asked.first?.savedWasRejected == true
                     && PasswordVault.password(for: account) == "pp-secret-456"
@@ -359,7 +556,7 @@ enum SelfTest {
                 try? (text + "\n" + text.replacingOccurrences(of: "Host pptest", with: "Host pplong")
                     .replacingOccurrences(of: keyURL.path, with: longURL.path)).write(to: config, atomically: true, encoding: .utf8)
                 model.reloadConfig()
-                PasswordVault.setPassword("pp-long-789", for: CredentialKey.passphrase(keyPath: longURL.path))
+                Credentials.save("pp-long-789", for: CredentialKey.passphrase(keyPath: longURL.path))
                 let long = await signIn("pplong")
                 say(long.online && long.asked.isEmpty ? "PASS a long key path (\(longURL.path.count) characters) finds its kept passphrase"
                                                       : "FAIL long path online=\(long.online) asked=\(long.asked.map(\.request.prompt))")
@@ -1116,5 +1313,26 @@ enum SelfTest {
             say("done")
         }
     }
+}
+/// A drag as AppKit hands it to a drop target, for dropping without a mouse.
+final class SelfTestDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard: NSPasteboard
+    init(pasteboard: NSPasteboard) { draggingPasteboard = pasteboard }
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions = [], for view: NSView?,
+                                classes classArray: [AnyClass], searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
+                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+    func resetSpringLoading() {}
 }
 #endif

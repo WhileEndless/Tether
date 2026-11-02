@@ -66,7 +66,14 @@ public struct RemoteFileSystem: Sendable {
     static let listScript = #"""
 export LC_ALL=C
 T=$(printf '\t')
-if [ -z "$1" ]; then cd || exit 1; else cd -- "$1" 2>/dev/null || { echo "Cannot open directory: $1" >&2; exit 1; }; fi
+if [ -z "$1" ]; then cd || exit 1
+elif [ ! -e "$1" ]; then
+  # Gone only when the folder above that is there can be looked into: below one that cannot
+  # (`/root/x` for another user) nothing can be told, and it is not called gone.
+  p=$(dirname -- "$1"); while [ ! -e "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do p=$(dirname -- "$p"); done
+  if [ -d "$p" ] && [ -x "$p" ]; then echo "Directory not found: $1" >&2; else echo "Cannot open directory: $1" >&2; fi
+  exit 1
+else cd -- "$1" 2>/dev/null || { echo "Cannot open directory: $1" >&2; exit 1; }; fi
 pwd
 if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
   find . -mindepth 1 -maxdepth 1 -printf '%y\t%m\t%u\t%g\t%s\t%T@\t%l\t%f\n' 2>/dev/null
@@ -79,10 +86,38 @@ else
 fi
 """#
 
-    /// Lists a directory. Pass nil for the home directory.
-    public func list(_ path: String?) async throws -> (directory: String, files: [RemoteFile]) {
-        let text = try await executor.output(RemoteScript(Self.listScript, windows: WindowsFileScripts.list), arguments: [path ?? ""], timeout: 30, purpose: "files")
-        return Self.parseListing(text)
+    /// A folder that is not there (any more): deleted, renamed, or on a server set up afresh.
+    public struct MissingDirectory: Error, LocalizedError, Sendable {
+        public let path: String
+        public var errorDescription: String? { "\u{2018}\(path)\u{2019} no longer exists." }
+    }
+
+    /// Lists a directory. Pass nil for the home directory. `stopOnCancel`: cancelling the calling
+    /// task ends the listing on the server too (a tab closed, another folder asked for).
+    public func list(_ path: String?, stopOnCancel: Bool = false) async throws -> (directory: String, files: [RemoteFile]) {
+        do {
+            let text = try await executor.output(RemoteScript(Self.listScript, windows: WindowsFileScripts.list), arguments: [path ?? ""],
+                                                 timeout: 30, purpose: "files", stopOnCancel: stopOnCancel)
+            return Self.parseListing(text)
+        } catch let error as RemoteError where error.message.hasPrefix("Directory not found:") {
+            throw MissingDirectory(path: path ?? "~")
+        }
+    }
+
+    /// Walks up from `path` to the nearest folder that exists and can be opened (the home folder
+    /// when none does), resolved as the listing shows it.
+    static let nearestScript = #"""
+p=$1
+while [ -n "$p" ] && [ "$p" != / ] && ! { [ -d "$p" ] && cd -- "$p" 2>/dev/null; }; do p=$(dirname -- "$p"); done
+if [ -n "$p" ] && cd -- "$p" 2>/dev/null; then pwd; else cd && pwd; fi
+"""#
+
+    public func nearestExisting(_ path: String, stopOnCancel: Bool = false) async throws -> String {
+        let text = try await executor.output(RemoteScript(Self.nearestScript, windows: WindowsFileScripts.nearest), arguments: [path],
+                                             timeout: 30, purpose: "files", stopOnCancel: stopOnCancel)
+        let dir = text.split(separator: "\n").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !dir.isEmpty else { throw RemoteError("Could not find a folder near \(path).") }
+        return dir
     }
 
     public static func parseListing(_ text: String) -> (directory: String, files: [RemoteFile]) {
@@ -313,8 +348,26 @@ done
         _ = try await executor.output(RemoteScript(#"mkdir -p -- "$1""#, windows: WindowsFileScripts.makeDirectory), arguments: [path], purpose: "files")
     }
 
+    /// Never over something that is there (`mv` would replace a file, or move into a folder of
+    /// that name): refused with a reason. A new spelling of the same name on a disk that ignores
+    /// case (`readme` → `README` on macOS) is that very item, not another one: allowed — only
+    /// then (same folder, names differing only in case, neither a symbolic link, the same item).
+    /// A link renamed to the name of what it points to is another item: refused, or `mv` would
+    /// put the link in place of the file it points to.
+    static let renameScript = #"""
+if [ "$1" = "$2" ]; then exit 0; fi
+if [ -e "$2" ] || [ -L "$2" ]; then
+  lower() { basename -- "$1" | tr '[:upper:]' '[:lower:]'; }
+  if [ -L "$1" ] || [ -L "$2" ] || [ "$(dirname -- "$1")" != "$(dirname -- "$2")" ] \
+     || [ "$(lower "$1")" != "$(lower "$2")" ] || ! [ "$1" -ef "$2" ] 2>/dev/null; then
+    echo "Something named that is already there." >&2; exit 1
+  fi
+fi
+mv -- "$1" "$2"
+"""#
+
     public func rename(_ path: String, to newPath: String) async throws {
-        _ = try await executor.output(RemoteScript(#"mv -- "$1" "$2""#, windows: WindowsFileScripts.rename), arguments: [path, newPath], purpose: "files")
+        _ = try await executor.output(RemoteScript(Self.renameScript, windows: WindowsFileScripts.rename), arguments: [path, newPath], purpose: "files")
     }
 
     public func delete(_ path: String) async throws {
@@ -329,8 +382,10 @@ export LC_ALL=C
 file -b -- "$1" 2>/dev/null | head -n1
 if [ -d "$1" ]; then du -sk -- "$1" 2>/dev/null | cut -f1; fi
 """#
+        // Cancelled (another row selected, the view gone): `du` on a big folder stops on the
+        // server too, instead of one running per row the user moved over.
         guard let text = try? await executor.output(RemoteScript(script, windows: WindowsFileScripts.details), arguments: [file.path],
-                                                    timeout: 30, purpose: "files") else {
+                                                    timeout: 30, purpose: "files", stopOnCancel: true) else {
             return (nil, nil)
         }
         let lines = text.split(separator: "\n").map(String.init)

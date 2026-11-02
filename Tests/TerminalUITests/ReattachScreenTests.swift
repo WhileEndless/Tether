@@ -54,7 +54,7 @@ extension TerminalWindowTests {
         """.write(to: ui, atomically: true, encoding: .utf8)
 
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let window1 = openWindow(first)
         try await pump(0.3)
@@ -122,7 +122,7 @@ extension TerminalWindowTests {
         while :; do sleep 0.1; done
         """.write(to: ui, atomically: true, encoding: .utf8)
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let window1 = openWindow(first)
         try await pump(0.3)
@@ -170,7 +170,7 @@ extension TerminalWindowTests {
         while :; do sleep 0.1; done
         """.write(to: ui, atomically: true, encoding: .utf8)
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let w1 = openWindow(first)
         try await pump(0.3)
@@ -212,7 +212,7 @@ extension TerminalWindowTests {
     /// drawing its boxes for the earlier, wider terminal and they spill past the right edge.
     @Test func sizeChangedWhileReattachingReachesTheProgram() async throws {
         let cfg = config()
-        let descriptor = SessionDescriptor(target: .alias("local"), persistence: .tmux)
+        let descriptor = SessionDescriptor(target: host, persistence: .tmux)
         let first = TerminalSession(descriptor: descriptor) { cfg }
         let w1 = openWindow(first)
         try await pump(0.3)

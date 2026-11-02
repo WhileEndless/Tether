@@ -411,7 +411,7 @@ private struct TransferSettings: View {
             } header: {
                 Text("Uploading from a Terminal")
             } footer: {
-                Text("Paste (⌘V) or drop files or folders on a terminal of a server to upload them. The current folder is asked from tmux or the shell at that moment; when it cannot be told (screen, Windows, a shell that does not report it), or a program in front connects elsewhere (ssh, docker exec), Tether asks. To choose the folder anyway, use Edit ▸ Paste Files To… (⌥⌘V) or hold ⌥ while dropping. If the folder cannot take the files, Tether asks before sending anything. While a full-screen program (vim, htop) is open, the paths are copied instead of typed. Nothing is overwritten: clashing names get a number (name-1.ext). Terminals of this Mac get the files' paths, without copying.")
+                Text("Paste (⌘V) or drop files or folders on a terminal of a server to upload them. The current folder is asked from tmux or the shell at that moment; when it cannot be told (screen, Windows, a shell that does not report it), or a program in front connects elsewhere (ssh, docker exec), Tether asks. To choose the folder anyway, use Edit ▸ Paste Files To… (⌥⌘V) or hold ⌥ while dropping. If the folder cannot take the files, Tether asks before sending anything. A full-screen program gets the paths too when it takes pastes as pastes (vim, an agent's prompt); otherwise they are copied, and the terminal says so. Nothing is overwritten: clashing names get a number (name-1.ext). Terminals of this Mac get the files' paths, without copying; a server's files pasted there are saved in the terminal's folder (or Downloads, or the folder chosen), as name 2.ext when the name is taken.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -505,18 +505,21 @@ private struct SessionSettings: View {
             } header: {
                 Text("Reconnecting")
             } footer: {
-                Text("A server that does not answer is tried once for all its tabs, however many there are: they wait together, twice as long after each failed try, up to the longest wait. Reconnect on a tab tries at once, and so does every waiting tab when the network comes back or another tab to that server connects.")
+                Text("A server that does not answer is tried once for all its tabs, however many there are: they wait together, twice as long after each failed try, up to the longest wait. Reconnect on a tab tries at once, and so does every waiting tab when the network comes back or another tab to that server connects. With connection sharing on, a ConnectTimeout set in your ssh_config is used instead of the wait set here.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 Toggle("Send keep-alives", isOn: Binding(
                     get: { store.settings.serverAliveInterval > 0 },
-                    set: { store.settings.serverAliveInterval = $0 ? 30 : 0 }))
+                    set: {
+                        store.settings.serverAliveInterval = $0 ? 60 : 0
+                        if $0 { store.settings.serverAliveCountMax = max(store.settings.serverAliveCountMax, 10) }
+                    }))
                 if store.settings.serverAliveInterval > 0 {
                     Stepper("Keep-alive every \(store.settings.serverAliveInterval) s",
                             value: $store.settings.serverAliveInterval, in: 5...300, step: 5)
                     Stepper("End the connection after \(store.settings.serverAliveCountMax) missed keep-alives",
-                            value: $store.settings.serverAliveCountMax, in: 1...60)
+                            value: $store.settings.serverAliveCountMax, in: 1...120)
                 }
                 Stepper("Re-attach a tmux tab after \(Int(store.settings.stallTimeout)) s without an answer",
                         value: $store.settings.stallTimeout, in: 5...120, step: 5)
@@ -529,7 +532,7 @@ private struct SessionSettings: View {
             } header: {
                 Text("Connection Health")
             } footer: {
-                Text("Like plain ssh, a connection is not given up because the network went away for a moment or the Mac slept: it usually survives, and nobody has to sign in again. Without keep-alives (the default) your ssh_config decides; when on, these values replace its ServerAliveInterval. Before the Mac sleeps, tmux and screen tabs detach from their server sessions (they keep running) so the server sends nothing; after waking, each connection is checked over its own link and closed only if it is dead. The silence and dead-connection times count only while the Mac is awake and online.")
+                Text("A connection is not given up because the network went away for a moment or the Mac slept: it usually survives, and nobody has to sign in again. Keep-alives (on by default, every 60 s) stop firewalls and routers from forgetting an idle connection; they end one only after at least 10 minutes without any answer, whatever count is set. An interval set in your ssh_config is kept, with its count raised to last as long. Before the Mac sleeps, tmux and screen tabs detach from their server sessions (they keep running) so the server sends nothing; after waking, each connection is checked over its own link and closed only if it is dead. The silence and dead-connection times count only while the Mac is awake and online.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -568,6 +571,13 @@ private struct RecordingSettings: View {
                 .help("A session's earlier output is moved aside in pieces of this size while it runs and compressed when the Mac is idle; the latest output stays as it is, so scrolling back stays fast")
                 Toggle("When space runs out, shorten the largest session first", isOn: $store.settings.recordingShortenLargestFirst)
                     .help("A session holding more than half of the storage limit loses its oldest output before any other recording is removed (sessions compressed while they run, in pieces; not with Never above)")
+                Toggle("Keep free space on the disk", isOn: $store.settings.recordingProtectFreeSpace)
+                    .help("Recordings never fill the disk: when less than this is free, they are compressed and the oldest removed — also while Tether is locked with encryption on, when they cannot be compressed (then at most twice the storage limit waits for the unlock)")
+                if store.settings.recordingProtectFreeSpace {
+                    Picker("Free space to keep", selection: $store.settings.recordingMinFreeGB) {
+                        ForEach([1, 2, 5, 10, 20, 50], id: \.self) { Text("\($0) GB").tag($0) }
+                    }
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: Double(total), total: Double(max(quota, 1)))
                         .animation(.smooth, value: total)
@@ -835,7 +845,7 @@ private struct PasswordSettings: View {
                         Text("1 hour").tag(3600)
                     }
                     HStack {
-                        Text("Locking the screen or sleeping always asks again.").font(.caption).foregroundStyle(.secondary)
+                        Text("Locking the screen or sleeping always asks again before the keychain is read. A password already remembered under Signing In Again is not asked for again.").font(.caption).foregroundStyle(.secondary)
                         Spacer()
                         Button(locked ? "Locked" : "Lock Now") { SecretGate.shared.lock(); locked = true }
                             .disabled(locked)
@@ -875,7 +885,7 @@ private struct PasswordSettings: View {
                         // A wrong or outdated password is corrected here (or when it is next rejected).
                         Button("Replace…") { replacing = a }
                         Button("Remove", role: .destructive) {
-                            PasswordVault.deletePassword(for: a)
+                            Credentials.remove(a)
                             accounts = PasswordVault.allAccounts()
                         }
                     }
@@ -918,7 +928,9 @@ private struct ReplacePasswordSheet: View {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Replace") {
-                    if PasswordVault.setPassword(password, for: account) { dismiss() } else { failed = true }
+                    if Credentials.save(password, for: account) {
+                        dismiss()
+                    } else { failed = true }
                 }
                 .keyboardShortcut(.defaultAction)
                 .prominentGlassButtonStyle()
@@ -991,13 +1003,13 @@ private struct SignInMemorySection: View {
             if items.count > 1 {
                 HStack {
                     Spacer()
-                    Button("Forget All") { cache.removeAll(); items = cache.items() }
+                    Button("Forget All") { cache.removeAll(reason: "Forget All in Settings ▸ Passwords"); items = cache.items() }
                 }
             }
         } header: {
             Text("Signing In Again")
         } footer: {
-            Text("A password the server accepted signs that connection in again while Tether runs — another connection for many tabs, a reconnect after the connection really ended — without asking. It is sealed by a Secure Enclave key that exists only while Tether runs, never written anywhere, and never used for sudo or one-time codes. It is forgotten when refused, when Tether locks, and as set above. Details in docs/connections-and-passwords.md.")
+            Text("A password the server accepted signs that connection in again while Tether runs — another connection for many tabs, a reconnect after the connection really ended — without asking. It is sealed by a Secure Enclave key that exists only while Tether runs, never written anywhere, and never used for sudo or one-time codes. It stays through sleep and a locked screen (a saved one too, once read with Touch ID), is not used while Tether is locked, and is forgotten when the server refuses it and as set above. Even with this off, a password you type answers the same server's other sign-ins for a minute, so many tabs ask once. Details in docs/connections-and-passwords.md.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onAppear { items = cache.items() }

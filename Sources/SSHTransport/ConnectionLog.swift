@@ -54,14 +54,35 @@ public final class ConnectionLog: @unchecked Sendable {
         public let level: Level
         public let category: Category
         public let host: String?
-        /// The tab it happened in (its title, and the tmux or screen session it shows).
+        /// The tab it happened in (its number, its title, and the tmux or screen session it shows).
         public let tab: String?
         public let message: String
         /// Text from ssh or the server (may name hosts and addresses: private in macOS's log).
         public let detail: String?
     }
 
+    /// A tab's title inside its log name (`TerminalSession.logTab`): kept in Tether's own list, left
+    /// out of everything copied, saved or sent to macOS's log — a title can hold a command line.
+    /// The marks are taken out of the title itself (a program names its tab): none can end it early.
+    public static func title(_ text: String) -> String {
+        "\u{2068}" + text.filter { $0 != "\u{2068}" && $0 != "\u{2069}" } + "\u{2069}"
+    }
+
+    /// `tab` without its title (see `title`).
+    public static func withoutTitles(_ tab: String) -> String {
+        var out = "", inTitle = false
+        for c in tab {
+            if c == "\u{2068}" { inTitle = true; continue }
+            if c == "\u{2069}" { inTitle = false; continue }
+            if !inTitle { out.append(c) }
+        }
+        return out.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespaces)
+    }
+
     public static let limit = 3_000
+    /// Events let go because the log was full (said in what is copied).
+    private var dropped = 0
+    public var droppedCount: Int { lock.withLock { dropped } }
     private let logger = Logger(subsystem: "io.github.whileendless.tether", category: "connections")
     private let lock = NSLock()
     private var entries: [Entry] = []
@@ -86,9 +107,12 @@ public final class ConnectionLog: @unchecked Sendable {
         let entry = Entry(date: Date(), level: level, category: category, host: host, tab: tab, message: message, detail: detail)
         lock.withLock {
             entries.append(entry)
-            if entries.count > Self.limit { entries.removeFirst(entries.count - Self.limit) }
+            if entries.count > Self.limit {
+                dropped += entries.count - Self.limit
+                entries.removeFirst(entries.count - Self.limit)
+            }
         }
-        let where_ = [host, tab].compactMap { $0 }.joined(separator: " · "), more = detail ?? ""
+        let where_ = [host, tab.map(Self.withoutTitles)].compactMap { $0 }.joined(separator: " · "), more = detail ?? ""
         switch level {
         case .info: logger.info("\(message, privacy: .public) [\(where_, privacy: .private)] \(more, privacy: .private)")
         case .notice: logger.notice("\(message, privacy: .public) [\(where_, privacy: .private)] \(more, privacy: .private)")
@@ -99,18 +123,40 @@ public final class ConnectionLog: @unchecked Sendable {
 
     public var all: [Entry] { lock.withLock { entries } }
 
-    public func clear() { lock.withLock { entries.removeAll() } }
+    public func clear() { lock.withLock { entries.removeAll(); dropped = 0 } }
 
     /// Everything as plain text, to copy into a bug report (host names included: the user decides).
     public var text: String { Self.text(all) }
 
-    /// `entries` as plain text, oldest first: one line each, ssh's and the server's words indented
-    /// below it.
-    public static func text(_ entries: [Entry]) -> String {
+    /// What a copied or saved log starts with: Tether's version, macOS's, the time zone, the span of
+    /// the events, and how many older ones the log had let go (and whether only some are shown).
+    public func header(version: String, shown: [Entry], filtered: Bool) -> String {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let f = Self.dateFormatter()
+        var lines = ["Tether \(version), macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion), times in \(TimeZone.current.identifier)"]
+        if let first = shown.first, let last = shown.last {
+            lines.append("Events from \(f.string(from: first.date)) to \(f.string(from: last.date))"
+                         + (filtered ? " (only those the filter lets through)" : ""))
+        }
+        let gone = droppedCount
+        if gone > 0 { lines.append("\(gone) older events were let go (the log keeps the last \(Self.limit))") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Local time with its offset from UTC, to the millisecond.
+    static func dateFormatter() -> ISO8601DateFormatter {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        f.timeZone = .current
+        return f
+    }
+
+    /// `entries` as plain text, oldest first: one line each, ssh's and the server's words indented
+    /// below it. Tabs by their number and session, never their titles.
+    public static func text(_ entries: [Entry]) -> String {
+        let f = dateFormatter()
         return entries.map { e in
-            let place = [e.host, e.tab].compactMap { $0 }.joined(separator: " · ")
+            let place = [e.host, e.tab.map(withoutTitles)].compactMap { $0 }.joined(separator: " · ")
             var line = "\(f.string(from: e.date)) \(e.level.rawValue.uppercased()) \(e.category.rawValue)"
                 + (place.isEmpty ? "" : " [\(place)]") + " \(e.message)"
             if let detail = e.detail {

@@ -21,7 +21,10 @@ public final class RemoteMonitor {
     }
 
     /// How this host is reached; replaced when the ssh settings change (the next probe uses it).
-    public var executor: RemoteExecutor
+    public var executor: RemoteExecutor {
+        // Settings changed (ssh program, connection sharing): its traffic view follows.
+        didSet { traffic.executor = executor }
+    }
     /// Traffic per process on this host (streamed only while someone looks).
     public let traffic: ProcessTraffic
     public private(set) var snapshot: SystemSnapshot?
@@ -64,7 +67,55 @@ public final class RemoteMonitor {
     @ObservationIgnored private var interval: TimeInterval = 3
     @ObservationIgnored private var restartTask: Task<Void, Never>?
     @ObservationIgnored private var pace = RetryPace()
+
+    /// How long a panel waits before asking the host again: `base` while it answers, longer and
+    /// longer while it does not (as the stream's own retries) — a host that went away is not asked
+    /// every few seconds for as long as its panel is open; it is at once again when it answers.
+    public func panelWait(_ base: TimeInterval) -> TimeInterval {
+        guard pace.failures > 0 else { return base }
+        return Backoff.delay(base: base, doublings: pace.failures, longest: max(RetryPace.longest, base), maxDoublings: 12)
+    }
     @ObservationIgnored private var lastFrameAt: Date?
+    /// The stream has sent nothing for a while (its connection may be gone): what is shown is from
+    /// `staleSince`'s last frame, and the stream is started again.
+    public private(set) var stale = false
+    public var lastUpdate: Date? { lastFrameAt }
+    @ObservationIgnored private var staleWatch: Task<Void, Never>?
+
+    /// Watches a running stream: no frame for three intervals (at least 15 s, awake time) — it is
+    /// marked stale and started again.
+    private func watchForStaleness(_ s: RemoteStream) {
+        staleWatch?.cancel()
+        let limit = max(3 * interval, 15)
+        staleWatch = Task { [weak self] in
+            var quietSince = ProcessInfo.processInfo.systemUptime
+            var lastSeen = self?.lastFrameAt
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(limit / 3))
+                guard let self, self.stream === s, !self.paused else { return }
+                if self.lastFrameAt != lastSeen { lastSeen = self.lastFrameAt; quietSince = ProcessInfo.processInfo.systemUptime; continue }
+                // The user is answering a question for this host (its sign-in): not stale.
+                let host = self.executor.target.key
+                if AskPassBridge.shared.waitsOnUser(where: { HostLinks.sameServer($0, host) }) {
+                    quietSince = ProcessInfo.processInfo.systemUptime
+                    continue
+                }
+                guard ProcessInfo.processInfo.systemUptime - quietSince > limit else { continue }
+                self.stale = true
+                self.stopStream()
+                // Started again like a stream that ended without data: later and later while the
+                // server keeps not answering (`serverAnswered` starts it at once).
+                guard self.interest > 0 else { return }
+                let wait = self.pace.next(first: 5)
+                self.restartTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard let self, self.interest > 0, self.stream == nil else { return }
+                    self.startStream()
+                }
+                return
+            }
+        }
+    }
     /// Demo data loaded: never contact the host.
     @ObservationIgnored private var frozen = false
     /// Whether a feature may run on this host (Settings ▸ Monitoring and the host's own choices).
@@ -182,6 +233,9 @@ public final class RemoteMonitor {
             self.platform = platform
             s.start(executor: executor, script: RemoteScript(ProbeScripts.systemStream, windows: WindowsProbeScripts.systemStream),
                     platform: platform, arguments: [String(Int(interval))], purpose: "monitor")
+            // From now on (not while it waited its turn behind a sign-in): a stream that goes quiet
+            // is started again.
+            self.watchForStaleness(s)
         }
     }
 
@@ -213,6 +267,7 @@ public final class RemoteMonitor {
                               rx: net?.rx, tx: net?.tx))
         if history.count > 200 { history.removeFirst(history.count - 200) }
         lastFrameAt = Date()
+        if stale { stale = false }
     }
 
     /// One-off refresh (e.g. the Retry button).
@@ -323,7 +378,9 @@ public final class RemoteMonitor {
 
     private func lookAtRemoteSessions() async {
         let start = Date()
-        if let text = try? await executor.output(RemoteScript(ProbeScripts.remoteSessions, windows: WindowsProbeScripts.remoteSessions), timeout: 20, purpose: "monitor") {
+        // A few MB at most: the script bounds its lines, and a server that prints more anyway is not read.
+        if let text = try? await executor.output(RemoteScript(ProbeScripts.remoteSessions, windows: WindowsProbeScripts.remoteSessions), timeout: 20, purpose: "monitor",
+                                                 maxOutput: 4 << 20) {
             noteCommandLatency(Date().timeIntervalSince(start))
             sessionsRefreshedAt = Date()
             // Unchanged lists are not assigned: observers (the sidebar) are not redrawn for nothing.
@@ -343,7 +400,7 @@ public final class RemoteMonitor {
                                                 arguments: platform.isWindows ? windowsArgs : args, timeout: 30, purpose: "logs")
             logError = nil
         } catch {
-            logText = ""
+            // What was shown stays (a follow that fails once does not wipe it); the error says why.
             logError = error.localizedDescription
             self.error = error.localizedDescription
         }
@@ -416,22 +473,53 @@ public final class RemoteMonitor {
         remoteSessions.removeAll { $0.name == name }
     }
 
-    public func killRemoteSession(_ entry: RemoteSessionEntry) async {
-        let script = entry.kind == .tmux ? "tmux kill-session -t \"=$1\"" : "screen -S \"$1\" -X quit"
-        _ = await executor.run(script: script, arguments: [entry.name], timeout: 15, purpose: "sessions")
+    /// Ends a session the user chose on the server. Whether it is gone afterwards.
+    @discardableResult
+    public func killRemoteSession(_ entry: RemoteSessionEntry) async -> Bool {
+        let ended = await end(entry, unlessAttached: false)
         await refreshRemoteSessions()
+        return ended
     }
 
-    /// Kills every Tether-created session that is not currently open in the app.
-    public func cleanUpOrphans(keeping open: Set<String>) async -> Int {
-        let orphans = remoteSessions.filter { $0.isTether && !open.contains($0.name) && !$0.attached }
-        for o in orphans {
-            let script = o.kind == .tmux ? "tmux kill-session -t \"=$1\"" : "screen -S \"$1\" -X quit"
-            _ = await executor.run(script: script, arguments: [o.name], timeout: 15, purpose: "sessions")
-        }
+    /// Ends these sessions on the server (the caller chose them: never "every Tether session",
+    /// which on a shared account would include other people's). One somebody attached to since the
+    /// list was read is left alone. Returns the names of those that are gone now.
+    @discardableResult
+    public func endSessions(_ entries: [RemoteSessionEntry]) async -> Set<String> {
+        var ended = Set<String>()
+        for e in entries where await end(e, unlessAttached: true) { ended.insert(e.name) }
         await refreshRemoteSessions()
-        return orphans.count
+        return ended
     }
+
+    private func end(_ entry: RemoteSessionEntry, unlessAttached: Bool) async -> Bool {
+        let r = await executor.run(RemoteScript(entry.kind == .tmux ? Self.endTmux : Self.endScreen),
+                                   arguments: [entry.name, unlessAttached ? "1" : "0"], timeout: 15, purpose: "sessions")
+        return r.succeeded
+    }
+
+    /// `$1` the session, `$2` 1 to leave it alone while a client is attached. Exit 0 only when it is
+    /// gone afterwards.
+    static let endTmux = #"""
+command -v tmux >/dev/null 2>&1 || exit 2
+if [ "$2" = 1 ] && [ -n "$(tmux list-clients -t "=$1" 2>/dev/null)" ]; then exit 3; fi
+tmux kill-session -t "=$1" 2>/dev/null
+tmux has-session -t "=$1" 2>/dev/null && exit 1
+exit 0
+"""#
+
+    static let endScreen = #"""
+export LC_ALL=C
+command -v screen >/dev/null 2>&1 || exit 2
+listed() { screen -ls 2>/dev/null | N="$1" A="$2" awk 'BEGIN { n = ENVIRON["N"] } { i = index($1, "."); if (i && substr($1, i + 1) == n && (ENVIRON["A"] == "" || $0 ~ /Attached/)) f = 1 } END { exit !f }'; }
+if [ "$2" = 1 ] && listed "$1" attached; then exit 3; fi
+screen -S "$1" -X quit >/dev/null 2>&1
+for i in 1 2 3; do
+  listed "$1" "" || exit 0
+  sleep 1
+done
+exit 1
+"""#
 
     #if DEBUG
     /// Debug builds only: fills the monitor with prepared probe output (in the real probe formats,

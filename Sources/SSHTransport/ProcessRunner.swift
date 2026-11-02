@@ -20,11 +20,26 @@ public enum ProcessRunner {
         var err = Data()
         var finished = false
         var timedOut = false
+        /// More output came than the caller allows: the rest is not kept, and the process is stopped.
+        var overflowed = false
+        let maxOutput: Int
         let group = DispatchGroup()
 
-        func append(_ data: Data, isError: Bool) {
+        init(maxOutput: Int) { self.maxOutput = maxOutput }
+
+        /// Keeps a chunk of output; false once the output went over the limit (the process should
+        /// stop: whatever it sends, a server cannot fill Tether's memory). Messages on stderr are
+        /// kept up to a limit of their own and never stop it.
+        func append(_ data: Data, isError: Bool) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            if isError { err.append(data) } else { out.append(data) }
+            if isError {
+                if err.count < ProcessRunner.maxErrorOutput { err.append(data.prefix(ProcessRunner.maxErrorOutput - err.count)) }
+                return true
+            }
+            guard !overflowed else { return false }
+            guard out.count + data.count <= maxOutput else { overflowed = true; return false }
+            out.append(data)
+            return true
         }
 
         /// Returns true only for the first caller.
@@ -37,23 +52,52 @@ public enum ProcessRunner {
 
         func result(status: Int32) -> ProcessResult {
             lock.lock(); defer { lock.unlock() }
-            return ProcessResult(status: status, stdout: out, stderr: err, timedOut: timedOut)
+            guard overflowed else { return ProcessResult(status: status, stdout: out, stderr: err, timedOut: timedOut) }
+            // Cut short: never taken for a complete answer.
+            return ProcessResult(status: -1, stdout: out, stderr: Data("The command printed more than Tether reads (\(maxOutput / 1024) KB); it was stopped.\n".utf8) + err,
+                                 timedOut: false)
         }
     }
 
     /// - Parameter stopOnCancel: cancelling the calling task ends the process (a search the user
     ///   stopped); otherwise it runs to its end or its timeout.
+    /// - Parameter waitWhile: the timeout does not end it while this holds (a password question of
+    ///   its own is open: the user may take minutes); checked again every second.
+    /// - Parameter maxOutput: bytes of output kept at most; a process that prints more is stopped
+    ///   and fails (status -1).
     public static func run(_ executable: String, arguments: [String], environment: [String: String]? = nil,
-                           input: Data? = nil, timeout: TimeInterval = 30, stopOnCancel: Bool = false) async -> ProcessResult {
+                           input: Data? = nil, timeout: TimeInterval = 30, stopOnCancel: Bool = false,
+                           waitWhile: (@Sendable () -> Bool)? = nil, maxOutput: Int = defaultMaxOutput) async -> ProcessResult {
         let process = Process()
         let box = ProcessBox(process)
         return await withTaskCancellationHandler {
             await run(process, executable, arguments: arguments, environment: environment, input: input, timeout: timeout,
-                      stopOnCancel: stopOnCancel)
+                      stopOnCancel: stopOnCancel, waitWhile: waitWhile, maxOutput: maxOutput)
         } onCancel: {
             if stopOnCancel { box.stop() }
         }
     }
+
+    /// Output kept from one command unless its caller says otherwise: far more than any listing or
+    /// probe prints, and a bound on what a server (or a broken script) can make Tether hold.
+    public static let defaultMaxOutput = 128 << 20
+    static let maxErrorOutput = 1 << 20
+
+    // MARK: Running now
+
+    private static let runningLock = NSLock()
+    nonisolated(unsafe) private static var running: [ObjectIdentifier: Process] = [:]
+
+    /// Ends every command started here that still runs (a listing, a check, a transfer's helper):
+    /// when Tether quits they have nobody to answer, and a hanging one would stay behind. What is
+    /// meant to outlive Tether (ending a private session on the server, closing shared connections)
+    /// is started elsewhere and not touched.
+    public static func terminateAll() {
+        let now = runningLock.withLock { quitting = true; return Array(running.values) }
+        for p in now where p.isRunning { p.terminate() }
+    }
+    /// Set by `terminateAll`: what is asked for after that is not started.
+    nonisolated(unsafe) private static var quitting = false
 
     private final class ProcessBox: @unchecked Sendable {
         let process: Process
@@ -62,7 +106,8 @@ public enum ProcessRunner {
     }
 
     private static func run(_ process: Process, _ executable: String, arguments: [String], environment: [String: String]?,
-                            input: Data?, timeout: TimeInterval, stopOnCancel: Bool) async -> ProcessResult {
+                            input: Data?, timeout: TimeInterval, stopOnCancel: Bool,
+                            waitWhile: (@Sendable () -> Bool)?, maxOutput: Int) async -> ProcessResult {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcessResult, Never>) in
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
@@ -72,7 +117,7 @@ public enum ProcessRunner {
             process.standardError = errPipe
             process.standardInput = input == nil ? FileHandle.nullDevice : inPipe
 
-            let c = Collector()
+            let c = Collector(maxOutput: max(maxOutput, 0))
             for (pipe, isErr) in [(outPipe, false), (errPipe, true)] {
                 c.group.enter()
                 pipe.fileHandleForReading.readabilityHandler = { h in
@@ -80,13 +125,15 @@ public enum ProcessRunner {
                     if chunk.isEmpty {
                         h.readabilityHandler = nil
                         c.group.leave()
-                    } else {
-                        c.append(chunk, isError: isErr)
+                    } else if !c.append(chunk, isError: isErr), process.isRunning {
+                        // Read on (and dropped) until it ends, so it is never stuck writing to a full pipe.
+                        process.terminate()
                     }
                 }
             }
 
             process.terminationHandler = { p in
+                runningLock.withLock { _ = running.removeValue(forKey: ObjectIdentifier(p)) }
                 guard c.markFinished() else { return }
                 let status = p.terminationStatus
                 // Wait briefly for pipes to drain; a backgrounded ControlMaster may hold them open.
@@ -98,11 +145,23 @@ public enum ProcessRunner {
                 }
             }
             do {
+                let refused = runningLock.withLock { () -> Bool in
+                    if quitting { return true }
+                    running[ObjectIdentifier(process)] = process
+                    return false
+                }
+                if refused {
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    cont.resume(returning: ProcessResult(status: -1, stdout: Data(), stderr: Data("Tether is quitting".utf8), timedOut: false))
+                    return
+                }
                 try process.run()
                 if let environment { AskPassBridge.shared.bindToken(environment, pid: process.processIdentifier) }
                 // Cancelled before it started: the handler found nothing running to stop.
                 if stopOnCancel, Task.isCancelled { process.terminate() }
             } catch {
+                runningLock.withLock { _ = running.removeValue(forKey: ObjectIdentifier(process)) }
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
                 cont.resume(returning: ProcessResult(status: -1, stdout: Data(),
@@ -116,8 +175,12 @@ public enum ProcessRunner {
                 }
             }
             if timeout > 0 {
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                @Sendable func expire() {
                     guard process.isRunning else { return }
+                    if let waitWhile, waitWhile() {
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { expire() }
+                        return
+                    }
                     c.lock.lock(); c.timedOut = true; c.lock.unlock()
                     process.terminate()
                     // A process that ignores SIGTERM (stopped, or trapping it) must not keep its caller
@@ -131,6 +194,7 @@ public enum ProcessRunner {
                         cont.resume(returning: c.result(status: -9))
                     }
                 }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { expire() }
             }
         }
     }

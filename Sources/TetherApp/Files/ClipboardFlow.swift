@@ -27,6 +27,18 @@ final class ClipboardCopy {
     private(set) var localCopies: [URL]?
     private(set) var fetching = false
     private var waiters: [([URL]?) -> Void] = []
+    /// Where its download goes (its own folder under the clipboard folder).
+    private var folder: URL?
+
+    /// A newer copy replaced this one on the clipboard: its download, if nothing waits for it (a
+    /// paste in progress), is stopped instead of running on in the background.
+    func cancelIfUnused(with model: AppModel) {
+        guard fetching, waiters.isEmpty, let folder else { return }
+        let base = folder.standardizedFileURL.path + "/"
+        for item in model.transfers.items where !item.isFinished && (item.localURL.standardizedFileURL.path + "/").hasPrefix(base) {
+            model.transfers.cancel(item)
+        }
+    }
 
     init(clip: RemoteClip, files: [RemoteFile], target: ConnectionTarget, changeCount: Int) {
         self.clip = clip
@@ -50,6 +62,7 @@ final class ClipboardCopy {
         fetching = true
         let folder = AppPaths.clipboardDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        self.folder = folder
         model.downloadRemoteItems(files, from: target, to: folder) { [weak self] outcome in
             guard let self else { return }
             self.fetching = false
@@ -88,6 +101,7 @@ extension AppModel {
         let clip = RemoteClip(items, from: target)
         let count = RemoteClipboard.write(clip, to: .general)
         let copy = ClipboardCopy(clip: clip, files: items, target: target, changeCount: count)
+        ClipboardCopy.current?.cancelIfUnused(with: self)
         ClipboardCopy.current = copy
         copy.fetch(with: self, then: ready)
     }
@@ -141,16 +155,22 @@ extension AppModel {
     }
 
     /// ⌘V in a terminal with remote files on the pasteboard. The same server: their paths are
-    /// typed (quoted for its shell). Another server: they come through this Mac — downloaded,
-    /// uploaded where the terminal's uploads go (Settings ▸ Transfers), the temporary copy
-    /// removed — and their new paths are typed as for any upload. Returns false when the
+    /// typed (quoted for its shell). Files of this Mac (its own file manager) going to a server are
+    /// sent as files from Finder are. Another server's going to a server come through this Mac —
+    /// downloaded, uploaded where the terminal's uploads go (Settings ▸ Transfers), the temporary
+    /// copy removed — and their new paths are typed as for any upload; going to a terminal on this
+    /// Mac they are saved here (`saveForLocalTerminal`) and their paths typed. Returns false when the
     /// pasteboard holds no remote files (the paste goes on as usual).
     /// `dropped`: remote files dragged onto the terminal (handled the same way) instead of the pasteboard's.
     @discardableResult
     func pasteRemoteClip(into session: TerminalSession, in state: WindowState, dropped: RemoteClip? = nil) -> Bool {
         guard let clip = dropped ?? pastedRemoteClip else { return false }
         if clip.targetKey == session.descriptor.target.key {
-            typePaths(clip.paths, into: session)
+            typeDroppedPaths(clip.paths, into: session)
+            return true
+        }
+        if clip.target.isLocal {
+            handleFiles(clip.items.map { URL(fileURLWithPath: $0.path, isDirectory: $0.isDirectory) }, for: session, in: state)
             return true
         }
         // Shown over the terminal while the files come to this Mac (a large folder takes a while).
@@ -171,10 +191,7 @@ extension AppModel {
             return false
         }
         if session.descriptor.target.isLocal {
-            // A terminal on this Mac: the files are fetched here and their paths typed.
-            localCopies(of: clip) { urls, _ in
-                if fetched(urls), let urls { self.typePaths(urls.map(\.path), into: session) }
-            }
+            saveForLocalTerminal(clip, session: session, fetched: fetched)
             return true
         }
         // Then sent like files pasted from Finder: where Settings ▸ Transfers says (the
@@ -184,5 +201,77 @@ extension AppModel {
             self.handleFiles(urls, for: session, in: state, afterUpload: { Self.removeTemporaryCopy(madeHere) })
         }
         return true
+    }
+
+    /// A server's files pasted or dropped into a terminal on this Mac: they are saved where Settings
+    /// ▸ Transfers sends a terminal's files — the terminal's folder (Downloads when it cannot be
+    /// told), the Mac's temporary folder (removed after a day), or a folder asked for (always while
+    /// ⌥ is held) — never replacing anything there (`name 2`), and their paths typed.
+    private func saveForLocalTerminal(_ clip: RemoteClip, session: TerminalSession, fetched: @escaping ([URL]?) -> Bool) {
+        let ask = NSEvent.modifierFlags.contains(.option) || settings.uploadDestination == .ask
+        let destination = settings.uploadDestination
+        Task {
+            var folder: URL?
+            if ask {
+                guard let chosen = downloadFolder(ask: true) else {
+                    if let batch = uploadBatches[session.id], batch.fetching != nil { uploadBatches[session.id] = nil }
+                    return
+                }
+                folder = chosen
+            } else if destination == .currentFolder {
+                if case .folder(let dir) = await uploadDirectory(for: session) {
+                    folder = URL(fileURLWithPath: dir, isDirectory: true)
+                } else {
+                    folder = defaultDownloadFolder
+                }
+            }
+            localCopies(of: clip) { urls, madeHere in
+                guard fetched(urls), let urls else { return }
+                guard let folder else {
+                    // The temporary copy is where they stay (the clipboard folder, cleared after a day).
+                    self.showSaved(urls, in: urls.first.map { $0.deletingLastPathComponent().path } ?? "", for: session)
+                    return
+                }
+                Task {
+                    let placed = await Self.place(urls, in: folder, moving: madeHere != nil)
+                    Self.removeTemporaryCopy(madeHere)
+                    self.showSaved(placed, in: folder.path, for: session)
+                }
+            }
+        }
+    }
+
+    /// Copies (or moves: a copy made for this paste only) items into a folder under free names.
+    nonisolated static func place(_ urls: [URL], in folder: URL, moving: Bool) async -> [URL] {
+        await Task.detached {
+            let names = LocalFiles.uniqueNames(in: folder, for: urls.map(\.lastPathComponent))
+            var placed: [URL] = []
+            for (url, name) in zip(urls, names) {
+                let to = folder.appendingPathComponent(name)
+                do {
+                    if moving { try FileManager.default.moveItem(at: url, to: to) } else { try FileManager.default.copyItem(at: url, to: to) }
+                    placed.append(to)
+                } catch {}
+            }
+            return placed
+        }.value
+    }
+
+    /// Says over a terminal on this Mac where the files it was given were saved, and types their paths.
+    private func showSaved(_ urls: [URL], in folder: String, for session: TerminalSession) {
+        let batch = UploadBatch(sessionID: session.id, directory: (folder as NSString).abbreviatingWithTildeInPath)
+        batch.toThisMac = true
+        batch.paths = urls.map(\.path)
+        batch.finished = true
+        if urls.isEmpty {
+            batch.error = "the files could not be saved in \(batch.directory)"
+        } else {
+            batch.copiedInstead = !typePaths(batch.paths, into: session)
+        }
+        uploadBatches[session.id] = batch
+        let bars = settings.floatingBars
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(urls.isEmpty ? bars.uploadFailedHideAfter : bars.uploadDoneHideAfter)) {
+            if self.uploadBatches[session.id] === batch { self.uploadBatches[session.id] = nil }
+        }
     }
 }

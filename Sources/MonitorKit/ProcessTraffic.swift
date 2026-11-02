@@ -66,7 +66,8 @@ public final class ProcessTraffic {
 
     public func clearDiagnostics() { diagnostics.clear() }
 
-    @ObservationIgnored private let executor: RemoteExecutor
+    /// Replaced when the ssh settings change (the next stream uses it).
+    @ObservationIgnored public var executor: RemoteExecutor
     @ObservationIgnored private var stream: RemoteStream?
     @ObservationIgnored private var pace = RetryPace()
     @ObservationIgnored private var restartTask: Task<Void, Never>?

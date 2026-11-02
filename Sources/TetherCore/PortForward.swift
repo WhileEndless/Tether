@@ -38,6 +38,14 @@ public struct PortForward: Codable, Identifiable, Hashable, Sendable {
     /// Start automatically whenever a session to the host connects.
     public var autoStart: Bool
 
+    /// It listens only on this Mac's own loopback (a local or SOCKS forward not opened to the
+    /// network): reopened by itself after a relaunch. Others are asked about first.
+    public var listensOnlyOnThisMac: Bool {
+        guard kind != .remote else { return false }
+        let a = bindAddress.lowercased()
+        return a.isEmpty || a == "localhost" || a.hasPrefix("127.") || a == "::1" || a == "[::1]"
+    }
+
     public init(id: UUID = UUID(), kind: Kind = .local, label: String = "", bindAddress: String = "",
                 listenPort: Int, destinationHost: String = "localhost", destinationPort: Int, autoStart: Bool = false) {
         self.id = id

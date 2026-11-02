@@ -13,6 +13,10 @@ import TetherCore
 /// font does in SwiftTerm).
 @MainActor
 @Suite(.serialized) struct DisplayScaleTests {
+    /// A host name of this suite's own: per-host state (the sign-in queue, retry rounds, platform
+    /// cache) is shared by every test running at the same time, and the fake ssh ignores the name.
+    let host = ConnectionTarget.alias("local-" + String(UUID().uuidString.prefix(6)))
+
     /// The cell width SwiftTerm uses, from the frame it asks for (cells plus the legacy scroller).
     func cellWidth(_ view: TetherTerminalView) -> CGFloat {
         let scroller = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
@@ -21,7 +25,7 @@ import TetherCore
 
     func check(on screen: NSScreen) {
         _ = NSApplication.shared
-        let session = TerminalSession(descriptor: SessionDescriptor(target: .alias("local"), persistence: .off)) {
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) {
             SessionConfiguration(settings: AppSettings())
         }
         let rect = NSRect(x: screen.frame.minX + 10, y: screen.frame.minY + 10, width: 900, height: 500)

@@ -34,6 +34,10 @@ final class UploadBatch: Identifiable {
     var pastePaths = true
     /// The paths could not be typed (a full-screen program was in front): they were copied instead.
     var copiedInstead = false
+    /// The items came to this Mac (files from a server for a terminal here), not to a server.
+    var toThisMac = false
+    /// Said instead of any progress (the paths of a drop were copied instead of typed).
+    var note: String?
     /// Still asking the terminal where it is (the files have not been sent yet).
     var findingFolder = false
     /// Files copied on another server, still being fetched to this Mac before they are sent:
@@ -160,15 +164,18 @@ extension AppModel {
 
     /// Types paths into a terminal as one paste: quoted for its shell (PowerShell on Windows), and
     /// bracketed when the shell asked for it, so nothing runs before the user presses Return.
-    /// Not into a full-screen program (an upload can finish minutes later, with vim or htop in
-    /// front, which would take the letters as commands), and not names with control characters:
-    /// then the paths go to the clipboard instead. Returns whether they were typed.
+    /// Not names with control characters, and not into a full-screen program that might take the
+    /// letters as commands: an upload can finish minutes later with vim or htop in front. Paths
+    /// dropped or pasted right now (`now`) do go to one that takes pastes as pastes (bracketed:
+    /// vim, an agent's prompt), as in Terminal. Otherwise the paths go to the clipboard instead.
+    /// Returns whether they were typed.
     @discardableResult
-    func typePaths(_ paths: [String], into session: TerminalSession) -> Bool {
+    func typePaths(_ paths: [String], into session: TerminalSession, now: Bool = false) -> Bool {
         let quoted = paths.map { session.platform.isWindows ? $0.powerShellQuoted : $0.shellQuoted }
         let view = TerminalRegistry.shared.existingView(for: session.id)
         let unsafe = paths.contains { $0.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f } }
-        guard !unsafe, view?.showsAlternateScreen != true else {
+        let fullScreen = view?.showsAlternateScreen == true
+        guard !unsafe, !fullScreen || (now && view?.getTerminal().bracketedPasteMode == true) else {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(quoted.joined(separator: " "), forType: .string)
             return false
@@ -182,6 +189,22 @@ extension AppModel {
         return true
     }
 
+    /// Paths dropped or pasted into a terminal right now: typed, or — when they cannot be — copied,
+    /// and the terminal says so (otherwise the drop would seem to do nothing).
+    func typeDroppedPaths(_ paths: [String], into session: TerminalSession) {
+        guard !paths.isEmpty, !typePaths(paths, into: session, now: true) else { return }
+        let unsafe = paths.contains { $0.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f } }
+        let them = paths.count == 1 ? "path was" : "paths were"
+        let batch = UploadBatch(sessionID: session.id, directory: "")
+        batch.note = unsafe ? "A name holds control characters, so the \(them) copied instead of typed: paste with ⌘V"
+            : "A full-screen program is open, so the \(them) copied instead of typed: paste with ⌘V"
+        batch.finished = true
+        uploadBatches[session.id] = batch
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(settings.floatingBars.uploadFailedHideAfter + 2)) {
+            if self.uploadBatches[session.id] === batch { self.uploadBatches[session.id] = nil }
+        }
+    }
+
     /// What a drop/paste of files does for a session: local terminals get the paths directly;
     /// remote ones upload to the folder chosen in Settings ▸ Transfers (the terminal's current folder
     /// by default), or ask — always while ⌥ is held, and when the current folder cannot be told.
@@ -190,7 +213,7 @@ extension AppModel {
     func handleFiles(_ files: [URL], for session: TerminalSession, in state: WindowState, askAnyway: Bool? = nil,
                      afterUpload: (() -> Void)? = nil) {
         if session.descriptor.target.isLocal {
-            typePaths(files.map(\.path), into: session)
+            typeDroppedPaths(files.map(\.path), into: session)
             afterUpload?()
             return
         }
@@ -418,7 +441,10 @@ struct UploadBatchPill: View {
     var body: some View {
         GlassPill {
             HStack(spacing: 10) {
-                if let fetching = batch.fetching {
+                if let note = batch.note {
+                    Image(systemName: "doc.on.clipboard").foregroundStyle(.secondary)
+                    Text(note).lineLimit(2)
+                } else if let fetching = batch.fetching {
                     ProgressView().controlSize(.small)
                     Text("Getting \(fetching.count) item\(fetching.count == 1 ? "" : "s") from \(fetching.from) through this Mac…")
                 } else if batch.findingFolder {
@@ -434,7 +460,7 @@ struct UploadBatchPill: View {
                     Text("Upload failed: \(error)").lineLimit(2)
                 } else if batch.finished {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Uploaded to \(batch.directory)" + (!batch.pastePaths ? ""
+                    Text("\(batch.toThisMac ? "Saved" : "Uploaded") to \(batch.directory)" + (!batch.pastePaths ? ""
                         : batch.copiedInstead ? " — a full-screen program is open, so the path\(batch.paths.count == 1 ? " was" : "s were") copied: paste with ⌘V"
                         : " — path\(batch.paths.count == 1 ? "" : "s") typed into the terminal"))
                 } else if let item = batch.items.first(where: { $0.question != nil }), let question = item.question {

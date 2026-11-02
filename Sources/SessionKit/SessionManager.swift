@@ -29,21 +29,56 @@ public final class SessionManager {
     @ObservationIgnored private let archiveStore = JSONStore<[ArchivedSession]>(filename: "archive.json")
     @ObservationIgnored private let openStore = JSONStore<[SavedSession]>(filename: "open-sessions.json")
     @ObservationIgnored private let connectivity = ConnectivityMonitor()
+    /// Tabs closed here whose sessions went on running on their servers (see `LeftSession`).
+    @ObservationIgnored let leftOnServer = LeftOnServer()
     private struct SavedSession: Codable {
         var descriptor: SessionDescriptor
         var persistence: ActivePersistence
         var background: Bool?
         var suspended: Bool?
-        /// The user asked to end it on the server, which could not be reached then: done once it is.
+        /// Earlier versions: "end it on the server once it can be reached". Read only, and taken as
+        /// `closedWhileOffline` — nothing is ended without the user any more.
         var endWhenConnected: Bool?
+        /// Closed by the user while its server could not be reached (see `closeWhileOffline`).
+        var closedWhileOffline: Bool?
         /// Its recording, relative to the recordings folder: continued after a relaunch.
         var recording: String?
     }
 
     public init(settings: SettingsStore) {
         self.settings = settings
+        // Set now, at launch (a static is set when first read: that could be hours later).
+        _ = TerminalSession.launchedAt
         archive = archiveStore.load() ?? []
         connectivity.onEvent = { [weak self] event in self?.connectivityChanged(event) }
+        // Network events are not guaranteed (one can be missed after a sleep or a quick change):
+        // the network is looked at now and then too, so no tab waits for an event that never comes.
+        networkLook = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.lookAtTheNetwork() }
+        }
+    }
+
+    @ObservationIgnored nonisolated(unsafe) private var networkLook: Timer?
+    deinit { networkLook?.invalidate() }
+
+    /// Reports what a missed network event would have, and lets go of tabs still held for a network
+    /// that is there.
+    private func lookAtTheNetwork() {
+        // Tabs closed while offline whose server came back without any event here (another tab's
+        // sign-in, the network) are looked for now and then too.
+        if connectivity.isOnline, !connectivity.isAsleep { lookForEndedSessions(host: nil, atMostEvery: 300) }
+        guard sessions.contains(where: { !$0.phase.isOnline && !$0.phase.isDead && !$0.descriptor.target.isLocal }) else { return }
+        connectivity.recheck()
+        guard connectivity.isOnline, !connectivity.isAsleep, returnTask == nil,
+              sessions.contains(where: \.connectivityHeld) else { return }
+        ConnectionLog.shared.notice("The network is there but tabs still waited for it; they go on now", .network)
+        lossGrace?.cancel()
+        lossGrace = nil
+        HostLinks.shared.networkUp = true
+        hold(false)
+        HostRetryClock.shared.reset()
+        retryWaiting()
+        HostLinks.shared.post(.networkBack)
     }
 
     // MARK: Network and sleep
@@ -64,8 +99,16 @@ public final class SessionManager {
                                                          .lost: "The network went away", .restored: "The network is back",
                                                          .changed: "The way out to the network changed"]
         let ways = connectivity.interfaces.isEmpty ? "none" : connectivity.interfaces.joined(separator: ", ")
-        ConnectionLog.shared.info(names[event] ?? "Network event", .network,
-                                  detail: event == .willSleep ? nil : "Network interfaces: \(ways)")
+        var title = names[event] ?? "Network event"
+        if event == .didWake, let sleep = connectivity.lastSleep {
+            title += " after " + SharedConnections.seconds(sleep.duration) + " asleep" + (sleep.otherNetwork ? ", on another network" : "")
+        }
+        ConnectionLog.shared.info(title, .network,
+                                  detail: event == .willSleep ? nil : "Network interfaces: \(ways)" + (connectivity.isOnline ? "" : " (not online yet: waiting for it)"))
+        // What ssh_config says can depend on the network (`Match exec`, `Match localnetwork`): worked
+        // out afresh from now on.
+        if event != .willSleep && event != .lost { Task { await SharedConnections.shared.forgetResolutions() } }
+        HostLinks.shared.networkUp = connectivity.isOnline && !connectivity.isAsleep
         switch event {
         case .willSleep:
             hold(true)
@@ -92,18 +135,22 @@ public final class SessionManager {
             // still runs: that lasts as long as its slowest host, and a connection it found alive
             // before this change is asked again (one still being checked is not asked twice).
             guard connectivity.isOnline, !connectivity.isAsleep else { return }
+            // Connections made before now are checked before they are used again (at once: a tab
+            // reconnecting in the next two seconds must not trust one over the old way out).
+            Task { await SharedConnections.shared.noteNetworkChanged() }
             changeCheck?.cancel()
             changeCheck = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self, self.connectivity.isOnline else { return }
                 await SharedConnections.shared.restartStalledSignIns(startedBefore: SharedConnections.uptime - 2)
                 // The old way out is most likely gone, and every connection over it: decided quickly.
-                await self.closeDeadMasters(deadAfter: min(self.settings.settings.deadAfterSeconds, 10))
+                await self.closeDeadMasters(deadAfter: min(self.settings.settings.deadAfterSeconds, 10), why: "the way out to the network changed")
                 // A new way out (a VPN up, another network) may reach servers that did not answer:
                 // their waiting tabs try now instead of at their next round.
                 guard !Task.isCancelled, self.connectivity.isOnline else { return }
                 HostRetryClock.shared.reset()
                 self.retryWaiting()
+                HostLinks.shared.post(.networkBack)
             }
         case .didWake, .restored:
             // Waking is reported before Wi-Fi is back: connections judged then would all look dead.
@@ -118,14 +165,28 @@ public final class SessionManager {
             // delays only its own tabs — its connection is closed when found dead, and they sign in
             // again then.
             let moment = SharedConnections.uptime
-            Task { await SharedConnections.shared.restartStalledSignIns(startedBefore: moment) }
+            Task {
+                // After a sleep or a time offline, connections are checked before they are used again.
+                await SharedConnections.shared.noteNetworkChanged()
+                await SharedConnections.shared.restartStalledSignIns(startedBefore: moment)
+            }
             hold(false)
             HostRetryClock.shared.reset()
             retryWaiting()
+            // After a long sleep, or on another network, connections over the old way are most likely
+            // gone: decided quickly (a live one answers the check at once).
+            let sleep = event == .didWake ? connectivity.lastSleep : nil
+            let quick = sleep.map { $0.otherNetwork || $0.duration > 300 } ?? false
             returnTask = Task { [weak self] in
                 guard let self else { return }
                 defer { if self.returnAttempt == attempt { self.returnTask = nil } }
-                await self.closeDeadMasters()
+                await self.closeDeadMasters(deadAfter: quick ? min(self.settings.settings.deadAfterSeconds, 10) : nil,
+                                            why: event == .didWake ? "the Mac woke up" : "the network came back")
+                // Tabs that tried a connection found dead meanwhile go again at once, not after a
+                // back-off.
+                guard !Task.isCancelled, self.connectivity.isOnline else { return }
+                self.retryWaiting()
+                HostLinks.shared.post(.networkBack)
             }
         }
     }
@@ -151,21 +212,57 @@ public final class SessionManager {
         sessions.filter { $0.descriptor.target.key == targetKey }
     }
 
+    // MARK: Sessions left on servers
+
+    /// The note on a server session that a tab closed here left running, if it is one.
+    public func leftSession(on targetKey: String, named name: String) -> LeftSession? {
+        leftOnServer.find(targetKey, name)
+    }
+
+    /// The session was ended on the server (or found gone).
+    public func forgetLeftSession(on targetKey: String, named name: String) {
+        leftOnServer.forget(targetKey, name)
+    }
+
+    public func forgetLeftSessions(on targetKey: String) {
+        leftOnServer.forgetAll(on: targetKey)
+    }
+
+    /// A tab closing without ending its server session: noted when that session may go on there.
+    private func noteLeftOnServer(_ s: TerminalSession, killRemote: Bool) {
+        let d = s.descriptor
+        guard !d.target.isLocal, !d.remoteSessionName.isEmpty else { return }
+        // Ended with the tab, or known to be gone: no note. (Only then: closing a background tab
+        // archives it, which closes it again from inside — the note just made must survive that.)
+        if killRemote || d.isPrivate || s.remoteSessionGone {
+            leftOnServer.forget(d.target.key, d.remoteSessionName)
+            return
+        }
+        guard !s.phase.isDead, s.mayHoldServerWork, s.persistence == .tmux || s.persistence == .screen else { return }
+        leftOnServer.remember(LeftSession(targetKey: d.target.key, name: d.remoteSessionName,
+                                          persistence: s.persistence == .screen ? .screen : .tmux,
+                                          title: d.customTitle ? d.title : nil, color: d.color, closedAt: Date()))
+    }
+
     // MARK: Opening
 
     @discardableResult
     public func open(_ target: ConnectionTarget, title: String? = nil, color: TagColor = .none,
                      persistence: PersistenceMode? = nil, remoteSessionName: String? = nil,
                      directory: String? = nil, isPrivate: Bool = false) -> TerminalSession {
-        var descriptor = SessionDescriptor(target: target, title: title, color: color,
-                                           persistence: persistence ?? settings.settings.defaultPersistence)
+        // Opening again a session a tab closed here left running: under that tab's name and color.
+        let left = remoteSessionName.flatMap { leftOnServer.find(target.key, $0) }
+        var descriptor = SessionDescriptor(target: target, title: title ?? left?.title,
+                                           color: color == .none ? left?.color ?? .none : color,
+                                           persistence: persistence ?? left?.persistence ?? settings.settings.defaultPersistence)
         descriptor.initialDirectory = directory
         descriptor.isPrivate = isPrivate
         if let remoteSessionName { descriptor.remoteSessionName = remoteSessionName }
         let session = makeSession(descriptor)
-        session.controlSlot = nextControlSlot(for: target)
+        session.controlSlot = nextControlSlot(for: target, plain: descriptor.persistence == .off)
         sessions.append(session)
-        if remoteSessionName != nil {
+        if let remoteSessionName {
+            leftOnServer.forget(target.key, remoteSessionName)
             session.openedForAttach = true
             // Attaching to an existing remote session: never create a new one.
             session.restore(previous: descriptor.persistence == .screen ? .screen : .tmux)
@@ -183,16 +280,36 @@ public final class SessionManager {
     public static func terminalsPerConnection(slot: Int) -> Int { slot == 0 ? 5 : 8 }
 
     /// The shared connection a new session to `target` should use: the first slot with room.
-    /// Suspended tabs hold no channel and are not counted.
-    private func nextControlSlot(for target: ConnectionTarget) -> Int {
+    /// Suspended tabs hold no channel and are not counted (nor those coming back paused).
+    ///
+    /// `plain`: a tab set to a plain shell on a host whose other tabs use tmux or screen. It gets a
+    /// connection of its own (`plainSlots`): a plain shell printing while the Mac sleeps keeps the
+    /// server sending, which can end the connection it is on — not the one the re-attaching tabs use.
+    private func nextControlSlot(for target: ConnectionTarget, plain: Bool = false) -> Int {
         var load: [Int: Int] = [:]
-        for s in sessions where s.descriptor.target.key == target.key && !s.phase.isDead && !s.phase.isSuspended {
+        // Per server, not per name: two aliases of one server (or an alias and Quick Connect) share
+        // its connections (they are named after the server), so their tabs count together.
+        func server(_ t: ConnectionTarget) -> String { ResolvedNames.serverID(for: t.key) ?? t.key }
+        let wanted = server(target)
+        for s in sessions where server(s.descriptor.target) == wanted && !s.phase.isDead && !s.phase.isSuspended
+            && !restoringPaused.contains(s.id) {
             load[s.controlSlot, default: 0] += 1
         }
-        var slot = 0
+        // Only beside tabs on the usual connections: alone, a plain tab takes the first one (with
+        // the forwards ssh_config asks for, which further connections leave out).
+        let beside = load.keys.contains { $0 < Self.plainSlots }
+        // A server that asks a second step (a code) at sign-in: one connection for all its tabs, as
+        // long as it allows (a session it refuses moves that tab on by itself) — never another code.
+        if HostLinks.shared.asksSecondStep(target.key) { return 0 }
+        var slot = plain && beside ? Self.plainSlots : 0
         while load[slot, default: 0] >= Self.terminalsPerConnection(slot: slot) { slot += 1 }
         return slot
     }
+
+    /// Where the connections for plain-shell tabs start (see `nextControlSlot`).
+    public static let plainSlots = 100
+    /// Tabs coming back paused from the last run, until they are (they hold no channel).
+    @ObservationIgnored private var restoringPaused: Set<UUID> = []
 
     /// Opens a fresh session to the same destination (used for dead tabs and "Duplicate").
     @discardableResult
@@ -228,9 +345,12 @@ public final class SessionManager {
         guard let session = session(id) else { return }
         // Ending it archives it, and archiving a background session closes it again (from inside
         // this call): look the session up afresh afterwards instead of trusting an old index.
-        if !session.phase.isDead { session.close(killRemote: killRemote) }
+        // A private tab keeps nothing on the server either: its own session ends with it.
+        noteLeftOnServer(session, killRemote: killRemote)
+        if !session.phase.isDead { session.close(killRemote: killRemote || session.descriptor.isPrivate) }
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         onSessionClosed?(session, killRemote)
+        offlineChecks[id] = nil
         sessions.remove(at: index)
         background.remove(id)
         if selectedID == id { selectedID = nil }
@@ -240,7 +360,7 @@ public final class SessionManager {
 
     /// Ends a session and its tmux/screen session on the server. Not connected: the server is reached
     /// first (signing in once for it if needed) and the session is ended there before the tab goes;
-    /// returns false when the server cannot be reached, and the tab stays (see `endWhenConnected`).
+    /// returns false when the server cannot be reached, and the tab stays (see `closeWhileOffline`).
     public func endOnServer(_ id: UUID) async -> Bool {
         guard let s = session(id) else { return true }
         guard !s.phase.isOnline, !s.descriptor.target.isLocal, s.persistence == .tmux || s.persistence == .screen else {
@@ -249,25 +369,85 @@ public final class SessionManager {
         }
         guard await s.endRemoteSession() else { return false }
         close(id, killRemote: false)
+        leftOnServer.forget(s.descriptor.target.key, s.descriptor.remoteSessionName)
         return true
     }
 
-    /// The server could not be reached: the tab moves to the background and keeps trying; once it
-    /// is connected again, its session is ended there and it goes.
-    public func endWhenConnected(_ id: UUID) {
+    /// The user closed a tab whose server cannot be reached. Its tmux/screen session may still run
+    /// there, and is never ended by itself: the tab waits in the background, paused (not attached),
+    /// and once the server can be reached its session is looked for quietly — still there, the user
+    /// is told and decides; gone, the tab goes (see `lookForEndedSessions`).
+    public func closeWhileOffline(_ id: UUID) {
         guard let s = session(id) else { return }
-        s.endWhenConnected = true
+        s.closedWhileOffline = true
         background.insert(id)
-        if s.phase.isSuspended { s.resume() } else { s.reconnectNow() }
+        s.pauseClosedWhileOffline()
         saveOpenSessions()
     }
 
-    /// Takes back "End When Connected": the session stays (in the background) and is not ended.
+    /// Keeps such a tab's session (in the background, paused): no more reminders about it.
     public func keepRunning(_ id: UUID) {
-        guard let s = session(id), s.endWhenConnected else { return }
-        s.endWhenConnected = false
+        guard let s = session(id), s.closedWhileOffline else { return }
+        s.closedWhileOffline = false
         saveOpenSessions()
     }
+
+    /// The tab's server just answered (a sign-in, a connection checked, the network back): its paused
+    /// tabs — suspended, waiting for the user, or closed while offline (`awaitsServerSession`) —
+    /// have their sessions looked for, quietly (no sign-in that asks, no attaching).
+    /// - Gone (found so twice, a few seconds apart): the tab ends and closes; the archive keeps it.
+    /// - Still there: a tab closed while offline is told about (`onStillRunning`, once); the others
+    ///   stay as they are, and attach as they would have.
+    /// - Not known (no answer, a password needed): nothing changes, and it is asked again next time.
+    /// `atMostEvery`: seconds between two looks for the same tab (events come in bursts).
+    public func lookForEndedSessions(host: String?, atMostEvery gap: TimeInterval = 20) {
+        let now = Date()
+        for s in sessions where (s.closedWhileOffline ? s.offlineCheck != .stillRunning : s.awaitsServerSession)
+            && (host.map { HostLinks.sameServer(s.descriptor.target.key, $0) } ?? true) {
+            if let last = offlineChecks[s.id], now.timeIntervalSince(last) < gap { continue }
+            offlineChecks[s.id] = now
+            Task { [weak self, weak s] in
+                guard let s else { return }
+                var there = await s.remoteSessionStillThere()
+                if there == false {
+                    // Once more before anything is closed: a server busy restarting tmux, a moment
+                    // between two sessions of the same server.
+                    try? await Task.sleep(for: .seconds(Self.goneConfirmDelay))
+                    guard s.closedWhileOffline || s.awaitsServerSession else { return }
+                    there = await s.remoteSessionStillThere()
+                }
+                guard let self, self.session(s.id) != nil else { return }
+                // Attached (or on its way) meanwhile: what it found there counts, not this look.
+                guard s.closedWhileOffline || s.awaitsServerSession else { self.offlineChecks[s.id] = nil; return }
+                switch there {
+                case true?:
+                    guard s.closedWhileOffline else { return }
+                    ConnectionLog.shared.notice("A tab closed while its server was unreachable still runs there; asking you", .tab,
+                                                host: s.descriptor.target.key)
+                    s.offlineCheck = .stillRunning
+                    self.onStillRunning?(s)
+                case false?:
+                    ConnectionLog.shared.info(s.closedWhileOffline ? "A tab closed while its server was unreachable has ended there; removed"
+                                                                   : "A tab not attached has ended on the server; closed", .tab,
+                                              host: s.descriptor.target.key)
+                    self.offlineChecks[s.id] = nil
+                    s.remoteSessionEndedWhileAway()
+                    self.leftOnServer.forget(s.descriptor.target.key, s.descriptor.remoteSessionName)
+                    self.close(s.id, killRemote: false)
+                case nil:
+                    // Asking needs a sign-in Tether cannot do by itself (a password): said so. No
+                    // answer at all: it still waits for the server, and is asked again next time.
+                    if s.closedWhileOffline, BackgroundSignIn.shared.reason(s.descriptor.target.key) != nil { s.offlineCheck = .needsSignIn }
+                    self.offlineChecks[s.id] = nil
+                }
+            }
+        }
+    }
+    /// Seconds between the two looks that find a session gone (tests use less).
+    nonisolated(unsafe) static var goneConfirmDelay: Double = 3
+    @ObservationIgnored private var offlineChecks: [UUID: Date] = [:]
+    /// A tab closed while offline turned out to still run on its server (tell the user).
+    @ObservationIgnored public var onStillRunning: ((TerminalSession) -> Void)?
 
     /// Disconnects a persistent session and keeps it (suspended) in the background.
     public func suspend(_ id: UUID) {
@@ -315,19 +495,21 @@ public final class SessionManager {
         let sockets = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
         for name in sockets where name != AppPaths.askPassSocket.lastPathComponent {
             let path = dir.appendingPathComponent(name).path
-            _ = await ProcessRunner.run(options.sshBinary, arguments: ["-F", "/dev/null", "-o", "ControlPath=\(path)", "-O", "exit", "tether-master"],
-                                        timeout: 5)
+            await SharedConnections.control(.exit, socket: path, ssh: options.sshBinary)
         }
     }
 
     /// Closes the shared connections that no longer reach their server and keeps the others.
     /// One that does not answer gets until `deadAfterSeconds` (awake, with the network there) —
-    /// a VPN reconnecting, Wi-Fi joining — before it counts as dead.
+    /// a VPN reconnecting, Wi-Fi joining — before it counts as dead. The verdict itself is
+    /// `SharedConnections.verifyLink`'s (one check per connection, shared by everyone asking).
     /// `deadAfter`: seconds of silence after which a connection counts as dead (the setting by
     /// default; shorter after the way out to the network changed, when the old one is most likely dead).
-    public func closeDeadMasters(only sockets: [String]? = nil, deadAfter limit: Double? = nil) async {
+    /// `why`: what asked for the check, for the Connection Log.
+    public func closeDeadMasters(only sockets: [String]? = nil, deadAfter limit: Double? = nil, why: String? = nil) async {
         let options = SSHOptions(settings: settings.settings)
         guard options.useControlMaster else { return }
+        configureLinkHealth()
         let dir = AppPaths.controlSocketDirectory
         let all = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
             .filter { $0 != AppPaths.askPassSocket.lastPathComponent }
@@ -336,46 +518,36 @@ public final class SessionManager {
         let targets = sockets.map { wanted in all.filter { wanted.contains($0) } } ?? all
         let deadAfter = max(limit ?? settings.settings.deadAfterSeconds, 5)
         await withTaskGroup(of: Void.self) { group in
-            for path in targets where probing.insert(path).inserted {
+            for path in targets {
                 group.addTask { @MainActor [weak self] in
-                    defer { self?.probing.remove(path) }
-                    // A network device runs nothing Tether sends (a probe's `exit 0` could fail on a
-                    // live one): only whether its connection is still there is asked.
-                    if await SharedConnections.shared.isDeviceConnection(path) {
-                        if case .gone = await SharedConnections.check(path, ssh: options.sshBinary) {
-                            await SharedConnections.shared.forget(socket: path)
-                        }
-                        return
-                    }
-                    let start = ProcessInfo.processInfo.systemUptime
                     await self?.noteChecking(path, true)
-                    defer { Task { @MainActor [weak self] in await self?.noteChecking(path, false) } }
-                    var verdict = await Self.probeMaster(path, ssh: options.sshBinary, timeout: min(8, deadAfter))
-                    while verdict == nil, !Task.isCancelled {
-                        guard let self else { return }
-                        // Only time with the network counts; without it nothing is decided.
-                        if !self.connectivity.isOnline || self.connectivity.isAsleep { return }
-                        if ProcessInfo.processInfo.systemUptime - start >= deadAfter { verdict = false; break }
-                        try? await Task.sleep(for: .seconds(min(5, deadAfter / 3)))
-                        verdict = await Self.probeMaster(path, ssh: options.sshBinary, timeout: min(10, deadAfter))
-                    }
-                    let host = await SharedConnections.shared.hostKey(of: path)
-                    let took = SharedConnections.seconds(ProcessInfo.processInfo.systemUptime - start)
-                    guard verdict == false else {
-                        if verdict == true { ConnectionLog.shared.info("Checked a connection: it still reaches its server (\(took))", host: host) }
-                        return
-                    }
-                    ConnectionLog.shared.notice("Closed a connection that no longer reaches its server (no answer in \(took))", host: host)
-                    _ = await ProcessRunner.run(options.sshBinary, arguments: [
-                        "-F", "/dev/null", "-o", "ControlPath=\(path)", "-O", "exit", "tether-master",
-                    ], timeout: 5)
-                    await SharedConnections.shared.forget(socket: path)
+                    await SharedConnections.shared.verifyLink(path, ssh: options.sshBinary, deadAfter: deadAfter, why: why)
+                    await self?.noteChecking(path, false)
                 }
             }
         }
     }
 
-    @ObservationIgnored private var probing: Set<String> = []
+    /// Tells the shared connections what counts as a sign of life on one while it is checked (a tab
+    /// or a transfer received something) and when a verdict may be reached (online and awake).
+    private func configureLinkHealth() {
+        guard !linkHealthConfigured else { return }
+        linkHealthConfigured = true
+        let signsOfLife: @Sendable (String, Date) async -> Bool = { [weak self] socket, moment in
+            guard let self else { return false }
+            return await self.received(on: socket, since: moment)
+        }
+        let canJudge: @Sendable () async -> Bool = { [weak self] in
+            guard let self else { return false }
+            return await self.canJudgeLinks()
+        }
+        Task { await SharedConnections.shared.configureLinkHealth(signsOfLife: signsOfLife, canJudge: canJudge) }
+    }
+    @ObservationIgnored private var linkHealthConfigured = false
+    private func canJudgeLinks() -> Bool { connectivity.isOnline && !connectivity.isAsleep }
+
+    /// Other signs of life on a connection (a transfer that moved data), by host: told by the app.
+    @ObservationIgnored public var otherActivity: (@MainActor (_ host: String, _ since: Date) -> Bool)?
 
     /// The tabs waiting on a connection being checked say so (instead of only "connecting").
     private func noteChecking(_ socket: String, _ checking: Bool) async {
@@ -388,9 +560,9 @@ public final class SessionManager {
         }
     }
 
-    /// Retry (or Reconnect Now) while an attempt hangs: the tab's shared connection is asked for a
-    /// moment; if it does not answer it is closed (it went dead: a new network, a sleeping router),
-    /// and the tab starts again at once — signing in again with what it already knows.
+    /// Retry (or Reconnect Now) while an attempt hangs: the tab starts again at once. Its shared
+    /// connection is checked the usual way (a live one answers at once): only one found dead is
+    /// closed — never one that is merely slow, which other tabs may be using.
     public func retryNow(_ session: TerminalSession) {
         if session.phase.isDead { session.retryAfterFailure(); return }
         let options = { var o = SSHOptions(settings: settings.settings); o.controlSlot = session.controlSlot; return o }()
@@ -399,18 +571,24 @@ public final class SessionManager {
         Task { [weak self] in
             if let socket = await SharedConnections.shared.socket(for: session.descriptor.target, options: options), Self.isSocket(socket),
                await Self.probeMaster(socket, ssh: options.sshBinary, timeout: 4) != true {
-                ConnectionLog.shared.notice("Retry: closed a connection that did not answer", host: session.descriptor.target.key)
-                _ = await ProcessRunner.run(options.sshBinary, arguments: [
-                    "-F", "/dev/null", "-o", "ControlPath=\(socket)", "-O", "exit", "tether-master",
-                ], timeout: 5)
-                await SharedConnections.shared.forget(socket: socket)
-                // The host's other tabs waiting on it go again too.
-                self?.sessions.filter { $0.descriptor.target.key == session.descriptor.target.key && $0 !== session && !$0.phase.isOnline }
-                    .forEach { $0.restartAttempt() }
+                // Not answered at once: the normal check decides, while the tab already starts again.
+                Task { await self?.closeDeadMasters(only: [socket], why: "you pressed Retry") }
             }
             session.noteConnectionCheck(false)
             session.restartAttempt()
         }
+    }
+
+    /// Whether a tab on this connection received anything from its server since `moment`.
+    private func received(on socket: String, since moment: Date) async -> Bool {
+        if let otherActivity, let host = await SharedConnections.shared.hostKey(of: socket), otherActivity(host, moment) { return true }
+        let options = SSHOptions(settings: settings.settings)
+        for s in sessions where s.phase.isOnline && !s.descriptor.target.isLocal && s.lastReceivedAt > moment {
+            var o = options
+            o.controlSlot = s.controlSlot
+            if await SharedConnections.shared.socket(for: s.descriptor.target, options: o) == socket { return true }
+        }
+        return false
     }
 
     /// A tab stopped hearing from its server: its shared connection is checked (and closed if it is
@@ -420,36 +598,26 @@ public final class SessionManager {
         let target = session.descriptor.target
         Task { [weak self] in
             guard let socket = await SharedConnections.shared.socket(for: target, options: options) else { return }
+            // Not used again by a tab before it was checked (a reconnect a moment from now would
+            // otherwise ride the same silent connection).
+            await SharedConnections.shared.suspect(socket)
             await self?.closeDeadMasters(only: [socket])
         }
     }
 
     /// Whether a shared connection still reaches its server: true (alive), false (clearly dead),
-    /// nil (no answer in time). It is asked to run `exit 0` over its existing link — understood by
-    /// sh, cmd and PowerShell; any exit status but ssh's own 255 means the server answered. No new
-    /// login can happen: no config file, BatchMode, and a ProxyCommand that fails at once if the
-    /// socket does not answer (instead of connecting to a host named "tether-master").
+    /// nil (no answer in time). See `SharedConnections.probe`.
     nonisolated static func probeMaster(_ path: String, ssh: String, timeout: TimeInterval) async -> Bool? {
-        let r = await ProcessRunner.run(ssh, arguments: [
-            "-F", "/dev/null", "-o", "ControlPath=\(path)", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
-            "-o", "ProxyCommand=/usr/bin/false", "-o", "RequestTTY=no", "-T", "tether-master", "exit 0",
-        ], timeout: timeout)
-        if r.timedOut { return nil }
-        if r.status != 255 { return true }
-        // A full connection (sshd MaxSessions) refuses one more session but is alive.
-        return TerminalSession.isSessionRefused(r.errorOutput) ? true : false
+        await SharedConnections.probe(path, ssh: ssh, timeout: timeout)
     }
 
-    nonisolated static func isSocket(_ path: String) -> Bool {
-        var st = stat()
-        return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK
-    }
+    nonisolated static func isSocket(_ path: String) -> Bool { SharedConnections.isSocket(path) }
 
     public func retryWaiting() {
         // Tabs waiting for the user to sign in start when they are shown (`shownToUser`).
         // A tab whose sign-in was cancelled or refused waits for Reconnect: the network coming back
         // does not change the password.
-        for s in sessions where !s.waitsForUser && s.retryPausedReason == nil { s.reconnectNow() }
+        for s in sessions where !s.waitsForUser && s.retryPausedReason == nil { s.reconnectNow("the Mac woke, or the network came back or changed") }
     }
 
     // MARK: Archive
@@ -560,7 +728,7 @@ public final class SessionManager {
             guard !s.phase.isDead, !s.descriptor.isPrivate, persistence == .tmux || persistence == .screen else { return nil }
             return SavedSession(descriptor: s.descriptor, persistence: persistence,
                                 background: background.contains(s.id), suspended: s.phase.isSuspended,
-                                endWhenConnected: s.endWhenConnected ? true : nil,
+                                endWhenConnected: nil, closedWhileOffline: s.closedWhileOffline ? true : nil,
                                 recording: s.recordingURL.flatMap(Self.recordingName))
         }
         // The sessions are on the servers (tmux, screen) and listed there too: this only brings
@@ -591,15 +759,18 @@ public final class SessionManager {
         }
         for item in saved {
             let session = makeSession(item.descriptor)
-            session.controlSlot = nextControlSlot(for: item.descriptor.target)
+            session.controlSlot = nextControlSlot(for: item.descriptor.target, plain: item.descriptor.persistence == .off)
+            if item.suspended == true { restoringPaused.insert(session.id) }
             restoringPersistence[session.id] = item.persistence
             sessions.append(session)
             if item.background == true { background.insert(session.id) }
-            session.endWhenConnected = item.endWhenConnected == true
+            session.closedWhileOffline = item.closedWhileOffline == true || item.endWhenConnected == true
             let start = { [weak session] in
                 guard let session else { return }
-                if item.suspended == true { session.restoreSuspended(previous: item.persistence) }
-                else { session.restore(previous: item.persistence) }
+                if item.suspended == true {
+                    session.restoreSuspended(previous: item.persistence)
+                    self.restoringPaused.remove(session.id)
+                } else { session.restore(previous: item.persistence) }
             }
             if let name = item.recording, let url = Self.recordingURL(name) {
                 restoredRecordings.insert(url.path)
@@ -627,12 +798,19 @@ public final class SessionManager {
     /// die with the connection, so they are archived now.
     public func prepareForTermination() {
         saveOpenSessions()
-        for s in sessions where !s.phase.isDead {
-            if s.persistence == .plain || s.persistence == .unknown, s.wasOnline {
-                archiveSession(s)
-            }
-            s.abandon()
+        // Commands still running (listings, checks) and sign-ins under way have nobody to answer
+        // any more; nothing new starts.
+        ProcessRunner.terminateAll()
+        SharedConnections.stopSigningIn()
+        let live = sessions.filter { !$0.phase.isDead }
+        for s in live where s.persistence == .plain || s.persistence == .unknown {
+            if s.wasOnline { archiveSession(s) }
         }
+        // Every private tab's "end" goes out first, then one short moment for all of them to leave
+        // this Mac — not a moment per tab while the app cannot quit.
+        let sent = live.map { $0.beginAbandon() }.contains(true)
+        if sent { usleep(250_000) }
+        live.forEach { $0.finishAbandon() }
         // Quitting ends the shared connections (the sessions on the servers keep running); the next
         // launch signs in once per server.
         // With "keep connections after quitting", they end by themselves after ControlPersist
