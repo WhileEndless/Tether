@@ -24,12 +24,36 @@ cd "$ROOT"
 # info), revealing the builder's home folder. Map them to "." and strip debug symbols.
 MAP=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=." -Xswiftc -debug-prefix-map -Xswiftc "$ROOT=."
      -Xcc "-ffile-prefix-map=$ROOT=." -Xcc "-fdebug-prefix-map=$ROOT=.")
+# SwiftPM's native build system copies SwiftTerm's Shaders.metal into its resource bundle, and
+# SwiftTerm compiles it when the app runs. The newer "swiftbuild" system compiles it while building,
+# with Apple's `metal` tool: the Command Line Tools do not have it (Xcode 26 only after downloading
+# its Metal Toolchain), and the build fails with "unable to spawn process 'metal'". Ask for the
+# native system whenever the toolchain offers it.
+SWIFTPM=(-c "$CONFIG" "${MAP[@]}")
+SWIFT_HELP="$(swift build --help 2>/dev/null || true)"
+case $SWIFT_HELP in
+    *native*) SWIFTPM+=(--build-system native) ;;
+    *)
+        # A toolchain without the native system compiles the shaders: it needs Xcode's Metal
+        # compiler. Say how to get it instead of failing deep inside the build.
+        if ! xcrun metal --version >/dev/null 2>&1; then
+            cat >&2 <<'EOF'
+error: this Swift toolchain compiles SwiftTerm's Metal shaders while building, and the Metal
+compiler is missing (it comes with Xcode, not the Command Line Tools). Run once:
+    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    xcodebuild -downloadComponent MetalToolchain
+then build again.
+EOF
+            exit 1
+        fi
+        ;;
+esac
 build() {   # build <extra swift build arguments…>; prints the folder with the products
     # Inside "$(build)" bash does not stop at a failed command by itself (set -e does not reach
     # there): a build that fails must not package the app built before.
-    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product Tether >&2 || return 1
-    swift build -c "$CONFIG" "${MAP[@]}" "$@" --product tether-askpass >&2 || return 1
-    swift build -c "$CONFIG" "${MAP[@]}" "$@" --show-bin-path
+    swift build "${SWIFTPM[@]}" "$@" --product Tether >&2 || return 1
+    swift build "${SWIFTPM[@]}" "$@" --product tether-askpass >&2 || return 1
+    swift build "${SWIFTPM[@]}" "$@" --show-bin-path
 }
 if [ "${UNIVERSAL:-}" = 1 ]; then
     # One build per architecture, joined with lipo (resource bundles are the same for both).
@@ -104,21 +128,41 @@ if [ "$CONFIG" = release ]; then
     fi
 fi
 
-# Signing identity: TETHER_SIGN_IDENTITY, else a "Tether Local Signing" certificate if one exists
-# (make signing-identity creates it), else ad-hoc. With a fixed certificate macOS recognises every
-# build as the same app, so permissions (Documents, Downloads …) and the keychain's "Always Allow"
-# stay granted across updates; an ad-hoc signature is a new app to macOS with every build.
+# Signing identity: TETHER_SIGN_IDENTITY ("-" for ad-hoc), else the "Tether Local Signing"
+# certificate — created here once when it does not exist yet (scripts/make-signing-identity.sh,
+# also `make signing-identity`), so builds made by Tether's own updates get it too. With a fixed
+# certificate macOS recognises every build as the same app, so permissions (Documents, Downloads …)
+# and the keychain's "Always Allow" stay granted across updates; an ad-hoc signature is a new app to
+# macOS with every build, and the keychain asks for the Mac's password again after each update.
 # Hardened runtime: macOS ignores DYLD_* variables for the app, so no library can be injected into
 # Tether (which holds the keychain access, the recording key and the askpass socket).
+has_local_identity() {
+    local ids
+    ids="$(security find-identity -p codesigning 2>/dev/null || true)"
+    case $ids in *'"Tether Local Signing"'*) return 0 ;; *) return 1 ;; esac
+}
 IDENTITY="${TETHER_SIGN_IDENTITY:-}"
-if [ -z "$IDENTITY" ] && security find-identity -p codesigning 2>/dev/null | grep -q '"Tether Local Signing"'; then
-    IDENTITY="Tether Local Signing"
+if [ -z "$IDENTITY" ]; then
+    if ! has_local_identity && ! "$ROOT/scripts/make-signing-identity.sh" >&2; then
+        echo "warning: the local signing certificate could not be created; signing ad-hoc" >&2
+    fi
+    if has_local_identity; then IDENTITY="Tether Local Signing"; fi
 fi
 IDENTITY="${IDENTITY:--}"
-codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/MacOS/tether-askpass"
-codesign --force --options runtime --sign "$IDENTITY" "$APP"
+sign() {   # sign <identity>
+    codesign --force --options runtime --sign "$1" "$APP/Contents/MacOS/tether-askpass" \
+        && codesign --force --options runtime --sign "$1" "$APP"
+}
+if ! sign "$IDENTITY"; then
+    # A certificate the keychain does not hand out now (locked keychain, removed key) must not stop
+    # the build: ad-hoc instead, as without a certificate.
+    [ "$IDENTITY" != "-" ] || exit 1
+    echo "warning: signing with \"$IDENTITY\" failed; signing ad-hoc" >&2
+    IDENTITY="-"
+    sign "$IDENTITY"
+fi
 if [ "$IDENTITY" = "-" ]; then
-    echo "Built $APP (ad-hoc signature; run 'make signing-identity' once to keep macOS permissions across builds)"
+    echo "Built $APP (ad-hoc signature: macOS asks for permissions again after every build)"
 else
     echo "Built $APP (signed with \"$IDENTITY\")"
 fi

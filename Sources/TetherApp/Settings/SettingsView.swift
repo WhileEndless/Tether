@@ -51,7 +51,7 @@ private struct GeneralSettings: View {
             } header: {
                 Text("Updates")
             } footer: {
-                Text("The check is one request to GitHub; nothing about you is sent. A newer release's source is downloaded into a temporary folder and built there in the background (a few minutes, at low priority; it needs Apple's command line tools — without them you get the release page), then installed with make install when Tether quits, or now with Restart to Update. Tabs in tmux or screen re-attach after the restart.")
+                Text("The check is one request to GitHub; nothing about you is sent. A newer release's source is downloaded into a temporary folder and built in the background (a few minutes the first time, much less later: only what changed is compiled again; at low priority; it needs Apple's command line tools — without them you get the release page), then installed with make install when Tether quits, or now with Restart to Update. Tabs in tmux or screen re-attach after the restart.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Tabs & Windows") {

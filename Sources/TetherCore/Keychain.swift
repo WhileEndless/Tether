@@ -62,8 +62,9 @@ public enum Keychain {
 
     /// Whether an item exists and the value kept in its "generic" attribute. Attributes are read
     /// without the access list's prompt, so this suits values that must not be changed silently but
-    /// are not secret. (Tether is ad-hoc signed: every build is a new app to the keychain, and
-    /// reading an item's data would ask the user again after each update.)
+    /// are not secret. (An ad-hoc signed build is a new app to the keychain, and reading an item's
+    /// data would ask the user again after each update — builds signed with the local certificate
+    /// are not, but one without it must still work quietly.)
     public enum Lookup: Equatable, Sendable { case missing, found(Data?) }
 
     public static func lookUpAttribute(service: String, account: String) -> Lookup {

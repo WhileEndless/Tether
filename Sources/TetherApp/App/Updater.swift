@@ -7,10 +7,10 @@ import TetherCore
 /// - At launch (and once a day while it runs) it asks GitHub whether a newer release exists; *Check
 ///   for Updates* asks now. Nothing about the user is sent; without GitHub the check is skipped.
 /// - With "Download and install updates" on (the default), a newer release's source is downloaded
-///   into a private temporary folder (with its progress) and built there in the background
+///   into a private temporary folder (with its progress) and built in the background
 ///   (`UpdateScripts.fetchAndBuild`, at background priority; the build's progress is read from its
-///   log). Building needs Apple's command line tools; without them the update stays a link to the
-///   release page.
+///   log) in a build folder kept between updates, so only what changed is compiled again. Building
+///   needs Apple's command line tools; without them the update stays a link to the release page.
 /// - Once built, it is installed with `make install` over the copy that runs — after Tether quits
 ///   (*Restart to Update*, or simply the next time you quit). Sessions in tmux or screen re-attach
 ///   after the restart as after any relaunch, and the release's notes are shown once ("What's New").
@@ -71,9 +71,18 @@ final class Updater {
     @ObservationIgnored private var download: ReleaseDownload?
     @ObservationIgnored private var daily: Task<Void, Never>?
 
-    /// Where updates are downloaded and built: a folder of Tether's own in the user's temporary folder.
+    /// Where updates are downloaded and the built app waits to be installed: a folder of Tether's own
+    /// in the user's temporary folder (compiled in `buildFolder`).
     var workFolder: URL { FileManager.default.temporaryDirectory.appendingPathComponent("tether-update-work") }
     var logFile: URL { workFolder.appendingPathComponent("update.log") }
+    /// Where updates are compiled, kept from one update to the next (in Caches: macOS may clear it,
+    /// and the next update then builds from scratch).
+    var buildFolder: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? AppPaths.appName)
+            .appendingPathComponent("tether-update-build")
+    }
 
     private var settings: AppSettings { AppModel.shared.settings }
 
@@ -191,7 +200,8 @@ final class Updater {
         // Background priority: building takes a few minutes of CPU, never ahead of what you do.
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/taskpolicy")
         p.arguments = ["-b", "/bin/sh", "-c", UpdateScripts.fetchAndBuild, "tether-update",
-                       release.tag, workFolder.path, AppInfo.repository.absoluteString, release.version, tarball.path]
+                       release.tag, workFolder.path, AppInfo.repository.absoluteString, release.version, tarball.path,
+                       buildFolder.path]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
         env["TMUX"] = nil

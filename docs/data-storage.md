@@ -48,7 +48,9 @@ Temporary files outside this folder:
 - Hang records: when Tether stops answering for a few seconds or takes long to quit, macOS's `sample`
   of the process (function names only, nothing a terminal showed) in `~/Library/Logs/Tether/`; the
   last five are kept, at most one in ten minutes.
-- An update being prepared (Settings ▸ General ▸ Updates): the release's source, its build and `update.log` in `tether-update-work` in your temporary folder (private to you), removed once the update is installed.
+- An update being prepared (Settings ▸ General ▸ Updates): the release's source, the app built from it and `update.log` in `tether-update-work` in your temporary folder (private to you), removed once the update is installed.
+- Updates' build folder: `~/Library/Caches/<Tether's bundle id>/tether-update-build` (private to you), kept between updates so the next one compiles only what changed (a few hundred MB). macOS may clear it; the next update then builds from scratch. Deleting it is safe.
+- The signing certificate "Tether Local Signing" in your login keychain, made once by the first build from source (also by an update), so macOS recognises every later build as the same app and keeps the keychain's *Always Allow* and folder permissions. It never leaves your Mac; removing it in Keychain Access makes builds ad-hoc signed again until the next build makes a new one.
 
 ## Recordings in detail
 

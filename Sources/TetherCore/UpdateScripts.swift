@@ -1,23 +1,27 @@
 import Foundation
 
 /// The shell scripts that update Tether from its source: a release's source is fetched into a
-/// private temporary folder and built there (while Tether runs), then — once Tether has quit —
-/// installed with `make install` over the copy that ran, and opened again if asked.
+/// private temporary folder and built (while Tether runs) in a build folder kept between updates,
+/// so only what changed is compiled again; then — once Tether has quit — installed with
+/// `make install` over the copy that ran, and opened again if asked.
 ///
 /// Building needs Apple's command line tools (`swift`, `make`); without them the update stays a
 /// link to the release page. Nothing is written outside the work folder until the install step.
 public enum UpdateScripts {
     /// `$1` = release tag (`v1.2.3`), `$2` = work folder, `$3` = repository URL (https://github.com/…),
     /// `$4` = the version expected in the built app, `$5` = the source already downloaded (a
-    /// `.tar.gz` GitHub made of the tag; empty: downloaded here with curl). Prints the built app's
-    /// path on success. Exit 2: refused arguments, 3: no build tools, 4: the build made no app of
-    /// that version.
+    /// `.tar.gz` GitHub made of the tag; empty: downloaded here with curl), `$6` = the build folder
+    /// kept between updates (named `tether-update-build`; empty: built in the work folder, from
+    /// scratch). Prints the built app's path on success — always `$2/src/dist/Tether.app`, next to
+    /// the release's source. Exit 2: refused arguments, 3: no build tools, 4: the build made no app
+    /// of that version.
     public static let fetchAndBuild = #"""
 set -eu
 export LC_ALL=C
-tag=$1 work=$2 repo=$3 want=$4 tarball=${5:-}
+tag=$1 work=$2 repo=$3 want=$4 tarball=${5:-} cache=${6:-}
 case $repo in https://github.com/*) ;; *) echo "Not a GitHub repository: $repo" >&2; exit 2 ;; esac
 case $tag in *[!A-Za-z0-9._-]*|'') echo "Unexpected release tag: $tag" >&2; exit 2 ;; esac
+case $cache in ''|/*/tether-update-build) ;; *) echo "Unexpected build folder: $cache" >&2; exit 2 ;; esac
 if [ -z "${TETHER_UPDATE_SKIP_TOOLS_CHECK:-}" ]; then
   xcode-select -p >/dev/null 2>&1 || { echo "Apple's command line tools are not installed (xcode-select --install)." >&2; exit 3; }
 fi
@@ -35,21 +39,49 @@ fi
 echo "Unpacking $tag"
 tar -xzf "$tarball" -C src --strip-components 1
 rm -f "$tarball"
-cd src
+if [ -n "$cache" ]; then
+  # The build folder of the update before: only files whose contents changed are replaced (the
+  # others keep their dates), so SwiftPM compiles again what changed and keeps the packages it
+  # downloaded. Its own .build and dist stay.
+  mkdir -p "$cache/src"
+  chmod 700 "$cache"
+  rsync -rlpc --delete --exclude /.build --exclude /dist "$work/src/" "$cache/src/"
+  cd "$cache/src"
+else
+  cd src
+fi
+rm -rf ./dist
+run_make() {
+  # Stopped (Cancel, Tether quitting): the whole build stops, not only this shell — it runs in a
+  # process group of its own (job control), and the group is ended.
+  set -m
+  make app &
+  build=$!
+  set +m
+  trap 'kill -TERM -- "-$build" 2>/dev/null; kill -TERM "$build" 2>/dev/null; exit 143' TERM INT HUP
+  status=0
+  wait "$build" || status=$?
+  trap - TERM INT HUP
+  return "$status"
+}
 echo "Building $tag"
-# Stopped (Cancel, Tether quitting): the whole build stops, not only this shell — it runs in a
-# process group of its own (job control), and the group is ended.
-set -m
-make app &
-build=$!
-set +m
-trap 'kill -TERM -- "-$build" 2>/dev/null; kill -TERM "$build" 2>/dev/null; exit 143' TERM INT HUP
-wait "$build"
-trap - TERM INT HUP
+if ! run_make; then
+  [ -n "$cache" ] || exit 1
+  # What the update before left may not fit any more (another Xcode, a damaged folder): once more
+  # from a clean folder.
+  echo "Building $tag again from a clean folder"
+  rm -rf ./.build ./dist
+  run_make || exit 1
+fi
 plist=dist/Tether.app/Contents/Info.plist
 [ -f "$plist" ] || { echo "The build made no app." >&2; exit 4; }
 got=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null || sed -n '/CFBundleShortVersionString/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$plist")
 [ "$got" = "$want" ] || { echo "The built app is version $got, not $want." >&2; exit 4; }
+if [ -n "$cache" ]; then
+  # Installed from next to the release's source (make install-built there), as without the cache.
+  mkdir -p "$work/src/dist"
+  mv dist/Tether.app "$work/src/dist/Tether.app"
+fi
 echo "Built $work/src/dist/Tether.app"
 """#
 

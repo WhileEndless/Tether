@@ -7,6 +7,9 @@ INSTALL_DIR  ?= /Applications
 # `make install INSTALL_DIR=~/Applications`: the shell leaves ~ alone after =, so expand it here.
 override INSTALL_DIR := $(patsubst ~%,$(HOME)%,$(INSTALL_DIR))
 NOTES        := release-notes/v$(VERSION).md
+# SwiftPM's native build system needs no Metal compiler (see scripts/build-app.sh); asked for
+# whenever the toolchain offers it. Evaluated only by the targets that build.
+SWIFTPM_FLAGS = $(if $(findstring native,$(shell swift build --help 2>/dev/null)),--build-system native)
 
 .DEFAULT_GOAL := app
 .PHONY: help build test app debug run demo install install-built uninstall zip check privacy hooks notes clean version signing-identity
@@ -22,10 +25,10 @@ version: ## Print the current version
 	@echo $(VERSION)
 
 build: ## Compile all modules (debug)
-	swift build
+	swift build $(SWIFTPM_FLAGS)
 
 test: ## Run the unit and integration tests (at a lower priority: the Mac stays usable)
-	nice -n 10 swift test
+	nice -n 10 swift test $(SWIFTPM_FLAGS)
 
 app: ## Build the release app into dist/Tether.app (default)
 	scripts/build-app.sh release
@@ -56,7 +59,7 @@ install: app install-built ## Build and copy Tether.app to /Applications (INSTAL
 # quit). The new copy is made next to the old one and swapped in: a copy that fails leaves the
 # installed Tether as it was.
 install-built:
-	@if pgrep -qf "$(INSTALL_DIR)/Tether.app/Contents/MacOS/Tether"; then echo "Quit Tether first, then run make install again."; exit 1; fi
+	@if pgrep -qf "$(INSTALL_DIR)/Tether.app/Contents/MacOS/Tether"; then echo "Quit Tether first (it may still be in the menu bar), then run make install-built."; exit 1; fi
 	@test -d $(APP) || { echo "Nothing built in $(APP): run make install."; exit 1; }
 	mkdir -p "$(INSTALL_DIR)"
 	rm -rf "$(INSTALL_DIR)/.Tether.app.new" "$(INSTALL_DIR)/.Tether.app.old"

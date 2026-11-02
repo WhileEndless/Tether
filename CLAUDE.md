@@ -49,13 +49,16 @@ This file is public: it is committed to GitHub like everything else.
 
 ```sh
 make help      # all targets
-make build     # swift build
+make build     # swift build (native build system: no Metal compiler needed)
 make test      # swift test (no server needed; ssh is faked where required)
-make app       # dist/Tether.app (release, ad-hoc signed)
+make app       # dist/Tether.app (release, signed with the local "Tether Local Signing" certificate, made once)
 make check     # privacy + release notes + tests
 ```
 
 - Build with zero warnings.
+- Call `swift build` / `swift test` directly only with `--build-system native`: SwiftPM's newer build
+  system compiles SwiftTerm's `Shaders.metal` and needs Xcode's Metal compiler ("unable to spawn
+  process 'metal'"); the Makefile and `scripts/build-app.sh` add it whenever the toolchain offers it.
 - The oldest macOS is 14.4 (`platforms` in Package.swift and `MIN_MACOS` in scripts/build-app.sh,
   kept in step). Newer APIs need `#available` with a fallback, through the helpers in
   `Sources/TetherApp/Shared/Styling.swift` (Liquid Glass buttons and backgrounds, symbol effects,

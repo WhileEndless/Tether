@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.10.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -170,7 +170,7 @@ Menu shortcuts can be changed in System Settings ▸ Keyboard ▸ Keyboard Short
 ### Requirements
 
 - macOS 14.4 (Sonoma) or later. Release downloads run on Apple silicon and Intel Macs. On macOS 26 Tether uses Liquid Glass; earlier systems get the standard look.
-- To build: Xcode 26 or its Command Line Tools (Swift 6.2), which is what Tether is built and tested with. Xcode 16 (Swift 6.0, needed on macOS 14) is meant to work too, without Liquid Glass, but is not tested. Check with `swift --version`.
+- To build: Xcode 26 or its Command Line Tools (Swift 6.2), which is what Tether is built and tested with. Xcode 16 (Swift 6.0, needed on macOS 14) is meant to work too, without Liquid Glass, but is not tested. Check with `swift --version`. No Metal compiler is needed: the build uses SwiftPM's native build system, which copies the terminal's shaders, and they are compiled when Tether runs.
 - On servers: nothing. tmux or GNU screen make sessions persistent if they are there; `tar` (present almost everywhere) speeds up transfers of many files.
 
 ### From a release
@@ -192,15 +192,17 @@ make install          # builds a release for this Mac and copies it to /Applicat
 
 `make install INSTALL_DIR="$HOME/Applications"` installs for your user only. `make zip` builds the release download (Apple silicon and Intel in one app).
 
+`make install` refuses while Tether is running. Closing the window is not enough when *Keep running in the menu bar when the window is closed* is on (the default): quit from the menu bar icon, then run `make install-built` to install what was just built without building again.
+
 Or `make run` to build and open it from `dist/` without installing. A build made on your own Mac is not quarantined, so it opens without the warning.
 
 ### Updating
 
-Tether updates itself (Settings ▸ General ▸ Updates, on by default): at launch and once a day it asks GitHub whether a newer release exists, downloads that release's source into a temporary folder, builds it there in the background at low priority, and installs it with `make install` over the copy that runs when you quit Tether — or at once with *Restart to Update* (also in the Help menu and the sidebar). Help ▸ Check for Updates… asks right away and opens the Software Update window: the new version's release notes, the progress of the download and of the build (*Cancel* stops it), and *Restart to Update* once it is ready. After an update, Tether shows once what changed. Building needs Apple's command line tools (`xcode-select --install`); without them, or with *Download and install updates* off, Tether only says a new version exists and links to its release page. Turn the check off and nothing is asked at all.
+Tether updates itself (Settings ▸ General ▸ Updates, on by default): at launch and once a day it asks GitHub whether a newer release exists, downloads that release's source into a temporary folder, builds it in the background at low priority (in a build folder kept between updates in `~/Library/Caches`, so only what changed is compiled again), and installs it with `make install` over the copy that runs when you quit Tether — or at once with *Restart to Update* (also in the Help menu and the sidebar). Help ▸ Check for Updates… asks right away and opens the Software Update window: the new version's release notes, the progress of the download and of the build (*Cancel* stops it), and *Restart to Update* once it is ready. After an update, Tether shows once what changed. Building needs Apple's command line tools (`xcode-select --install`); without them, or with *Download and install updates* off, Tether only says a new version exists and links to its release page. Turn the check off and nothing is asked at all.
 
 By hand: quit Tether, then install the new version over the old one (`git pull && make install` from source). Either way settings, hosts, sessions and recordings are kept, and sessions that were open reattach on the next launch.
 
-Tether is not signed with a developer certificate. With the default ad-hoc signature every build is a new app to macOS: the first time a new version uses a saved password (or the recording key), macOS asks whether Tether may use it (choose *Always Allow*), and folder permissions (Documents, Downloads …) are asked for again. Building from source, run `make signing-identity` once: it creates a local, self-signed signing certificate in your login keychain, every later build is signed with it, and macOS keeps those permissions across updates. Tether's own security settings are read without asking either way.
+Tether is not signed with a developer certificate. An ad-hoc signature makes every build a new app to macOS: the first time a new version uses a saved password (or the recording key), macOS asks for your Mac's password to let Tether use it, and folder permissions (Documents, Downloads …) are asked for again. So a build from source (`make app`, `make install`, and Tether's own updates) first creates a local, self-signed signing certificate, "Tether Local Signing", in your login keychain (once; `make signing-identity` does only that) and signs every build with it: macOS then keeps those permissions across updates. After the first build signed with it, macOS asks once more — choose *Always Allow*. `TETHER_SIGN_IDENTITY=-` builds ad-hoc instead. Tether's own security settings are read without asking either way.
 
 Programs you run in Tether's terminals (a build, `git`, a coding agent) reach macOS as Tether, as they would as Terminal.app: when one of them opens a file in Documents, macOS asks whether *Tether* may. A terminal (or tmux server) started by an older build still belongs to that build, so after updating, reopen local terminals once.
 
@@ -242,7 +244,7 @@ make check            # privacy scan + release notes + tests
 make clean            # remove build products
 ```
 
-`make` only wraps `swift build`, `swift test` and `scripts/build-app.sh`; you can run those directly. The app is ad-hoc signed. To distribute it without the first-launch warning, sign and notarize it with your own Developer ID.
+`make` only wraps `swift build`, `swift test` and `scripts/build-app.sh`; you can run those directly (add `--build-system native` to `swift build` and `swift test`: SwiftPM's newer build system wants Xcode's Metal compiler for SwiftTerm's shaders). Builds are signed with the local "Tether Local Signing" certificate (see above), not a Developer ID: to distribute the app without the first-launch warning, sign and notarize it with your own Developer ID (`TETHER_SIGN_IDENTITY`).
 
 ## Architecture
 
