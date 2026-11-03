@@ -490,7 +490,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
     // Updates
     /// At launch (and once a day), ask GitHub whether a newer release exists (one request to api.github.com).
     public var checkForUpdates = true
-    /// A newer release is fetched and built in the background, and installed when Tether quits.
+    /// A newer release is fetched and built in the background; it is installed only when the user
+    /// chooses Restart to Update and confirms (never on quit).
     public var installUpdatesAutomatically = true
 
     // Passwords

@@ -68,6 +68,57 @@ import TetherCore
         #expect(view.getTerminal().getCursorLocation().y == 0)
     }
 
+    /// The top row in view (wherever the view is scrolled).
+    func viewTop(_ view: TetherTerminalView) -> String {
+        let t = view.getTerminal()
+        return (t.getScrollInvariantLine(row: t.buffer.yDisp + t.buffer.totalLinesTrimmed)?.translateToString(trimRight: true) ?? "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    func atBottom(_ view: TetherTerminalView) -> Bool {
+        view.getTerminal().buffer.yDisp >= view.bufferLineCount - view.getTerminal().rows
+    }
+
+    /// Scrolled up a little (the prompt still in view), Ctrl+L shows the cleared screen with the
+    /// prompt at the top: the view goes to the bottom with it.
+    @Test(arguments: [1, 3, 30])
+    func ctrlLWhileScrolledUpShowsThePromptAtTheTop(_ up: Int) {
+        let view = makeView()
+        feed(view, (1...60).map { "line \($0)" }.joined(separator: "\r\n") + "\r\n$ ")
+        view.scrollTo(row: view.getTerminal().buffer.yDisp - up)
+        #expect(!atBottom(view))
+        view.sendsAreTyping = true
+        view.send(source: view, data: [0x0c][...])
+        feed(view, "\u{1b}[H\u{1b}[2J$ ")
+        #expect(atBottom(view), "at the bottom")
+        #expect(viewTop(view) == "$", "the prompt at the top (\(viewTop(view)))")
+        #expect(view.scrollbackText().lines.contains("line 60"), "the screen kept above")
+    }
+
+    /// `clear` and Return, scrolled up a little: the same.
+    @Test func clearCommandWhileScrolledUpShowsThePromptAtTheTop() {
+        let view = makeView()
+        feed(view, (1...60).map { "line \($0)" }.joined(separator: "\r\n") + "\r\n$ clear")
+        view.scrollTo(row: view.getTerminal().buffer.yDisp - 2)
+        view.sendsAreTyping = true
+        view.send(source: view, data: [0x0d][...])
+        feed(view, "\r\n\u{1b}[H\u{1b}[2J\u{1b}[3J$ ")
+        #expect(atBottom(view))
+        #expect(viewTop(view) == "$")
+    }
+
+    /// A program clearing on its own while the user reads above: the view stays where it is.
+    @Test func aProgramsClearDoesNotMoveTheViewOfSomeoneReading() {
+        let view = makeView()
+        feed(view, (1...60).map { "line \($0)" }.joined(separator: "\r\n") + "\r\n")
+        let row = view.getTerminal().buffer.yDisp - 20
+        view.scrollTo(row: row)
+        let before = viewTop(view)
+        feed(view, "\u{1b}[H\u{1b}[2Jframe")
+        #expect(!atBottom(view))
+        #expect(viewTop(view) == before, "still reading \(before) (\(viewTop(view)))")
+    }
+
     /// Inside tmux and screen, shells clear with "home, erase below" (ESC[H ESC[J): kept the same way.
     @Test func tmuxStyleClearKeepsScreenInScrollback() {
         let view = makeView()

@@ -116,6 +116,10 @@ public final class ForwardManager {
 
     public func status(of forward: PortForward) -> Status { status[forward.id] ?? .inactive }
 
+    /// Stopped with its connection (or not reachable yet after a relaunch): made again by itself
+    /// once the host connects, not failed for good.
+    public func isWaiting(_ forward: PortForward) -> Bool { pendingRestore.contains(forward.id) }
+
     /// The forwards running now.
     public var activeForwards: [PortForward] {
         owners.values.filter { status[$0.forward.id] == .active }.map(\.forward)

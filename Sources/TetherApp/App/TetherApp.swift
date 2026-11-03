@@ -320,10 +320,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // What is waiting to be written (open tabs, windows) first: whatever happens next, the
             // next launch brings them back.
             step("saving state first") { DeferredWrites.shared.flush() }
-            // An update built meanwhile is installed once this Tether has ended; one still being
-            // built is stopped (it starts again next time).
+            // An update still being built is stopped (it starts again next time). One that is built
+            // is never installed on quit: only Restart to Update, after the user confirms, installs.
             step("stopping the update") { Updater.shared.stop() }
-            step("starting the update's install") { Updater.shared.installOnQuit() }
             step("saving file tabs") { AppModel.shared.fileTabs.saveDirectories() }
             step("ending the sessions") { AppModel.shared.sessions.prepareForTermination() }
             step("stopping command watchers") { AppModel.shared.stopCommandHubs() }

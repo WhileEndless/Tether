@@ -50,7 +50,7 @@ struct UpdateStatusPanel: View {
             Button("Show Log") { updater.showLog() }
         case .available(let r, _):
             if updater.installFolder != nil {
-                Button("Download and Install") { updater.prepare(r) }
+                Button("Download") { updater.prepare(r) }
                     .keyboardShortcut(.defaultAction)
             }
             Button("Release Page") { NSWorkspace.shared.open(r.page) }
@@ -92,7 +92,7 @@ struct UpdateStatusPanel: View {
         case .building(_, let progress, _):
             (progress.map { "\(Int(($0 * 100).rounded())) % · " } ?? "")
                 + "In the background at low priority; it takes a few minutes. You can keep working."
-        case .ready: "It is installed when you quit Tether, or now with Restart to Update. Tabs in tmux or screen come back."
+        case .ready: "Ready to install. Nothing is installed until you choose Restart to Update. Tabs in tmux or screen come back."
         case .failed(_, let why): why
         case .checking: nil
         }
@@ -206,7 +206,7 @@ struct UpdateWindow: View {
             Divider()
             HStack(spacing: 14) {
                 Toggle("Check daily", isOn: $store.settings.checkForUpdates)
-                Toggle("Download and install updates", isOn: $store.settings.installUpdatesAutomatically)
+                Toggle("Download in the background", isOn: $store.settings.installUpdatesAutomatically)
                     .onChange(of: store.settings.installUpdatesAutomatically) { _, on in if !on { updater.stop() } }
                 Spacer(minLength: 0)
                 if updater.installed != nil {

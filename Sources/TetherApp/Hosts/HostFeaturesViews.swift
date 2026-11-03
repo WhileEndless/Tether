@@ -19,7 +19,8 @@ struct HostFeaturesMenu: View {
         }))
         .help("Cisco, Junos, FortiOS, RouterOS, a menu or git-shell: Tether only opens the device's own command line and runs nothing else there")
         Menu("Host Panel Tabs") {
-            ForEach(HostFeature.panels) { f in
+            // Port forwards go through a server: the Mac itself has none.
+            ForEach(HostFeature.panels.filter { !(target.isLocal && $0 == .portsPanel) }) { f in
                 Toggle(f.title, isOn: Binding(get: { model.isEnabled(f, for: target) },
                                               set: { model.setHostChoice(f, for: target, $0) }))
                     .disabled(f.needsMonitoring && !monitoring)

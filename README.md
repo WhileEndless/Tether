@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.1 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.10.2 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.1): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.2): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -87,7 +87,8 @@ Search across every terminal, the archive and recordings.
 - **SSH keys:** *Set Up SSH Key…* on a host creates a key (Ed25519, or RSA 4096 for older servers), with or without a passphrase (typed twice), adds it to the server's `authorized_keys`, checks that the key alone logs in, and sets it in your SSH config. An existing key can be used instead. Existing files are never replaced. It is offered only where key login doesn't already work.
 - **Keys with a passphrase:** when ssh asks for it, Tether answers with the passphrase it keeps in your keychain (after Touch ID, if you turned that on), or asks you and can remember it — once per key file, however many hosts and tabs use it (see [docs/connections-and-passwords.md](docs/connections-and-passwords.md#key-passphrases)). Optionally new keys also go to the macOS ssh-agent for Terminal and git. Settings ▸ SSH ▸ Keys lists your keys and adds, changes or removes a passphrase.
 - **Port forwarding:**
-  - local, remote and SOCKS forwards saved per host, with auto-start
+  - *Forward a Port…* asks what you want in plain words: open a port of the server on this Mac, reach another machine through the server, let the server reach this Mac, or browse through the server (SOCKS); it picks a free port and says in one sentence what will happen
+  - forwards saved per host, with auto-start; each says whether it is on, off, waiting or failed, and what that means
   - conflict checks with free-port suggestions
   - one-click forwarding of ports the server listens on
   - forwards are restored automatically after a reconnect, also for hosts without an open tab, and after a relaunch (those listening only on this Mac by themselves; others when you say so)
@@ -198,7 +199,7 @@ Or `make run` to build and open it from `dist/` without installing. A build made
 
 ### Updating
 
-Tether updates itself (Settings ▸ General ▸ Updates, on by default): at launch and once a day it asks GitHub whether a newer release exists, downloads that release's source into a temporary folder, builds it in the background at low priority (in a build folder kept between updates in `~/Library/Caches`, so only what changed is compiled again), and installs it with `make install` over the copy that runs when you quit Tether — or at once with *Restart to Update* (also in the Help menu and the sidebar). Help ▸ Check for Updates… asks right away and opens the Software Update window: the new version's release notes, the progress of the download and of the build (*Cancel* stops it), and *Restart to Update* once it is ready. After an update, Tether shows once what changed. Building needs Apple's command line tools (`xcode-select --install`); without them, or with *Download and install updates* off, Tether only says a new version exists and links to its release page. Turn the check off and nothing is asked at all.
+Tether updates itself (Settings ▸ General ▸ Updates, on by default): at launch and once a day it asks GitHub whether a newer release exists, downloads that release's source into a temporary folder, builds it in the background at low priority (in a build folder kept between updates in `~/Library/Caches`, so only what changed is compiled again), and waits: it is installed with `make install` over the copy that runs only when you choose *Restart to Update* (also in the Help menu and the sidebar) and confirm — never by itself, also not when you quit Tether. Help ▸ Check for Updates… asks right away and opens the Software Update window: the new version's release notes, the progress of the download and of the build (*Cancel* stops it), and *Restart to Update* once it is ready. After an update, Tether shows once what changed. Building needs Apple's command line tools (`xcode-select --install`); without them, or with *Download updates in the background* off, Tether only says a new version exists and links to its release page. Turn the check off and nothing is asked at all.
 
 By hand: quit Tether, then install the new version over the old one (`git pull && make install` from source). Either way settings, hosts, sessions and recordings are kept, and sessions that were open reattach on the next launch.
 

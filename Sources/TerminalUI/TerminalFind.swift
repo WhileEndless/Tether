@@ -542,7 +542,16 @@ extension TetherTerminalView {
                 }
                 if !shown { s.queuedEarlier = id }
             }
-            if forward { read(at: place.cut, through: offset) } else { read(at: max(place.cut - span, 0), through: place.cut) }
+            if forward {
+                read(at: place.cut, through: offset)
+            } else {
+                // Where the match's piece of output starts is known from the search: a part read from
+                // there through the place holds both at once, when they are near each other. (Moving
+                // back a span at a time read the same few megabytes three or four times over — about
+                // ten seconds a step in a long agent session.) Far apart, as before.
+                let near = place.cut - target.start <= Self.backSpan << 6
+                read(at: near ? min(target.start, max(place.cut - span, 0)) : max(place.cut - span, 0), through: place.cut)
+            }
             return
         }
         // From memory, back: the last match above where memory starts.
@@ -688,7 +697,7 @@ extension TetherTerminalView {
         s.overlay.update(matches: s.matches, current: s.current, geometry: geometry, style: settingsFindStyle,
                          font: font, scale: window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2, appearance: effectiveAppearance,
                          // Shares of the whole session: only when the scroller stands for it.
-                         earlier: exactIndex == nil ? [] : s.earlier.map(\.share), currentEarlier: s.currentEarlier,
+                         earlier: sessionScaleIndex == nil ? [] : s.earlier.map(\.share), currentEarlier: s.currentEarlier,
                          text: { [unowned self] row, columns in self.findCells(row: row, columns: columns) })
     }
 
@@ -798,7 +807,7 @@ extension TetherTerminalView {
                                      textWidth: scroller.map { $0.minX } ?? bounds.width,
                                      scroller: scroller, firstRow: trimmed, lineCount: bufferLineCount)
         g.visibleLines = historyScroller.visible
-        if let index = exactIndex, !isAlternateScreen || isBrowsingHistory {
+        if let index = sessionScaleIndex, !isAlternateScreen || isBrowsingHistory {
             g.lineBefore = Double(liveFirstLineForMarks)
             g.rowsPerLine = rowsPerLine
             g.lineCount = index.lines + 1

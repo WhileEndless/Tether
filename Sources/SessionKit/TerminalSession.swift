@@ -78,7 +78,7 @@ public final class TerminalSession: Identifiable {
         Task { [weak self] in
             // On the maintenance queue: no pass (compression, masking, the storage limit) can move or
             // remove the file between deciding to continue it and marking it in use.
-            let opened = await RecordingStore.perform { () -> (SessionRecorder, [UInt8]?)? in
+            let opened = await RecordingStore.perform { () -> (SessionRecorder, [UInt8]?, Int)? in
                 let fm = FileManager.default
                 // Output it holds (parts as their names say, the file as it is): indexing reads it all.
                 let main = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
@@ -88,23 +88,31 @@ public final class TerminalSession: Identifiable {
                 guard fm.fileExists(atPath: url.path), output <= limit, !RecordingStore.isActive(url),
                       !RecordingCrypto.encryptNew || RecordingCrypto.isEncrypted(url),
                       let recorder = SessionRecorder(existing: url, key: key) else { return nil }
-                return (recorder, RecordingReader.tail(of: url, lines: 2_000, key: key))
+                // The output it holds, to tell whether the tail shown is all of it.
+                let length = recorder.flushedLength()
+                return (recorder, RecordingReader.tail(of: url, lines: 2_000, key: key), length)
             }
-            if let self, let (recorder, tail) = opened, self.recorder == nil, !phase.isDead {
+            if let self, let (recorder, tail, length) = opened, self.recorder == nil, !phase.isDead {
                 self.recorder = recorder
                 continuedRecording = true
                 applyRecordingInterval()
                 if let tail, !tail.isEmpty {
                     showEarlierOutput(tail)
-                    // As many lines as were asked for (or as much as is read at most): more before it.
-                    let breaks = tail.reduce(0) { $0 + ($1 == 0x0a ? 1 : 0) }
-                    if breaks >= 1_999 || tail.count >= RecordingReader.tailMaxBytes - 1024 { sink?.earlierOutputIsPartial() }
+                    // Less than the recording holds: more before it. (Not judged by its line breaks:
+                    // a program redrawing in place, such as a coding agent, writes many per line.)
+                    if Self.tailIsPartial(tailBytes: tail.count, recordingLength: length) { sink?.earlierOutputIsPartial() }
                 }
             } else {
                 opened?.0.close()
             }
             done()
         }
+    }
+
+    /// Whether a recording's tail of `tailBytes` leaves output before it (the recording holds
+    /// `recordingLength` bytes of output).
+    nonisolated static func tailIsPartial(tailBytes: Int, recordingLength: Int) -> Bool {
+        tailBytes < recordingLength
     }
 
     /// Output from an earlier run, shown again: not recorded, and a full-screen program that was
@@ -162,7 +170,10 @@ public final class TerminalSession: Identifiable {
         if code == 7501 {
             guard let status = ProgramStatus.parse(payload) else { return }
             if status == .query {
-                if agentStatusEnabled { send(ProgramStatus.reply[...]) }
+                // Not in tmux: tmux keeps the question from its clients, so the program does not
+                // wait for an answer, and ours (typed into the pane a round trip later) would be
+                // echoed as text. There the agent's status is read on the host instead.
+                if agentStatusEnabled, tmux == nil { send(ProgramStatus.reply[...]) }
             } else if case .update(_, _, _, let app) = status, let activity = status.activity {
                 let kind = app.flatMap { AgentKind(program: $0) } ?? agent?.kind ?? foregroundName.flatMap { AgentKind(program: $0) } ?? .other
                 agentReported(kind: kind, activity: activity, at: Date())
@@ -746,6 +757,8 @@ exit 1
     @ObservationIgnored private var process: LocalProcess?
     @ObservationIgnored private var bridge: ProcessBridge?
     @ObservationIgnored private var tmux: TmuxDriver?
+    /// The tmux pane's history as last seen (see `TmuxDriver.lastPosition`).
+    @ObservationIgnored private var lastHistoryPosition: TmuxDriver.HistoryPosition?
     @ObservationIgnored private var markerBuffer: [UInt8] = []
     @ObservationIgnored private var markerResolved = false
     /// The bootstrap never answered and the tab was taken as a plain session (see
@@ -974,7 +987,10 @@ exit 1
     public func sendAutomatic(_ bytes: ArraySlice<UInt8>) {
         if phase == .connecting, takesKeysWhileConnecting { process?.send(data: bytes); return }
         guard phase.isOnline else { return }
-        if let tmux { tmux.sendInput(bytes) } else { process?.send(data: bytes) }
+        guard let tmux else { process?.send(data: bytes); return }
+        // tmux answers its panes' questions itself (see `TmuxOwnAnswers`): ours would come late.
+        let rest = TmuxOwnAnswers.strip(bytes)
+        if !rest.isEmpty { tmux.sendInput(rest) }
     }
 
     /// While connecting, keys go straight to ssh: something asks in the terminal, or what starts is
@@ -1928,6 +1944,10 @@ exit 1
                 return sink.screenCursorRow() == nil
             }
             driver.catchUpLimit = max(configurationProvider().serverHistoryLines, TmuxDriver.catchUpProbe)
+            // Where the pane's history stood when this tab last asked: a re-attach then fetches
+            // only what was added since, not the whole history.
+            driver.lastPosition = { [weak self] in self?.lastHistoryPosition }
+            driver.onPosition = { [weak self] in self?.lastHistoryPosition = $0 }
             driver.onReady = { [weak self] in self?.becameOnline() }
             driver.willRedraw = { [weak self] in
                 // Noted in the recording as well: shown again, it keeps that screen too.

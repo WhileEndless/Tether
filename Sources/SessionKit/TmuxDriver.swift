@@ -58,6 +58,41 @@ final class TmuxDriver {
     var localOnAlternateScreen: () -> Bool = { false }
     /// The most history a catch-up may fetch (what the server keeps for Tether's sessions).
     var catchUpLimit = 100_000
+
+    /// Where the pane's history stood when last asked (every few seconds while connected): which
+    /// pane, how many rows its history held, how many it keeps at most, and the pane's size then.
+    struct HistoryPosition: Equatable, Sendable {
+        var paneID: String
+        var panePID: Int?
+        var size: Int
+        var limit: Int
+        var width: Int
+        var height: Int
+    }
+    /// The position last known for this tab (from the connection before this one).
+    var lastPosition: () -> HistoryPosition? = { nil }
+    /// Told the position whenever tmux says it.
+    var onPosition: (HistoryPosition) -> Void = { _ in }
+    private var panePID: Int?
+
+    /// About how many rows the pane's history gained since `last` — only to size the first look
+    /// (where to continue is always found by the rows themselves; when they are not in that look,
+    /// it looks further back as before). Nil when the count says nothing: another pane, or tmux
+    /// started again; a history near its limit (tmux then drops a tenth of it at once, uncounted);
+    /// the pane at another size then, or to be resized now (tmux re-wraps the history: its row
+    /// count changes with no output); a history smaller than it was (cleared).
+    static func rowsAdded(since last: HistoryPosition?, now info: TmuxPaneInfo, sizeToSend: (cols: Int, rows: Int)?) -> Int? {
+        guard let last, last.paneID == info.paneID, last.panePID == nil || info.panePID == nil || last.panePID == info.panePID,
+              let limit = info.historyLimit, limit == last.limit,
+              last.width == info.width, last.height == info.height,
+              sizeToSend.map({ $0.cols == info.width && $0.rows == info.height }) ?? true,
+              info.historySize >= last.size, info.historySize + catchUpMargin < limit - limit / 10 else { return nil }
+        return info.historySize - last.size
+    }
+
+    /// Rows asked for above what the history gained since it was last known (older rows, for
+    /// finding the last ones seen even when the count is a little off).
+    static let catchUpMargin = 300
     /// First catch-up attempt: this many history rows (enough unless a lot was printed meanwhile).
     static let catchUpProbe = 1_000
     /// Second attempt, before everything the server kept: a whole history can be many megabytes,
@@ -181,7 +216,13 @@ final class TmuxDriver {
             }
             let firstTime = paneID == nil
             let switched = !firstTime && paneID != info.paneID
+            let last = lastPosition()
             paneID = info.paneID
+            panePID = info.panePID
+            if let limit = info.historyLimit {
+                onPosition(HistoryPosition(paneID: info.paneID, panePID: info.panePID, size: info.historySize, limit: limit,
+                                           width: info.width, height: info.height))
+            }
             // Only a real size: a guessed one would resize the window, and its programs would
             // redraw twice (Claude Code and other TUIs then leave parts of the old frame behind).
             // Without one (a tab restored in the background), the screen restored now is drawn
@@ -194,7 +235,11 @@ final class TmuxDriver {
             if firstTime && isReattach && !terminalIsEmpty && !info.alternateScreen, let anchor = screenTail() {
                 // Reconnected: add what the pane printed meanwhile, then continue live.
                 restoring = true
-                let rows = min(info.historySize, Self.catchUpProbe)
+                // The first look: about as much as the history grew since this tab last asked (the
+                // margin covers a count a little off), else the last thousand rows. Further back in
+                // steps only when the rows seen last are not in it.
+                let added = Self.rowsAdded(since: last, now: info, sizeToSend: size())
+                let rows = min(info.historySize, added.map { $0 + Self.catchUpMargin } ?? Self.catchUpProbe)
                 send(TmuxCommands.capturePane(pane: info.paneID, historyLines: max(rows, 1), join: false),
                      expect: .catchUp(info: info, anchor: anchor, rows: rows))
             } else if (firstTime && isReattach) || switched || redrawRequested {
@@ -221,8 +266,12 @@ final class TmuxDriver {
             activitySentAt = nil
             guard success, let line = lines.first else { return }
             let text = String(decoding: line, as: UTF8.self)
-            let parts = text.split(separator: "\t", maxSplits: 1).map(String.init)
-            onActivity(parts.first ?? "", parts.count > 1 ? parts[1] : "", rtt)
+            let parts = text.split(separator: "\t", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 6 else { return }
+            if let paneID, let size = Int(parts[0]), let limit = Int(parts[1]), let width = Int(parts[2]), let height = Int(parts[3]) {
+                onPosition(HistoryPosition(paneID: paneID, panePID: panePID, size: size, limit: limit, width: width, height: height))
+            }
+            onActivity(parts[4], parts[5], rtt)
         case .capture(let info, let fullHistory):
             if redrawing {
                 redrawing = false
@@ -287,7 +336,8 @@ final class TmuxDriver {
                              joined: [[UInt8]]?, resume: HistoryCatchUp.Resume) -> Bool {
         let plain = lines.map(HistoryCatchUp.plainText)
         let tail = joined.flatMap { HistoryCatchUp.joinedLines(rows: plain, joined: $0, from: resume.index) }
-        let out = HistoryCatchUp.output(captured: tail ?? lines, from: tail == nil ? resume.index : 0, anchorRow: anchor.lastRow, cursorRow: anchor.cursorRow,
+        let out = HistoryCatchUp.output(captured: tail ?? lines, from: tail == nil ? resume.index : 0,
+                                        anchorRow: max(anchor.lastRow - resume.rowsBack, 0), cursorRow: anchor.cursorRow,
                                         height: info.height, cursor: (info.cursorX, info.cursorY),
                                         replacingAnchorRow: resume.replacesLastRow, screen: lines)
         display(out.stream)
@@ -497,7 +547,7 @@ final class TmuxDriver {
     func requestActivity() {
         guard ready, !exited, let paneID, activitySentAt == nil else { return }
         activitySentAt = ProcessInfo.processInfo.systemUptime
-        send("display-message -p -t \(paneID) '#{pane_current_command}\t#{pane_current_path}'\n", expect: .activity)
+        send("display-message -p -t \(paneID) '#{history_size}\t#{history_limit}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}'\n", expect: .activity)
     }
 
     func resize(cols: Int, rows: Int) {

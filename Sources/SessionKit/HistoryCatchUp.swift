@@ -66,6 +66,15 @@ enum HistoryCatchUp {
         /// It is the anchor's last row, printed again over it: that row was still being written when
         /// the connection dropped (a prompt, a line without its end yet, a progress bar).
         var replacesLastRow: Bool
+        /// The anchor's last rows that were redrawn since (an agent's prompt box): printed over, from
+        /// this many rows above the anchor's last one.
+        var rowsBack = 0
+
+        init(index: Int, replacesLastRow: Bool, rowsBack: Int = 0) {
+            self.index = index
+            self.replacesLastRow = replacesLastRow
+            self.rowsBack = rowsBack
+        }
     }
 
     /// Where the new output starts in `captured`: after the last place the anchor appears; when its
@@ -96,7 +105,28 @@ enum HistoryCatchUp {
         for start in stride(from: captured.count - n, through: 0, by: -1) where headMatches(start) {
             return Resume(index: start + n - 1, replacesLastRow: true)
         }
-        return resumeByText(captured: captured, anchor: anchor)
+        return resumeByText(captured: captured, anchor: anchor) ?? resumeByTopRows(captured: captured, anchor: anchor)
+    }
+
+    /// The anchor's upper rows found, its lower ones changed in place: a program that redraws the
+    /// bottom of the screen where it stands (a coding agent's prompt box and status line, a clock
+    /// in a prompt) leaves the output above as it was. As many of the top rows as are found — at
+    /// least half of them, three with text and enough letters to be told apart. What follows them
+    /// is new: an agent's new messages take the place of its old prompt box (which stays at the
+    /// bottom), so they continue right after the rows found, printed over the rows redrawn since.
+    static func resumeByTopRows(captured: [String], anchor: [String]) -> Resume? {
+        let n = anchor.count
+        guard n >= 4 else { return nil }
+        for keep in stride(from: n - 1, through: max(3, (n + 1) / 2), by: -1) {
+            let top = Array(anchor[..<keep])
+            guard top.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).count >= 3,
+                  top.joined().filter({ $0.isLetter || $0.isNumber }).count >= 24, captured.count >= keep else { continue }
+            for start in stride(from: captured.count - keep, through: 0, by: -1)
+            where captured[start..<(start + keep)].elementsEqual(top) {
+                return Resume(index: start + keep, replacesLastRow: false, rowsBack: n - keep)
+            }
+        }
+        return nil
     }
 
     /// The anchor's text found in `captured` whatever the rows: a restored tab draws its recording

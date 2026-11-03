@@ -107,11 +107,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// A newer Tether was found (`ready`: built, installed when Tether restarts or quits).
+    /// A newer Tether was found (`ready`: built, installed only with Restart to Update).
     func updateAvailable(_ version: String, ready: Bool) {
         let content = UNMutableNotificationContent()
         content.title = ready ? "Tether \(version) is ready" : "Tether \(version) is available"
-        content.body = ready ? "It is installed when you quit Tether, or now with Restart to Update (Settings ▸ General)."
+        content.body = ready ? "Install it with Restart to Update (Settings ▸ General) when you are ready; nothing is installed before."
             : "Settings ▸ General ▸ Updates has the release page."
         content.userInfo = ["update": version]
         Task {

@@ -531,7 +531,19 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private func noteClear() {
         let t = getTerminal()
         clearTop = ScrollbackRule.lineCount(t) - t.rows
+        // The user's clear (Ctrl+L, or `clear` and Return, just typed): the cleared screen, with the
+        // prompt at the top, is what they want to see — also when they had scrolled up a little,
+        // where the view would otherwise stay (SwiftTerm follows output only from the bottom).
+        if !t.isCurrentBufferAlternate, !replayingEarlier,
+           ProcessInfo.processInfo.systemUptime - lastClearKeyAt < Self.clearFollowsKey {
+            scrollToBottom()
+        }
     }
+
+    /// When Return or Ctrl+L was last typed (system uptime): a clear soon after it is the user's.
+    private var lastClearKeyAt: TimeInterval = -.infinity
+    /// How long after the key its clear is still taken for the user's (a slow server, a busy shell).
+    static let clearFollowsKey: TimeInterval = 5
 
     /// The terminal getting taller pulls lines back down from the scrollback (like xterm). After a
     /// clear those are the cleared screen, and the prompt would move down mid-screen: they go back up.
@@ -1786,6 +1798,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // it). The recording notes each one too (a command's mark counts for its Return), so it
         // keeps the same screens when it is shown again.
         let typed = data.reduce(0) { $0 + ($1 == 0x0d || $1 == 0x0c ? 1 : 0) }
+        if typed > 0 { lastClearKeyAt = ProcessInfo.processInfo.systemUptime }
+        // Ctrl+L: to the bottom at once (the caret may still be in view a little above it, where
+        // SwiftTerm would leave the view), so the cleared screen shows with the prompt at the top.
+        if data.contains(0x0c), !isAlternateScreen { scrollToBottom() }
         if typed > 0 {
             ruleContext.typed(typed)
             for _ in 0..<max(typed - (marked ? 1 : 0), 0) { session?.noteClearTyped() }
@@ -1860,9 +1876,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// there then too.
     public var hasOlderOutput: Bool {
         if linesDropped > 0 { return true }
-        guard showedEarlierOutput, hasHistoryOnDisk else { return false }
-        guard let index = historyIndex?() else { return earlierOutputCut }
-        return earlierOutputCut || index.lines + 1 > linesUpToCursor
+        // Told exactly when the tail was shown (`earlierOutputIsPartial`): the recording's line
+        // breaks are no measure of it (a program redrawing in place writes many per line).
+        return showedEarlierOutput && hasHistoryOnDisk && earlierOutputCut
     }
 
     /// Output of an earlier run was shown (the end of a recording that may hold more).
@@ -2259,11 +2275,18 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         return index
     }
 
+    /// The index when the scroller stands for the whole session: only while the recording holds
+    /// output memory does not. Until then it stands for memory's rows. Counting the recording's
+    /// line breaks would show more there: a program that redraws in place (a coding agent's prompt
+    /// box, redrawn on every key) adds breaks, not lines.
+    var sessionScaleIndex: RecordingIndex? { hasOlderOutput ? exactIndex : nil }
+
     func updateHistoryScroller() {
         scrollerUpdateQueued = false
         let t = getTerminal()
-        // A full-screen program's screen, or no index: the scroller stands for what is in memory.
-        guard !isAlternateScreen || isBrowsingHistory, let index = exactIndex else {
+        // A full-screen program's screen, nothing older than memory, or no index: the scroller
+        // stands for what is in memory.
+        guard !isAlternateScreen || isBrowsingHistory, let index = sessionScaleIndex else {
             historyScroller.set(total: bufferLineCount, top: t.buffer.yDisp, visible: t.rows)
             return
         }
@@ -2279,14 +2302,18 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     /// Where history row `row` (scroll-invariant) is on the scroller, 0…1 (the knob's scale).
     func historyShare(ofRow row: Int, in h: HistoryTerminalView) -> CGFloat? {
-        guard let index = exactIndex, let line = h.sessionLine(ofRow: row) else { return nil }
+        guard let index = sessionScaleIndex, let line = h.sessionLine(ofRow: row) else { return nil }
         return CGFloat(line / Double(index.lines + 1))
     }
 
     /// Shows the session from line `target` at the top: from memory when it is there, otherwise read
     /// from the recording (while one part is read, the latest position asked for comes next).
     func scrollHistory(toLine target: Int) {
-        guard let index = exactIndex else { scrollTo(row: target); return }
+        guard let index = sessionScaleIndex else {
+            // The scroller stands for memory: its rows (leaving a view of the recording, if one is up).
+            if isBrowsingHistory { leaveHistory(scrollTo: max(target, 1)) } else { scrollTo(row: target) }
+            return
+        }
         scrollGeneration &+= 1
         // A part is being read: the latest position (wherever it is) is shown once it is there.
         if history?.loading == true { pendingScrollLine = target; return }

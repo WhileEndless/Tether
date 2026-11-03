@@ -48,7 +48,7 @@ Temporary files outside this folder:
 - Hang records: when Tether stops answering for a few seconds or takes long to quit, macOS's `sample`
   of the process (function names only, nothing a terminal showed) in `~/Library/Logs/Tether/`; the
   last five are kept, at most one in ten minutes.
-- An update being prepared (Settings ▸ General ▸ Updates): the release's source, the app built from it and `update.log` in `tether-update-work` in your temporary folder (private to you), removed once the update is installed.
+- An update being prepared (Settings ▸ General ▸ Updates): the release's source, the app built from it and `update.log` in `tether-update-work` in your temporary folder (private to you). It waits there until you choose Restart to Update (nothing is installed before) and is removed once the update is installed.
 - Updates' build folder: `~/Library/Caches/<Tether's bundle id>/tether-update-build` (private to you), kept between updates so the next one compiles only what changed (a few hundred MB). macOS may clear it; the next update then builds from scratch. Deleting it is safe.
 - The signing certificate "Tether Local Signing" in your login keychain, made once by the first build from source (also by an update), so macOS recognises every later build as the same app and keeps the keychain's *Always Allow* and folder permissions. It never leaves your Mac; removing it in Keychain Access makes builds ad-hoc signed again until the next build makes a new one.
 
@@ -71,11 +71,16 @@ Temporary files outside this folder:
   in the background, to know where its lines and commands are. A continued recording is kept in
   the archive even if the tab is closed before it connects.
 - **Catching up after a reconnect (tmux):** the last rows the screen showed are looked up in what
-  the server kept, 1,000 rows first, then 10,000, then everything it keeps. A line that was still
-  being written when the connection dropped (a prompt, a progress bar) is completed in place rather
-  than shown twice. When those rows are not there at all (the screen was cleared, or more was
-  printed than the server keeps), everything it keeps is added under a note that earlier lines may
-  repeat — rather than lose any of it.
+  the server kept. Tether notes how many rows the pane's history held while it was connected, so it
+  first asks for about as many as were added since (300 more to be safe; the last 1,000 when that
+  count says nothing: another pane, tmux restarted, a history near its limit or re-wrapped by a
+  resize), and looks further back in steps (10,000, then everything kept) only when the rows are
+  not in it. A line that was still being written when the connection dropped (a prompt, a progress
+  bar) is completed in place rather than shown twice. Rows a program redrew in place at the bottom
+  (a coding agent's prompt box and status line) do not count as lost: when the rows above them are
+  found, the new output continues there. When the rows are not there at all (the screen was
+  cleared, or more was printed than the server keeps), everything it keeps is added under a note
+  that earlier lines may repeat — rather than lose any of it.
 - **Long sessions:** every 16 MB of output by default (Settings ▸ Recordings), the file is moved aside
   as a numbered part (compressed later, see below). Recording goes on in a fresh file.
   - The latest output is never compressed, so scrolling back stays fast.

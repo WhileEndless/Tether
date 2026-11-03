@@ -187,6 +187,50 @@ import SwiftTerm
         for _ in 0..<5 { seen.append(try await step(false)) }
         #expect(seen == ["4:4", "3:3", "2:2", "1:1", "6:6"], "back: \(seen)")
     }
+
+    /// ⌘⇧G back to a match far above the one shown, through output an agent redrew in place: the
+    /// part that holds it is read once, from where the search found it — not moved back a little at
+    /// a time, reading nearly the same part again and again (seconds each in a long session).
+    @Test func aStepBackReadsThePartOnce() async throws {
+        let f = try Fixture(lines: [], scrollback: 300, maxLines: 1500, chunk: 400, cols: 100)
+        for b in 1...4 {
+            Self.out(f, "$ needle run \(b)\r\n")
+            // A status block redrawn in place: many line breaks, few rows.
+            for fr in 0..<1_500 {
+                var s = fr == 0 ? "" : "\u{1b}[6A"
+                for l in 0..<6 { s += " step \(l) of run \(b) frame \(fr) \(String(repeating: "x", count: 40))\u{1b}[K\r\n" }
+                Self.out(f, s)
+            }
+        }
+        for i in 0..<400 { Self.out(f, "tail \(i)\r\n") }
+        var status = TerminalFindStatus()
+        f.view.onFindStatus = { status = $0 }
+        f.view.setFind(TerminalFindQuery(term: "needle"))
+        for _ in 0..<1000 where status.total < 4 || status.searchingRecording { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(status.total == 4)
+        var loads = 0
+        func step() async throws -> String {
+            loads = 0
+            f.view.onHistoryLoaded = { _ in loads += 1 }
+            f.view.findStep(forward: false)
+            for _ in 0..<1000 where f.view.history?.loading == true || f.view.history?.selection.active != true {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            for _ in 0..<1000 where f.view.history?.loading == true { try await Task.sleep(for: .milliseconds(10)) }
+            guard let h = f.view.history, h.selection.active else { return "-" }
+            let t = h.getTerminal()
+            let row = h.selection.start.row
+            return t.getLine(row: row - t.buffer.yDisp)?.translateToString(trimRight: true) ?? "?"
+        }
+        _ = try await step()                     // the newest: entering the recording
+        let second = try await step()
+        #expect(second.contains("needle run 3"), "the one before (\(second))")
+        #expect(loads <= 1, "read once (\(loads))")
+        let third = try await step()
+        #expect(third.contains("needle run 2"), "and the one before that (\(third))")
+        #expect(loads <= 1, "read once (\(loads))")
+    }
 }
 
 private extension Array {

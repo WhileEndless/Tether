@@ -36,7 +36,7 @@ public enum TmuxCommands {
         + "cursor=#{cursor_flag};keypad=#{keypad_flag};keys=#{keypad_cursor_flag};insert=#{insert_flag};origin=#{origin_flag};"
         + "wrap=#{wrap_flag};top=#{scroll_region_upper};bottom=#{scroll_region_lower};m1000=#{mouse_standard_flag};"
         + "m1002=#{mouse_button_flag};m1003=#{mouse_all_flag};m1006=#{mouse_sgr_flag};m1005=#{mouse_utf8_flag};"
-        + "paste=#{bracket_paste_flag};shape=#{cursor_shape};blink=#{cursor_blinking}'\n"
+        + "paste=#{bracket_paste_flag};shape=#{cursor_shape};blink=#{cursor_blinking} #{history_limit} #{pane_pid}'\n"
 
     /// Captures pane content with escape sequences.
     /// - Parameters:
@@ -76,6 +76,10 @@ public struct TmuxPaneInfo: Equatable, Sendable {
     public var historySize: Int
     /// The terminal modes the program in the pane has set (empty from an older Tether's question).
     public var modes: TmuxPaneModes
+    /// The most scrollback lines the pane keeps (nil: not asked).
+    public var historyLimit: Int?
+    /// The process the pane runs: with the pane id, which pane this is even after tmux restarted.
+    public var panePID: Int?
 
     public init?(line: String) {
         let p = line.split(separator: " ").map(String.init)
@@ -89,6 +93,8 @@ public struct TmuxPaneInfo: Equatable, Sendable {
         height = max(Int(p[5]) ?? 24, 1)
         historySize = max(p.count > 6 ? Int(p[6]) ?? 0 : 0, 0)
         modes = TmuxPaneModes(p.count > 7 ? p[7] : "")
+        historyLimit = p.count > 8 ? Int(p[8]).map { max($0, 0) } : nil
+        panePID = p.count > 9 ? Int(p[9]) : nil
     }
 }
 

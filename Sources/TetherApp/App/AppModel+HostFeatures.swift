@@ -74,6 +74,8 @@ extension AppModel {
         switch tab {
         case .gpu:
             return !(snapshot?.gpus.isEmpty ?? true)
+        case .ports:
+            return !target.isLocal          // forwards go through a server: none for this Mac itself
         case .containers, .kubernetes:
             guard settings.hideAbsentToolPanels, hostChoice(f, for: target) != true else { return true }
             let has = tab == .containers ? snapshot?.hasContainerTool : snapshot?.hasKubernetesTool

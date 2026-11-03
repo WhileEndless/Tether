@@ -413,18 +413,15 @@ struct TabStrip: View {
 
     @State private var contentWidth: CGFloat = 0
     @State private var visibleWidth: CGFloat = 0
-    /// The scroll offset, kept outside SwiftUI's state: it changes on every scroll event, and only
-    /// whether more tabs are hidden at either end is shown (`moreLeft`, `moreRight`).
-    @State private var offset = OffsetBox()
+    /// Whether more tabs are hidden at either end. Read from the scroll view itself (`TabScroller`)
+    /// whenever it scrolls or its tabs change, also at the end of an arrow's animated scroll.
     @State private var moreLeft = false
     @State private var moreRight = false
-    private final class OffsetBox { var x: CGFloat = 0 }
 
     private func updateEdges() {
-        let left = overflowing && offset.x > 1
-        let right = overflowing && offset.x < contentWidth - visibleWidth - 1
-        if left != moreLeft { moreLeft = left }
-        if right != moreRight { moreRight = right }
+        let (left, right) = scroller.hidden
+        if (overflowing && left) != moreLeft { moreLeft = overflowing && left }
+        if (overflowing && right) != moreRight { moreRight = overflowing && right }
     }
     @State private var scroller = TabScroller()
 
@@ -462,7 +459,7 @@ struct TabStrip: View {
                 }
                 .scrollIndicators(.never)
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { visibleWidth = $0; updateEdges() }
-                .onHorizontalScroll { offset.x = $0; updateEdges() }
+                .onAppear { scroller.onChange = { updateEdges() } }
                 // Fades at the edges show that more tabs are hidden there.
                 .mask {
                     HStack(spacing: 0) {
@@ -723,10 +720,59 @@ private struct TabScrollMarker: NSViewRepresentable {
     }
 }
 
-/// Scrolls one window's tab bar (arrow buttons).
+/// Scrolls one window's tab bar (arrow buttons), and tells whether tabs are hidden at either end.
 @MainActor
 final class TabScroller {
-    weak var scrollView: NSScrollView?
+    weak var scrollView: NSScrollView? {
+        didSet { if scrollView !== oldValue { watch() } }
+    }
+    /// Called (on the next turn of the main loop, never while SwiftUI lays out) when the scroll
+    /// position or the width of the tabs changed.
+    var onChange: (() -> Void)?
+    private var observers: [NSObjectProtocol] = []
+    private var changeQueued = false
+
+    /// Tabs hidden beyond the left and the right end, as the scroll view is now.
+    var hidden: (left: Bool, right: Bool) {
+        guard let scroll = scrollView else { return (false, false) }
+        return Self.edges(offset: scroll.contentView.bounds.origin.x, content: scroll.documentView?.frame.width ?? 0,
+                          visible: scroll.contentView.bounds.width)
+    }
+
+    /// Tabs hidden at either end for a scroll `offset`, the tabs' width and the width shown (half a
+    /// point of slack: offsets come out fractional on Retina screens and with rubber-banding).
+    nonisolated static func edges(offset: CGFloat, content: CGFloat, visible: CGFloat) -> (left: Bool, right: Bool) {
+        guard content > visible + 1 else { return (false, false) }
+        return (offset > 0.5, offset < content - visible - 0.5)
+    }
+
+    private func watch() {
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+        guard let scroll = scrollView else { return }
+        let clip = scroll.contentView
+        clip.postsBoundsChangedNotifications = true
+        observers.append(NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.changed() }
+        })
+        if let document = scroll.documentView {
+            document.postsFrameChangedNotifications = true
+            observers.append(NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: document, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.changed() }
+            })
+        }
+        changed()
+    }
+
+    private func changed() {
+        guard !changeQueued else { return }
+        changeQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.changeQueued = false
+            self.onChange?()
+        }
+    }
 
     func scroll(by delta: CGFloat, animated: Bool = true) {
         guard let scroll = scrollView else { return }
@@ -737,6 +783,9 @@ final class TabScroller {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.2
                 clip.animator().setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
+            } completionHandler: { [weak self] in
+                // Where the animation ended (its last step may not have been reported).
+                MainActor.assumeIsolated { self?.changed() }
             }
         } else {
             clip.setBoundsOrigin(NSPoint(x: x, y: clip.bounds.origin.y))
@@ -752,11 +801,17 @@ private struct TabArrow: View {
     let action: () -> Void
 
     var body: some View {
+        // At the end of the tabs it is not shown, but keeps its place: the tabs never move sideways
+        // as it comes and goes.
         Button(action: action) {
             Image(systemName: symbol).uiFont(size: 10, weight: .semibold).frame(width: 20, height: 24)
         }
         .buttonStyle(.borderless)
         .disabled(!enabled)
+        .opacity(enabled ? 1 : 0)
+        .allowsHitTesting(enabled)
+        .accessibilityHidden(!enabled)
+        .animation(.easeOut(duration: 0.15), value: enabled)
         .help(symbol == "chevron.left" ? "Scroll tabs left" : "Scroll tabs right")
     }
 }

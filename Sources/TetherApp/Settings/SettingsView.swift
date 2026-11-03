@@ -45,13 +45,13 @@ private struct GeneralSettings: View {
             }
             Section {
                 Toggle("Check for a new version at launch and once a day", isOn: $store.settings.checkForUpdates)
-                Toggle("Download and install updates", isOn: $store.settings.installUpdatesAutomatically)
+                Toggle("Download updates in the background", isOn: $store.settings.installUpdatesAutomatically)
                     .onChange(of: store.settings.installUpdatesAutomatically) { _, on in if !on { Updater.shared.stop() } }
                 UpdateStatusPanel(compact: true)
             } header: {
                 Text("Updates")
             } footer: {
-                Text("The check is one request to GitHub; nothing about you is sent. A newer release's source is downloaded into a temporary folder and built in the background (a few minutes the first time, much less later: only what changed is compiled again; at low priority; it needs Apple's command line tools — without them you get the release page), then installed with make install when Tether quits, or now with Restart to Update. Tabs in tmux or screen re-attach after the restart.")
+                Text("The check is one request to GitHub; nothing about you is sent. A newer release's source is downloaded into a temporary folder and built in the background (a few minutes the first time, much less later: only what changed is compiled again; at low priority; it needs Apple's command line tools — without them you get the release page), then installed with make install only when you choose Restart to Update and confirm — never by itself, also not when Tether quits. Tabs in tmux or screen re-attach after the restart.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Tabs & Windows") {

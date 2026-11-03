@@ -829,17 +829,26 @@ final class AppModel {
     /// the host and starts it. Returns the local port.
     @discardableResult
     func quickForward(_ target: ConnectionTarget, port: Int, address: String) -> Int {
-        let local = LocalPorts.isFree(port) ? port : (LocalPorts.nextFree(from: port + 1) ?? port)
-        let loopbackOrAny = ["", "*", "0.0.0.0", "::", "[::]", "::1", "[::1]"].contains(address) || address.hasPrefix("127.")
-        let f = PortForward(kind: .local, listenPort: local, destinationHost: loopbackOrAny ? "localhost" : address,
-                            destinationPort: port)
-        updateMetadata(for: target.key) { m in
-            if !(m.forwards ?? []).contains(where: { $0.kind == .local && $0.destinationPort == port }) {
-                m.forwards = (m.forwards ?? []) + [f]
-            }
+        let host = Self.quickForwardDestination(address)
+        // Already saved (the same port of the same address): that one is started.
+        if let existing = (metadata(for: target.key).forwards ?? []).first(where: {
+            $0.kind == .local && $0.destinationPort == port && $0.destinationHost == host
+        }) {
+            Task { await forwards.start(existing, on: target) }
+            return existing.listenPort
         }
+        let local = LocalPorts.isFree(port) ? port : (LocalPorts.nextFree(from: port + 1) ?? port)
+        let f = PortForward(kind: .local, listenPort: local, destinationHost: host, destinationPort: port)
+        updateMetadata(for: target.key) { m in m.forwards = (m.forwards ?? []) + [f] }
         Task { await forwards.start(f, on: target) }
         return local
+    }
+
+    /// Where a forward to a port the server listens on at `address` goes, as the server sees it:
+    /// its own localhost for loopback or all addresses, else that address.
+    static func quickForwardDestination(_ address: String) -> String {
+        let loopbackOrAny = ["", "*", "0.0.0.0", "::", "[::]", "::1", "[::1]"].contains(address) || address.hasPrefix("127.")
+        return loopbackOrAny ? "localhost" : address
     }
 
     /// Path the file browser of a host should navigate to (set by "Browse Files Here").
