@@ -241,6 +241,8 @@ public final class AskPassBridge: @unchecked Sendable {
         unlink(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
+        // Not handed down to processes Tether starts.
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
@@ -437,10 +439,30 @@ public final class AskPassBridge: @unchecked Sendable {
         cancel?(token)
     }
 
+    enum AcceptFailure: Equatable { case retryNow, retryLater, stop }
+
+    /// What a failed `accept` means for the loop: only a socket that is no longer usable ends it.
+    /// Before, any error ended it for good, and every later ssh question went unanswered.
+    static func acceptFailure(_ code: Int32) -> AcceptFailure {
+        switch code {
+        case EINTR, ECONNABORTED: .retryNow
+        case EBADF, EINVAL, ENOTSOCK, EOPNOTSUPP: .stop
+        default: .retryLater   // EMFILE, ENFILE, ENOBUFS, ENOMEM and anything passing
+        }
+    }
+
     private func acceptLoop(_ fd: Int32) {
         while true {
             let client = accept(fd, nil, nil)
-            if client < 0 { if errno == EINTR { continue }; return }
+            if client < 0 {
+                switch Self.acceptFailure(errno) {
+                case .retryNow: continue
+                // Out of descriptors or buffers for a moment, or a helper that gave up while waiting:
+                // the questions after it must still be answered.
+                case .retryLater: usleep(100_000); continue
+                case .stop: return
+                }
+            }
             // Only accept peers running as the same user, and only processes Tether started (ssh runs
             // the helper): another program of the same user that read a token from a process
             // environment cannot ask for a saved password.

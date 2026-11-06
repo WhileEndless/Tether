@@ -122,8 +122,9 @@ public final class ProcessTraffic {
     private func start() {
         let s = RemoteStream(separator: "@@end\n")
         s.onRecord = { [weak self] text in self?.ingest(text) }
-        s.onEnd = { [weak self] status, err in
-            guard let self, self.stream === s else { return }
+        // `s` weakly: the stream keeps this closure (see RemoteMonitor.startStream).
+        s.onEnd = { [weak self, weak s] status, err in
+            guard let self, let s, self.stream === s else { return }
             self.stream = nil
             if err.contains(RemoteExecutor.deviceMessage) { return }      // a device: nothing runs there
             if status != 0 && status != 15, !err.isEmpty {

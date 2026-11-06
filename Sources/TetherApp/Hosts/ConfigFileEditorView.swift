@@ -9,6 +9,8 @@ struct ConfigFileEditorView: View {
     @State private var text = ""
     @State private var original = ""
     @State private var error: String?
+    /// The file is there but could not be read: an empty editor saved would replace it.
+    @State private var readFailed = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -37,13 +39,19 @@ struct ConfigFileEditorView: View {
                 Button("Save") { save() }
                     .keyboardShortcut("s")
                     .prominentGlassButtonStyle()
-                    .disabled(text == original)
+                    .disabled(text == original || readFailed)
             }
             .padding()
         }
         .frame(width: 720, height: 560)
         .onAppear {
-            original = (try? String(contentsOf: model.settings.resolvedSSHConfigURL, encoding: .utf8)) ?? ""
+            let url = model.settings.resolvedSSHConfigURL
+            if let read = try? String(contentsOf: url, encoding: .utf8) {
+                original = read
+            } else if FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
+                readFailed = true
+                error = "The file could not be read, so it cannot be edited here."
+            }
             text = original
         }
     }

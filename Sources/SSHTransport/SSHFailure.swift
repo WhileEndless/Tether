@@ -56,6 +56,9 @@ public enum SSHFailure {
                         "could not resolve hostname", "nodename nor servname"])
     }
 
+    /// A sign-in Tether stopped because the network changed while it ran (it starts again).
+    public static let networkChangedDuringSignIn = "The network changed during the sign-in; it starts again."
+
     public static func isUnreachable(_ text: String) -> Bool {
         contains(text, ["connection timed out", "operation timed out", "connection refused", "no route to host",
                         "network is unreachable", "host is down", "could not resolve hostname",

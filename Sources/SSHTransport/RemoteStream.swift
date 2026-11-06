@@ -89,49 +89,80 @@ public final class RemoteStream: @unchecked Sendable {
         let quiet = SSHOptions.isQuietPurpose(purpose), local = executor.target.isLocal, key = executor.target.key
         let shared = executor.options.usesSharedConnection
         process.environment = ChildEnvironment.base.merging(env) { $1 }
-        let out = Pipe(), err = Pipe(), input = Pipe()
-        process.standardOutput = out
-        process.standardError = err
-        process.standardInput = input
+        let askPass = env
+        // Checked pipes: with no descriptor left, the stream fails instead of crashing the app.
+        guard let out = ChildPipe(), let err = ChildPipe(), let input = ChildPipe() else {
+            AskPassBridge.shared.revoke(environment: askPass)
+            DispatchQueue.main.async { self.onEnd?(-1, ChildPipe.unavailableMessage) }
+            return
+        }
+        process.standardOutput = out.write
+        process.standardError = err.write
+        process.standardInput = input.read
         let errData = ErrorBuffer()
-        err.fileHandleForReading.readabilityHandler = { h in
-            let chunk = h.availableData
-            // At end of file the handler would otherwise fire continuously.
-            if chunk.isEmpty { h.readabilityHandler = nil } else { errData.append(chunk) }
-        }
-        out.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let chunk = h.availableData
-            if chunk.isEmpty { h.readabilityHandler = nil; return }
-            self?.consume(chunk)
-        }
+        let drain = OutputDrain(ends: 2)
         process.terminationHandler = { [weak self] p in
-            err.fileHandleForReading.readabilityHandler = nil
             let status = p.terminationStatus
-            let text = errData.text
-            // Only a stream that never delivered anything can have failed to sign in (one that ran
-            // for hours and then lost its network did not). Through a shared connection it cannot
-            // have tried to sign in at all.
-            if quiet, !local, !shared, self?.receivedAny != true { BackgroundSignIn.shared.noteQuietResult(key, status: status, stderr: text) }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                AskPassBridge.shared.revoke(environment: self.env)
-                self.onEnd?(status, text)
+            // Held only until it is answered (1.5 s at most).
+            let stream = self
+            // The last records and messages are read first — not for long: a backgrounded
+            // ControlMaster may hold the pipes open. Then nothing keeps them (they close).
+            drain.whenDrained(limit: 1.5) {
+                out.read.readabilityHandler = nil
+                err.read.readabilityHandler = nil
+                let text = errData.text
+                // Only a stream that never delivered anything can have failed to sign in (one that ran
+                // for hours and then lost its network did not). Through a shared connection it cannot
+                // have tried to sign in at all.
+                let receivedAny = stream.map { s in s.lock.withLock { s.receivedAny } } ?? false
+                if quiet, !local, !shared, !receivedAny { BackgroundSignIn.shared.noteQuietResult(key, status: status, stderr: text) }
+                DispatchQueue.main.async {
+                    AskPassBridge.shared.revoke(environment: askPass)
+                    guard let stream else { return }
+                    stream.onEnd?(status, text)
+                    // Nothing more comes; whatever the owner's closures hold is let go.
+                    stream.onEnd = nil
+                    stream.onRecord = nil
+                }
             }
         }
         do {
             try process.run()
-            AskPassBridge.shared.bindToken(env, pid: process.processIdentifier)
-            // Stopped while the connection was being prepared: nothing more to do.
-            if lock.withLock({ stopped }) { process.terminate(); return }
-            let data = stdinData
-            // Off the caller's thread (often the main one): a script larger than the pipe's buffer
-            // would wait there until the far end reads it, however slow its host is.
-            DispatchQueue.global().async {
-                try? input.fileHandleForWriting.write(contentsOf: data)
-                try? input.fileHandleForWriting.close()
-            }
         } catch {
+            process.terminationHandler = nil
+            for p in [out, err, input] { p.closeBoth() }
+            AskPassBridge.shared.revoke(environment: askPass)
             DispatchQueue.main.async { self.onEnd?(-1, error.localizedDescription) }
+            return
+        }
+        // The child has its ends now; Tether's copies would keep the pipes from ending.
+        out.closeChildEnd(output: true)
+        err.closeChildEnd(output: true)
+        input.closeChildEnd(output: false)
+        err.read.readabilityHandler = { h in
+            let chunk = h.availableData
+            // At end of file the handler would otherwise fire continuously.
+            if chunk.isEmpty { h.readabilityHandler = nil; drain.reachedEnd() } else { errData.append(chunk) }
+        }
+        out.read.readabilityHandler = { [weak self] h in
+            let chunk = h.availableData
+            if chunk.isEmpty { h.readabilityHandler = nil; drain.reachedEnd(); return }
+            self?.consume(chunk)
+        }
+        AskPassBridge.shared.bindToken(env, pid: process.processIdentifier)
+        // Stopped while the connection was being prepared: nothing more to do (its input is closed,
+        // so it ends at once even if the signal is late).
+        if lock.withLock({ stopped }) {
+            try? input.write.close()
+            process.terminate()
+            return
+        }
+        let data = stdinData
+        // Off the caller's thread (often the main one): a script larger than the pipe's buffer
+        // would wait there until the far end reads it, however slow its host is.
+        DispatchQueue.global().async {
+            try? input.write.write(contentsOf: data)
+            try? input.write.close()
         }
     }
 

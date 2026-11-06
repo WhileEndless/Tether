@@ -93,6 +93,8 @@ final class ArchiveJob: TransferJob {
         let producer: Process
         let consumer: Process
         let tool = method?.program
+        /// Between the compressor and ssh (closed here once both started).
+        var wires: [ChildPipe] = []
         switch item.direction {
         case .upload:
             let mark = FileManager.default.temporaryDirectory.appendingPathComponent("tether-end-\(item.id.uuidString)", isDirectory: true)
@@ -110,9 +112,10 @@ final class ArchiveJob: TransferJob {
             if let tool, let path = Self.localPath(tool) {
                 // Counted here, compressed on the way to ssh.
                 let coder = Self.process(path, ["-1", "-c"])
-                let wire = Pipe()
-                coder.standardOutput = wire
-                remote.standardInput = wire
+                guard let wire = ChildPipe() else { fail(ChildPipe.unavailableMessage); return }
+                coder.standardOutput = wire.write
+                remote.standardInput = wire.read
+                wires.append(wire)
                 extra = remote
                 consumer = coder
             } else {
@@ -134,9 +137,10 @@ final class ArchiveJob: TransferJob {
             if let tool, let path = Self.localPath(tool) {
                 // Uncompressed as it arrives, then counted.
                 let coder = Self.process(path, ["-d", "-c"])
-                let wire = Pipe()
-                remote.standardOutput = wire
-                coder.standardInput = wire
+                guard let wire = ChildPipe() else { cleanUpStaging(); fail(ChildPipe.unavailableMessage); return }
+                remote.standardOutput = wire.write
+                coder.standardInput = wire.read
+                wires.append(wire)
                 extra = remote
                 producer = coder
             } else {
@@ -149,43 +153,58 @@ final class ArchiveJob: TransferJob {
 
         let extra = self.extra
         let all = [producer, consumer] + (extra.map { [$0] } ?? [])
+        // Checked pipes: with no descriptor left, the transfer fails instead of crashing the app.
+        let errors = ErrorCollector { [weak self] stage in
+            Task { @MainActor in self?.serverSays(stage) }
+        }
+        errorCollector = errors
+        var errorEnds: [FileHandle] = []
+        for _ in all {
+            guard let end = errors.attach() else { break }
+            errorEnds.append(end)
+        }
+        guard let pipeOut = ChildPipe(), let pipeIn = ChildPipe(), errorEnds.count == all.count else {
+            wires.forEach { $0.closeBoth() }
+            cleanUpStaging()
+            fail(ChildPipe.unavailableMessage)
+            return
+        }
+        for (p, end) in zip(all, errorEnds) { p.standardError = end }
+        producer.standardOutput = pipeOut.write
+        consumer.standardInput = pipeIn.read
+        if extra == nil || item.direction == .download { consumer.standardOutput = FileHandle.nullDevice }
+        if extra == nil || item.direction == .upload { producer.standardInput = FileHandle.nullDevice }
+        if let extra, item.direction == .upload { extra.standardOutput = FileHandle.nullDevice }
+        if let extra, item.direction == .download { extra.standardInput = FileHandle.nullDevice }
         let group = DispatchGroup()
         for p in all {
             group.enter()
             p.terminationHandler = { _ in group.leave() }
         }
-        let pipeOut = Pipe(), pipeIn = Pipe()
-        producer.standardOutput = pipeOut
-        consumer.standardInput = pipeIn
-        // The server's script says where it is (unpacked, moving into place, removing its folder).
-        let errors = ErrorCollector { [weak self] stage in
-            Task { @MainActor in self?.serverSays(stage) }
-        }
-        errorCollector = errors
-        for p in all { p.standardError = errors.attach() }
-        if extra == nil || item.direction == .download { consumer.standardOutput = FileHandle.nullDevice }
-        if extra == nil || item.direction == .upload { producer.standardInput = FileHandle.nullDevice }
-        if let extra, item.direction == .upload { extra.standardOutput = FileHandle.nullDevice }
-        if let extra, item.direction == .download { extra.standardInput = FileHandle.nullDevice }
+        var started = 0
         do {
             // From the far end back: each one's reader is there before its writer starts.
-            for p in all.reversed() { try p.run() }
+            for p in all.reversed() { try p.run(); started += 1 }
             for p in all { AskPassBridge.shared.bindToken(environment, pid: p.processIdentifier) }
         } catch {
+            // Those that never started never end: their part of the group is given back here (a
+            // group let go while waiting ends the app).
+            for p in all.reversed().dropFirst(started) { p.terminationHandler = nil; group.leave() }
             // Only a process that started can be stopped (stopping one that never ran ends the app).
             for p in all where p.isRunning { p.terminate() }
+            for pipe in [pipeOut, pipeIn] + wires { pipe.closeBoth() }
+            errors.closeChildEnds()
             cleanUpStaging()
             fail(error.localizedDescription)
             return
         }
         // The pipe ends this process does not use must be closed, or EOF never arrives.
-        try? pipeOut.fileHandleForWriting.close()
-        try? pipeIn.fileHandleForReading.close()
-        for end in [extra?.standardInput, extra?.standardOutput] {
-            if let wire = end as? Pipe {
-                try? wire.fileHandleForReading.close()
-                try? wire.fileHandleForWriting.close()
-            }
+        pipeOut.closeChildEnd(output: true)
+        pipeIn.closeChildEnd(output: false)
+        errors.closeChildEnds()
+        for wire in wires {
+            try? wire.read.close()
+            try? wire.write.close()
         }
 
         // Nothing moving for too long (a connection gone silent, a server that stopped reading):
@@ -197,13 +216,13 @@ final class ArchiveJob: TransferJob {
         watchdog.start()
 
         group.enter()
-        let readFD = pipeOut.fileHandleForReading.fileDescriptor
-        let writeFD = pipeIn.fileHandleForWriting.fileDescriptor
+        let readFD = pipeOut.read.fileDescriptor
+        let writeFD = pipeIn.write.fileDescriptor
         pump.run(from: readFD, to: writeFD, progress: { [weak self] bytes in
             Task { @MainActor in self?.update(bytes) }
         }, done: { [weak self] in
-            try? pipeOut.fileHandleForReading.close()
-            try? pipeIn.fileHandleForWriting.close()
+            try? pipeOut.read.close()
+            try? pipeIn.write.close()
             // The far end now finishes (unpacks, moves into place): that counts as moving.
             Task { @MainActor in
                 self?.watchdog?.activity(warm: true)
@@ -377,6 +396,8 @@ final class ArchiveJob: TransferJob {
     private func fail(_ message: String) {
         guard !finished else { return }
         finished = true
+        // Its error pipes are let go too (they would otherwise stay open, waiting for an end).
+        errorCollector?.close()
         removeEndMark()
         item.finishedAt = Date()
         item.state = .failed(message)
@@ -641,31 +662,57 @@ final class ErrorCollector: @unchecked Sendable {
         self.onStage = onStage
     }
 
-    private var pipes: [Pipe] = []
+    /// One stderr pipe: its reads and its closing never overlap (a read of a closed handle raises).
+    private final class Source: @unchecked Sendable {
+        let pipe: ChildPipe
+        let lock = NSLock()
+        var closed = false
+        init(_ pipe: ChildPipe) { self.pipe = pipe }
+    }
+    private var sources: [Source] = []
 
     /// Stops reading: the far end's next line then fails, as when ssh's channel closes.
     func close() {
         lock.lock()
-        let all = pipes
-        pipes.removeAll()
+        let all = sources
+        sources.removeAll()
         lock.unlock()
-        for pipe in all {
-            pipe.fileHandleForReading.readabilityHandler = nil
-            try? pipe.fileHandleForReading.close()
+        for s in all {
+            s.lock.lock()
+            if !s.closed {
+                s.closed = true
+                s.pipe.read.readabilityHandler = nil
+                try? s.pipe.read.close()
+            }
+            s.lock.unlock()
+            try? s.pipe.write.close()
         }
     }
 
-    func attach() -> Pipe {
-        let pipe = Pipe()
-        lock.lock(); pipes.append(pipe); lock.unlock()
+    /// Once the processes started: Tether's copies of their ends are closed, so each pipe ends
+    /// when its process does.
+    func closeChildEnds() {
+        lock.lock(); let all = sources; lock.unlock()
+        for s in all { try? s.pipe.write.close() }
+    }
+
+    /// The end a process writes its errors to; nil when the system has no descriptor left.
+    func attach() -> FileHandle? {
+        guard let pipe = ChildPipe() else { return nil }
+        let source = Source(pipe)
+        lock.lock(); sources.append(source); lock.unlock()
         final class Pending: @unchecked Sendable { var line = Data() }
         let pending = Pending()
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+        pipe.read.readabilityHandler = { [weak self] h in
+            source.lock.lock()
+            guard !source.closed else { source.lock.unlock(); return }
             let chunk = h.availableData
             if chunk.isEmpty {
                 h.readabilityHandler = nil
+                source.lock.unlock()
                 return
             }
+            source.lock.unlock()
             guard let self else { return }
             self.lock.lock()
             self.data.append(chunk)
@@ -681,7 +728,7 @@ final class ErrorCollector: @unchecked Sendable {
             }
             if pending.line.count > 4096 { pending.line.removeAll() }
         }
-        return pipe
+        return pipe.write
     }
 
     var text: String {
@@ -780,6 +827,7 @@ enum TransferFailure {
         isConnectionFailure(message) || waitsForUser(message) || message.contains("refused one more session")
             || message.hasPrefix("The jump host could not reach")
             || SSHFailure.isNetwork(message) || SSHFailure.isUnreachable(message)
+            || message.contains(SSHFailure.networkChangedDuringSignIn)
     }
 
     /// Its sign-in was stopped (nobody there to answer, Tether locked): tried again once someone is.

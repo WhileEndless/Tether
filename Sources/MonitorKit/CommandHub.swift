@@ -169,16 +169,21 @@ public final class CommandHub {
         guard !anchors.isEmpty else { return }
         guard await executor.backgroundWorkAllowed() else { return }
         let platform = await executor.resolvedPlatform(quiet: true)
+        // Stopped (no terminals left, the Mac going to sleep) or another round started one while this
+        // one waited: a watcher started now would run on with nobody to stop it.
+        guard !Task.isCancelled, watcher == nil else { return }
         let s = RemoteStream(separator: "\n")
         watched = covered.map(\.id)
         watchedAnchors = anchors
         // Lines still queued from a watcher that was replaced would map to the new tab list: dropped.
-        s.onRecord = { [weak self] line in
-            guard let self, self.watcher === s else { return }
+        // `s` weakly: the stream keeps these closures, and a strong reference would keep it (its ssh
+        // process and pipes) alive for ever.
+        s.onRecord = { [weak self, weak s] line in
+            guard let self, let s, self.watcher === s else { return }
             self.watcherSaid(line)
         }
-        s.onEnd = { [weak self] status, err in
-            guard let self, self.watcher === s else { return }
+        s.onEnd = { [weak self, weak s] status, err in
+            guard let self, let s, self.watcher === s else { return }
             self.watcher = nil
             self.watched = []
             self.watchedAnchors = []

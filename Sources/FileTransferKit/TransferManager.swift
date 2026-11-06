@@ -1446,6 +1446,8 @@ final class ScpJob: TransferJob {
         self.bridge = bridge
         let p = LocalProcess(delegate: bridge, dispatchQueue: .main)
         process = p
+        // Nothing Tether has open is handed to scp (fork and exec pass on all).
+        ChildDescriptors.closeOnExecAboveStdio()
         p.startProcess(executable: executable, args: arguments, environment: env.map { "\($0.key)=\($0.value)" })
         guard p.running, p.shellPid > 0 else {
             // No pseudo terminal or process could be made: nothing will ever report back.

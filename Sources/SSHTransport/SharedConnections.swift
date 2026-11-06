@@ -92,9 +92,15 @@ public actor SharedConnections {
 
     private final class Sentinel {
         let process: Process
-        let input: Pipe
+        let input: ChildPipe
         let id = UUID()
-        init(process: Process, input: Pipe) { self.process = process; self.input = input }
+        init(process: Process, input: ChildPipe) { self.process = process; self.input = input }
+
+        /// Ends its channel: stopped, and its input closed (so it also ends if the signal is late).
+        func end() {
+            if process.isRunning { process.terminate() }
+            try? input.write.close()
+        }
     }
 
     private var resolutions: [String: Resolution] = [:]
@@ -481,7 +487,11 @@ public actor SharedConnections {
             sentinelRestarts[socket] = nil
             finish(login, socket: socket, .ready(options, reused: false))
             startSentinel(target: target, options: options)
-        case .failure(let message, let log):
+        case .failure(let launcherMessage, let log):
+            // Stopped because the network changed under it: said so, so tabs wait for the next try
+            // instead of counting it as a failed sign-in (a few of those end a new tab).
+            let message = login.networkChanged && launcherMessage == MasterLauncher.stoppedMessage
+                ? SSHFailure.networkChangedDuringSignIn : launcherMessage
             let steps = launcher.milestones
             let last = log.suffix(3).filter { !steps.contains($0) }
             // ssh's words (host names, addresses) go in the detail: private in macOS's log.
@@ -521,7 +531,7 @@ public actor SharedConnections {
         guard let socket = await socket(for: target, options: options) else { return false }
         withoutSentinel.insert(socket)
         guard let s = sentinels.removeValue(forKey: socket) else { return false }
-        if s.process.isRunning { s.process.terminate() }
+        s.end()
         ConnectionLog.shared.notice("The server allows few sessions; the silent channel gave way to a tab", host: target.key)
         return true
     }
@@ -626,7 +636,7 @@ public actor SharedConnections {
     /// the next `prepare` checks again instead of trusting what it saw.
     public func forget(socket: String) {
         confirmed[socket] = nil
-        if let s = sentinels.removeValue(forKey: socket), s.process.isRunning { s.process.terminate() }
+        sentinels.removeValue(forKey: socket)?.end()
     }
 
     /// Host settings changed (ssh_config, a host edited): sockets are worked out again.
@@ -824,20 +834,30 @@ public actor SharedConnections {
         p.arguments = options.commonOptions() + ["-T", "-o", "BatchMode=yes"] + options.destination(target) + [command]
         let askPass = AskPassBridge.shared.refusingEnvironment(targetKey: target.key, purpose: "sentinel")
         p.environment = ChildEnvironment.base.merging(askPass) { $1 }
-        let input = Pipe()
-        p.standardInput = input
+        // Checked: with no descriptor left, there is simply no sentinel (instead of a crash).
+        guard let input = ChildPipe() else { AskPassBridge.shared.revoke(environment: askPass); return }
+        p.standardInput = input.read
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         let sentinel = Sentinel(process: p, input: input)
+        // Its id only: the process keeps this handler, and the sentinel (which holds the process)
+        // must not be kept by it.
+        let id = sentinel.id
         p.terminationHandler = { _ in
             AskPassBridge.shared.revoke(environment: askPass)
-            Task { await self.sentinelEnded(socket, id: sentinel.id, target: target, options: options) }
+            Task { await self.sentinelEnded(socket, id: id, target: target, options: options) }
         }
-        do { try p.run() } catch { AskPassBridge.shared.revoke(environment: askPass); return }
+        do { try p.run() } catch {
+            p.terminationHandler = nil
+            input.closeBoth()
+            AskPassBridge.shared.revoke(environment: askPass)
+            return
+        }
+        input.closeChildEnd(output: false)
         if platform.isWindows {
             // The launcher reads its script from the first line; ReadToEnd then waits for the end
             // of input, which never comes while Tether runs.
-            try? input.fileHandleForWriting.write(contentsOf: PowerShell.input("$null=[Console]::In.ReadToEnd()", arguments: []))
+            try? input.write.write(contentsOf: PowerShell.input("$null=[Console]::In.ReadToEnd()", arguments: []))
         }
         sentinels[socket] = sentinel
     }
@@ -845,7 +865,7 @@ public actor SharedConnections {
     private func sentinelEnded(_ socket: String, id: UUID, target: ConnectionTarget, options: SSHOptions) async {
         // An older channel ending after a new one took its place changes nothing.
         guard sentinels[socket]?.id == id else { return }
-        sentinels[socket] = nil
+        sentinels.removeValue(forKey: socket)?.end()
         guard !closing else { return }
         if Self.isSocket(socket), case .alive = await Self.check(socket, ssh: options.sshBinary) {
             // The connection is fine; only the channel ended (the server limits sessions, someone
@@ -932,7 +952,7 @@ public actor SharedConnections {
     }
 
     private func stopSentinels() {
-        for s in sentinels.values where s.process.isRunning { s.process.terminate() }
+        for s in sentinels.values { s.end() }
         sentinels = [:]
     }
 

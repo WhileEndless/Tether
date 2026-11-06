@@ -23,7 +23,6 @@ public enum ProcessRunner {
         /// More output came than the caller allows: the rest is not kept, and the process is stopped.
         var overflowed = false
         let maxOutput: Int
-        let group = DispatchGroup()
 
         init(maxOutput: Int) { self.maxOutput = maxOutput }
 
@@ -99,6 +98,14 @@ public enum ProcessRunner {
     /// Set by `terminateAll`: what is asked for after that is not started.
     nonisolated(unsafe) private static var quitting = false
 
+    /// A run's output pipes, until it ends.
+    private final class PipeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pipes: [ChildPipe]
+        init(_ pipes: [ChildPipe]) { self.pipes = pipes }
+        func take() -> [ChildPipe] { lock.withLock { defer { pipes = [] }; return pipes } }
+    }
+
     private final class ProcessBox: @unchecked Sendable {
         let process: Process
         init(_ process: Process) { self.process = process }
@@ -109,92 +116,113 @@ public enum ProcessRunner {
                             input: Data?, timeout: TimeInterval, stopOnCancel: Bool,
                             waitWhile: (@Sendable () -> Bool)?, maxOutput: Int) async -> ProcessResult {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcessResult, Never>) in
+            func refuse(_ message: String) {
+                cont.resume(returning: ProcessResult(status: -1, stdout: Data(), stderr: Data(message.utf8), timedOut: false))
+            }
+            // Checked pipes: with no descriptor left, the command fails instead of crashing the app.
+            guard let outPipe = ChildPipe(), let errPipe = ChildPipe() else { return refuse(ChildPipe.unavailableMessage) }
+            var inPipe: ChildPipe?
+            if input != nil {
+                guard let p = ChildPipe() else { return refuse(ChildPipe.unavailableMessage) }
+                inPipe = p
+            }
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
             process.environment = ChildEnvironment.base.merging(environment ?? [:]) { $1 }
-            let outPipe = Pipe(), errPipe = Pipe(), inPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            process.standardInput = input == nil ? FileHandle.nullDevice : inPipe
+            process.standardOutput = outPipe.write
+            process.standardError = errPipe.write
+            process.standardInput = inPipe?.read ?? FileHandle.nullDevice
 
             let c = Collector(maxOutput: max(maxOutput, 0))
-            for (pipe, isErr) in [(outPipe, false), (errPipe, true)] {
-                c.group.enter()
-                pipe.fileHandleForReading.readabilityHandler = { h in
-                    let chunk = h.availableData
-                    if chunk.isEmpty {
-                        h.readabilityHandler = nil
-                        c.group.leave()
-                    } else if !c.append(chunk, isError: isErr), process.isRunning {
-                        // Read on (and dropped) until it ends, so it is never stuck writing to a full pipe.
-                        process.terminate()
-                    }
-                }
+            let drain = OutputDrain(ends: 2)
+            // Let go of when the run ends: closures that outlive it (its timeout) keep only this box.
+            let ends = PipeBox([outPipe, errPipe])
+            /// The one way out, whichever path ends the run first: the handlers go (nothing keeps the
+            /// pipes alive after that, so they close), the process lets go of this run, and the caller
+            /// is answered.
+            @Sendable func finish(status: Int32) {
+                for p in ends.take() { p.read.readabilityHandler = nil }
+                process.terminationHandler = nil
+                runningLock.withLock { _ = running.removeValue(forKey: ObjectIdentifier(process)) }
+                cont.resume(returning: c.result(status: status))
             }
 
             process.terminationHandler = { p in
                 runningLock.withLock { _ = running.removeValue(forKey: ObjectIdentifier(p)) }
                 guard c.markFinished() else { return }
                 let status = p.terminationStatus
-                // Wait briefly for pipes to drain; a backgrounded ControlMaster may hold them open.
-                DispatchQueue.global().async {
-                    _ = c.group.wait(timeout: .now() + 1.5)
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    cont.resume(returning: c.result(status: status))
-                }
+                // What is still in the pipes is read first; a backgrounded ControlMaster may hold them
+                // open, so not for long.
+                drain.whenDrained(limit: 1.5) { finish(status: status) }
+            }
+            let refused = runningLock.withLock { () -> Bool in
+                if quitting { return true }
+                running[ObjectIdentifier(process)] = process
+                return false
+            }
+            if refused {
+                process.terminationHandler = nil
+                ends.take().forEach { $0.closeBoth() }
+                inPipe?.closeBoth()
+                return refuse("Tether is quitting")
             }
             do {
-                let refused = runningLock.withLock { () -> Bool in
-                    if quitting { return true }
-                    running[ObjectIdentifier(process)] = process
-                    return false
-                }
-                if refused {
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    cont.resume(returning: ProcessResult(status: -1, stdout: Data(), stderr: Data("Tether is quitting".utf8), timedOut: false))
-                    return
-                }
                 try process.run()
-                if let environment { AskPassBridge.shared.bindToken(environment, pid: process.processIdentifier) }
-                // Cancelled before it started: the handler found nothing running to stop.
-                if stopOnCancel, Task.isCancelled { process.terminate() }
             } catch {
                 runningLock.withLock { _ = running.removeValue(forKey: ObjectIdentifier(process)) }
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                cont.resume(returning: ProcessResult(status: -1, stdout: Data(),
-                                                     stderr: Data(error.localizedDescription.utf8), timedOut: false))
-                return
+                process.terminationHandler = nil
+                ends.take().forEach { $0.closeBoth() }
+                inPipe?.closeBoth()
+                return refuse(error.localizedDescription)
             }
-            if let input {
+            // The child has its ends now; Tether's copies would keep the pipes from ending.
+            outPipe.closeChildEnd(output: true)
+            errPipe.closeChildEnd(output: true)
+            inPipe?.closeChildEnd(output: false)
+            for (pipe, isErr) in [(outPipe, false), (errPipe, true)] {
+                pipe.read.readabilityHandler = { [weak process] h in
+                    let chunk = h.availableData
+                    if chunk.isEmpty {
+                        h.readabilityHandler = nil
+                        drain.reachedEnd()
+                    } else if !c.append(chunk, isError: isErr), let process, process.isRunning {
+                        // Read on (and dropped) until it ends, so it is never stuck writing to a full pipe.
+                        process.terminate()
+                    }
+                }
+            }
+            if let environment { AskPassBridge.shared.bindToken(environment, pid: process.processIdentifier) }
+            // Cancelled before it started: the handler found nothing running to stop.
+            if stopOnCancel, Task.isCancelled { process.terminate() }
+            if let input, let inPipe {
                 DispatchQueue.global().async {
-                    try? inPipe.fileHandleForWriting.write(contentsOf: input)
-                    try? inPipe.fileHandleForWriting.close()
+                    // A child that ended without reading it: an error (EPIPE), not a signal.
+                    try? inPipe.write.write(contentsOf: input)
+                    try? inPipe.write.close()
                 }
             }
             if timeout > 0 {
-                @Sendable func expire() {
-                    guard process.isRunning else { return }
+                // Weakly: a command that ended long before its timeout must not be kept (with its
+                // pipes) until then.
+                @Sendable func expire(_ process: Process?) {
+                    guard let process, process.isRunning else { return }
                     if let waitWhile, waitWhile() {
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { expire() }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [weak process] in expire(process) }
                         return
                     }
                     c.lock.lock(); c.timedOut = true; c.lock.unlock()
                     process.terminate()
                     // A process that ignores SIGTERM (stopped, or trapping it) must not keep its caller
                     // waiting: killed, and the caller answered, whatever happens to it.
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                        let pid = process.processIdentifier
-                        if process.isRunning, pid > 1 { kill(pid, SIGKILL) }
+                    let pid = process.processIdentifier
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak process] in
+                        guard let process, process.isRunning else { return }
+                        if pid > 1 { kill(pid, SIGKILL) }
                         guard c.markFinished() else { return }
-                        outPipe.fileHandleForReading.readabilityHandler = nil
-                        errPipe.fileHandleForReading.readabilityHandler = nil
-                        cont.resume(returning: c.result(status: -9))
+                        finish(status: -9)
                     }
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { expire() }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak process] in expire(process) }
             }
         }
     }

@@ -1590,7 +1590,8 @@ exit 1
         let message = progress?.failure ?? fallback
         lastError = message
         let permanent = progress.map { Self.failedForGood($0.sshSaid, attempt: attempt) } ?? false
-        let unreachable = ConnectionProgress.isUnreachable(fallback)
+        // A sign-in stopped by a network change is waited for like a server that did not answer.
+        let unreachable = ConnectionProgress.isUnreachable(fallback) || fallback == SSHFailure.networkChangedDuringSignIn
             || (progress.map { p in p.log.contains { ConnectionProgress.isUnreachable($0) } } ?? false)
         // A new tab gives up after a few failures that will not pass by themselves; a server that
         // does not answer is waited for like any other (it may come back), in the server's rounds.
@@ -1662,10 +1663,13 @@ exit 1
         bridge.process = process
         self.process = process
         if local { env["PATH"] = ChildEnvironment.local["PATH"] }
+        // Nothing Tether has open is handed to the terminal's program (fork and exec pass on all).
+        ChildDescriptors.closeOnExecAboveStdio()
         // A Finder-launched app runs in "/": local shells start in the home folder like Terminal.app.
         process.startProcess(executable: executable, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: local ? "sh" : "ssh",
                              currentDirectory: local ? (descriptor.initialDirectory ?? NSHomeDirectory()) : nil)
+        guard process.running else { return terminalDidNotStart() }
         AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
         if !local { watchForMissingMarker(process) }
         if !local, options.usesSharedConnection { watchForSilentStart(process) }
@@ -1801,8 +1805,10 @@ exit 1
         let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
         bridge.process = process
         self.process = process
+        ChildDescriptors.closeOnExecAboveStdio()
         process.startProcess(executable: options.sshBinary, args: args,
                              environment: env.map { "\($0.key)=\($0.value)" }, execName: "ssh")
+        guard process.running else { return terminalDidNotStart() }
         AskPassBridge.shared.bindToken(askPassEnv, pid: process.shellPid)
         if options.usesSharedConnection { watchForSilentStart(process) }
         markerResolved = true
@@ -2035,6 +2041,14 @@ exit 1
     nonisolated static func exitStatus(fromWaitStatus raw: Int32?) -> Int32? {
         guard let raw else { return nil }
         return raw & 0x7f == 0 ? (raw >> 8) & 0xff : 255
+    }
+
+    /// The terminal's program could not be started (no pseudo-terminal, descriptor or process left):
+    /// SwiftTerm says nothing then. Ended at once like an attempt that got no answer — tried again in
+    /// the usual rounds — instead of the tab waiting on "Connecting" for ever.
+    private func terminalDidNotStart() {
+        stalledAttempt = "Tether could not start the connection (too many files or processes open). It tries again shortly."
+        processTerminated(exitCode: nil)
     }
 
     fileprivate func processTerminated(exitCode: Int32?) {

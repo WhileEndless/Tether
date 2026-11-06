@@ -5,6 +5,19 @@ import Foundation
 public struct SSHConfigLibrary: Sendable {
     public private(set) var documents: [SSHConfigDocument]
     public let mainURL: URL
+    /// Files that exist but could not be read at the last load (no file descriptor left, no
+    /// permission, not UTF-8). Their hosts are kept from the load before, if there was one, and they
+    /// are never written: what Tether holds for them is not what is on disk.
+    public private(set) var unreadable: Set<String> = []
+
+    /// An edit of a file that could not be read: refused, so the file is never replaced by an empty
+    /// or outdated copy.
+    public struct UnreadableFile: LocalizedError, Equatable {
+        public let path: String
+        public var errorDescription: String? {
+            "\((path as NSString).abbreviatingWithTildeInPath) could not be read, so Tether did not change it. Check the file and try again."
+        }
+    }
 
     public init(mainURL: URL) {
         self.mainURL = mainURL
@@ -13,18 +26,37 @@ public struct SSHConfigLibrary: Sendable {
     }
 
     public mutating func reload() {
-        var docs: [SSHConfigDocument] = []
-        var visited = Set<String>()
-        Self.load(url: mainURL, depth: 0, into: &docs, visited: &visited)
-        documents = docs
+        reload(read: { try String(contentsOf: $0, encoding: .utf8) })
     }
 
-    private static func load(url: URL, depth: Int, into docs: inout [SSHConfigDocument], visited: inout Set<String>) {
+    /// - Parameter read: reads one file (replaced in tests).
+    mutating func reload(read: (URL) throws -> String) {
+        var docs: [SSHConfigDocument] = []
+        var visited = Set<String>()
+        var failed = Set<String>()
+        // A file that could not be read this time keeps what was read of it before, Includes and all
+        // (hosts do not vanish because of a passing error).
+        let previous = Dictionary(documents.compactMap { d in d.sourceURL.map { ($0.standardizedFileURL.path, d) } },
+                                  uniquingKeysWith: { a, _ in a })
+        Self.load(url: mainURL, depth: 0, into: &docs, visited: &visited, failed: &failed, previous: previous, read: read)
+        documents = docs
+        unreadable = failed
+    }
+
+    private static func load(url: URL, depth: Int, into docs: inout [SSHConfigDocument], visited: inout Set<String>,
+                             failed: inout Set<String>, previous: [String: SSHConfigDocument], read: (URL) throws -> String) {
         let path = url.standardizedFileURL.path
         guard depth < 8, !visited.contains(path) else { return }
         visited.insert(path)
-        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let doc = SSHConfigDocument(text: text, sourceURL: url)
+        let doc: SSHConfigDocument
+        if !FileManager.default.fileExists(atPath: path) {
+            doc = SSHConfigDocument(text: "", sourceURL: url)       // not there (yet): nothing in it
+        } else if let text = try? read(url) {
+            doc = SSHConfigDocument(text: text, sourceURL: url)
+        } else {
+            failed.insert(path)
+            doc = previous[path] ?? SSHConfigDocument(text: "", sourceURL: url)
+        }
         docs.append(doc)
         for (i, line) in doc.lines.enumerated() {
             _ = i
@@ -32,7 +64,7 @@ public struct SSHConfigLibrary: Sendable {
                   key.caseInsensitiveCompare("Include") == .orderedSame else { continue }
             for pattern in SSHConfigDocument.tokenize(value) {
                 for included in expandInclude(pattern) {
-                    load(url: included, depth: depth + 1, into: &docs, visited: &visited)
+                    load(url: included, depth: depth + 1, into: &docs, visited: &visited, failed: &failed, previous: previous, read: read)
                 }
             }
         }
@@ -90,6 +122,7 @@ public struct SSHConfigLibrary: Sendable {
         if documents.isEmpty { documents = [SSHConfigDocument(text: "", sourceURL: mainURL)] }
         let index = documentIndex(for: alias)
         var doc = documents[index]
+        if let path = doc.sourceURL?.standardizedFileURL.path, unreadable.contains(path) { throw UnreadableFile(path: path) }
         try change(&doc)
         try Self.write(doc, backupDirectory: backupDirectory)
         documents[index] = doc

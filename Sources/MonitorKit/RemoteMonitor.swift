@@ -195,8 +195,10 @@ public final class RemoteMonitor {
         restartTask?.cancel()
         let s = RemoteStream(separator: "@@end\n")
         s.onRecord = { [weak self] text in self?.ingest(text) }
-        s.onEnd = { [weak self] status, err in
-            guard let self, self.stream === s else { return }
+        // `s` weakly: the stream keeps this closure, and a strong reference would keep the stream (its
+        // ssh process and pipes) alive for ever.
+        s.onEnd = { [weak self, weak s] status, err in
+            guard let self, let s, self.stream === s else { return }
             self.stream = nil
             self.isStreaming = false
             // A network device or limited shell: nothing was sent, and nothing will be.

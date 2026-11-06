@@ -104,7 +104,8 @@ should not be forgotten by a firewall or router on the way:
   the next round. The rounds start afresh, and every waiting tab tries at once, when the network
   comes back or changes, when another tab to that server connects, and for the tab you press
   *Reconnect Now* on. A new tab waits for such a server too, instead of giving up (an unknown host
-  name or a changed host key still end it). A wrong password or a cancelled question is not the
+  name or a changed host key still end it, and a sign-in Tether restarted because the network changed
+  under it counts as no answer, not as a failed sign-in). A wrong password or a cancelled question is not the
   server's absence: it pauses only that tab until you press Reconnect, and the server's other tabs
   go on with their own sign-ins. Host panels ask
   a server that does not answer less and less often in the same way, and at once when a tab to it
