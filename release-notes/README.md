@@ -2,6 +2,7 @@
 
 One file per version, named `vX.Y.Z.md`, starting with 0.2.0. Earlier versions (0.1.0, 0.1.1) have no notes file; see their git tags.
 
+- [0.10.4](v0.10.4.md)
 - [0.10.3](v0.10.3.md)
 - [0.10.2](v0.10.2.md)
 - [0.10.1](v0.10.1.md)

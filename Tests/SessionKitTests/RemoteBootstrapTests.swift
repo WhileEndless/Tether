@@ -4,6 +4,12 @@ import TestSupport
 @testable import SessionKit
 
 @Suite struct RemoteBootstrapTests {
+    @Test func tmuxEnablesVisiblePanePassthroughForTerminalClipboard() {
+        let command = RemoteBootstrap.command(mode: .tmux, sessionName: "tether-test", attachOnly: false)
+        #expect(command.contains("set-option -p -t \"=$N:\" allow-passthrough on"))
+        #expect(!command.contains("allow-passthrough all"))
+    }
+
     /// Runs the bootstrap with a fake `screen` (and no tmux) that reports the settings file it got.
     @Test func screenSettingsFileIsPrivateAndNeverPlanted() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-bs-\(UUID())")

@@ -651,11 +651,21 @@ struct PaneSummary: View {
                     .foregroundStyle(agent.isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     .help(agent.isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
             }
-            Text(stateOnly ? (pane.agent?.isWorking == true ? "working" : "waiting") : showPath ? pane.summary : pane.displayCommand)
+            Text(stateOnly ? agentState : showPath ? pane.summary : pane.displayCommand)
                 .uiFont(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+        }
+    }
+
+    private var agentState: String {
+        guard let agent = pane.agent else { return "" }
+        return switch agent.activity {
+        case .working: "working"
+        case .waiting(let why): why
+        case .done: "done"
+        case .idle: "open"
         }
     }
 }

@@ -25,6 +25,16 @@ import Testing
         #expect(events == [.output(pane: "%1", data: bytes("a\\b"))])
     }
 
+    @Test func passesNativeClipboardOscThroughControlMode() {
+        var p = TmuxControlParser()
+        _ = p.feed(bytes("\u{1b}P1000p"))
+        let events = p.feed(bytes("\u{1b}]52;c;aGVsbG8=\u{7}%output %1 done\\012\n"))
+        #expect(events == [
+            .passthrough(bytes("\u{1b}]52;c;aGVsbG8=\u{7}")),
+            .output(pane: "%1", data: bytes("done\n")),
+        ])
+    }
+
     @Test func commandReplyCollectsLines() {
         var p = TmuxControlParser()
         _ = p.feed(bytes("\u{1b}P1000p"))

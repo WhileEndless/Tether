@@ -54,6 +54,12 @@ public enum RemoteBootstrap {
                 + "case \"$S:$E\" in 0:*|*'no server running'*|*'error connecting to'*'No such file'*) mark gone ;; "
                 + "*) mark \"unreachable;why=tmux: $(printf %s \"$E\" | tr ';\\n\\007\\033' '    ' | cut -c1-160)\" ;; esac; exit 0; fi; "
                 + "mark \"mode=tmux;v=$V\"; "
+                // Codex forwards /copy through tmux as DCS passthrough containing OSC 52. tmux
+                // defaults this pane option to off, which silently discards the sequence before
+                // the control-mode client (and its clipboard handler) can receive it. `on` keeps
+                // the scope to the visible pane; neither other panes nor background sessions can
+                // use the client clipboard.
+                + "tmux set-option -p -t \"=$N:\" allow-passthrough on >/dev/null 2>&1; "
                 // Tether's own sessions are never ended by tmux when Tether lets go of them (a
                 // `destroy-unattached on` in the user's tmux.conf): set on that session only.
                 + "case \"$N\" in tether-*) tmux set-option -t \"=$N:\" destroy-unattached off >/dev/null 2>&1 ;; esac; "

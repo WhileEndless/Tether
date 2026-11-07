@@ -69,6 +69,21 @@ import TetherCore
         #expect(r.filter(plain) == plain)
     }
 
+    @Test func tmuxPassthroughKeepsACodexSizedClipboardPayload() {
+        // Codex permits 100,000 raw bytes in an OSC 52 copy. Base64 expands that to more than
+        // 133 KB, so the passthrough must not drop the DCS wrapper before SwiftTerm sees OSC 52.
+        let encoded = Data(repeating: 0x61, count: 100_000).base64EncodedString()
+        let inner = "\u{1b}]52;c;\(encoded)\u{07}"
+        let wrapped = "\u{1b}Ptmux;" + inner.replacingOccurrences(of: "\u{1b}", with: "\u{1b}\u{1b}") + "\u{1b}\\"
+        #expect(wrapped.utf8.count < TmuxPassthrough.limit)
+
+        var p = TmuxPassthrough()
+        let bytes = Array(wrapped.utf8)
+        let cut = 70_000
+        let output = p.filter(Array(bytes[..<cut])) + p.filter(Array(bytes[cut...]))
+        #expect(output == Array(inner.utf8))
+    }
+
     @Test func tabIsWorkingOnlyWhileItsCommandDoesSomething() {
         #expect(TabActivity.decide(running: false, foreground: nil, outputActive: true, cpu: nil, io: nil) == .idle)
         #expect(TabActivity.decide(running: true, foreground: nil, outputActive: true, cpu: nil, io: nil) == .working("output"))

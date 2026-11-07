@@ -11,6 +11,7 @@ struct TetherApp: App {
 
     init() {
         CrashLog.installIfRequested()
+        SwiftUIRenderRepair.install()
         // A pipe or socket whose other end is gone (an ssh, scp or the askpass helper that already
         // ended) must give a write error, not end the app: by default SIGPIPE terminates silently,
         // without even a crash report.

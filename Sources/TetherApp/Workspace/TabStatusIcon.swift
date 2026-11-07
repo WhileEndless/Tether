@@ -45,7 +45,11 @@ struct TabStatusIcon: View {
         if session.attention != nil { return .attention(attentionHelp) }
         let activity = commandActivity
         if let kind = model.agentKind(of: session) {
-            let working = session.agent.map { $0.activity == .working } ?? (activity.isWorking)
+            // Claude provides an exact idle/busy state. Codex does not currently expose an
+            // equivalent live status record, so retain its identity while deriving its motion
+            // from the foreground command's actual output, CPU and I/O activity.
+            let working = session.agent.map { $0.activity == .working || ($0.activity == .idle && activity.isWorking) }
+                ?? activity.isWorking
             return .agent(kind, working: working)
         }
         if let tool = model.containerTool(of: session) {
@@ -80,7 +84,13 @@ struct TabStatusIcon: View {
             // Moving marks are animated by Core Animation (`AnimatedSymbol`): SwiftUI's looping
             // symbol effects redraw the window on every frame while an agent works.
             case .agent(let kind, let working):
-                if working && animates {
+                if kind == .codex {
+                    // Keep the coding-agent marks product-specific. The six-loop glyph is clearer
+                    // than a generic hexagon and deliberately quiet beside Tether's own controls.
+                    CodexMark(size: size, tint: Color(red: 0.16, green: 0.55, blue: 0.45))
+                        .opacity(working ? 1 : 0.72)
+                        .help(working ? "Codex is working" : "Codex")
+                } else if working && animates {
                     AnimatedSymbol(systemName: kind.symbol, size: size, weight: .semibold,
                                    color: NSColor(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue, alpha: 1), motion: .pulse)
                         .help("\(kind.title) is working")

@@ -67,6 +67,19 @@ public struct TmuxControlParser: Sendable {
                     left = true
                     break
                 }
+                // A control-mode client can receive a terminal OSC directly, outside a %output
+                // line. In particular, tmux's native clipboard delivery (load-buffer -w) sends
+                // OSC 52 this way. Keep it separate from the line protocol and let the terminal
+                // delegate apply its ordinary clipboard policy.
+                if buffer[pos] == 0x1b {
+                    guard pos + 1 < buffer.count else { break }
+                    if buffer[pos + 1] == 0x5d {
+                        guard let end = Self.oscEnd(in: buffer, from: pos) else { break }
+                        events.append(.passthrough(Array(buffer[pos..<end])))
+                        pos = end
+                        continue
+                    }
+                }
                 guard let nl = buffer[pos...].firstIndex(of: 0x0a) else { break }
                 var start = pos, end = nl
                 if end > start, buffer[end - 1] == 0x0d { end -= 1 }
@@ -81,6 +94,19 @@ public struct TmuxControlParser: Sendable {
     }
 
     private static let endPrefix = Array("%end ".utf8), errorPrefix = Array("%error ".utf8)
+
+    /// The index immediately after an OSC that starts at `from`, or nil while it is incomplete.
+    /// OSCs are terminated by BEL or ST. The latter is also a DCS terminator, but it only ends
+    /// control mode when it begins a protocol line (handled above).
+    private static func oscEnd(in bytes: [UInt8], from: Int) -> Int? {
+        var i = from + 2 // ESC ]
+        while i < bytes.count {
+            if bytes[i] == 0x07 { return i + 1 }
+            if bytes[i] == 0x1b, i + 1 < bytes.count, bytes[i + 1] == 0x5c { return i + 2 }
+            i += 1
+        }
+        return nil
+    }
 
     private mutating func handle(line: [UInt8]) -> TmuxEvent? {
         if let number = block?.number {

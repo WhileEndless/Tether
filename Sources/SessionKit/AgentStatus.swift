@@ -55,11 +55,13 @@ public enum ProgramStatus: Equatable, Sendable {
 
 /// Unwraps tmux passthrough (`ESC P tmux ; … ESC \`, with every ESC inside doubled), which programs
 /// in tmux use to reach the outer terminal — notifications (OSC 9/777/99) and OSC 7501 then work in
-/// tmux tabs too. A wrapper cut across chunks is held back until it ends (at most 64 KB).
+/// tmux tabs too. A wrapper cut across chunks is held back until it ends. Codex sends up to
+/// 100 KB of raw text through OSC 52; after Base64 this needs roughly 134 KB, so leave room for
+/// the complete supported Codex payload as well as its small DCS wrapper.
 public struct TmuxPassthrough {
     private var held: [UInt8] = []
     private static let start = Array("\u{1b}Ptmux;".utf8)
-    static let limit = 64 * 1024
+    static let limit = 256 * 1024
 
     public init() {}
 
