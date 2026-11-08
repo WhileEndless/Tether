@@ -260,7 +260,7 @@ else echo "@@netstat"; netstat -an -p tcp 2>/dev/null | grep -i established || n
 echo "@@end"
 """#
 
-    public static let remoteSessions = #"""
+    private static let remoteSessionsTemplate = #"""
 export LC_ALL=C
 # Bounded: no more lines (or longer ones) than Tether reads, however many sessions there are.
 cap() { awk -v n="$1" 'length($0) <= 8192 { if (++c > n) exit; print }'; }
@@ -279,7 +279,7 @@ if [ -n "$panes" ]; then
     $3 ~ /\+/ { t = $2; sub(/^tty/, "", t); if (t in want) print }')
 fi
 echo "@@fg"; [ -n "$fg" ] && printf '%s\n' "$fg"
-# Coding agents (Claude Code, Codex, opencode) in the foreground: the name of their session.
+# Coding agents in the foreground: the name of their session.
 # Only names and states are printed; nothing is read beyond the agent's own session index.
 echo "@@agents"
 set -f
@@ -294,6 +294,9 @@ pcwd() { readlink "/proc/$1/cwd" 2>/dev/null || lsof -n -P -w -a -p "$1" -d cwd 
     claude*|*/claude-code/*) kind=claude ;;
     codex*|*/codex/*) kind=codex ;;
     opencode*|.opencode*|*/opencode*) kind=opencode ;;
+    cursor-agent*|cursor*agent*) kind=cursor ;;
+    gemini*) kind=gemini ;;
+    aider*) kind=aider ;;
     *) continue ;;
   esac
   case $kind in
@@ -333,4 +336,7 @@ set +f
 echo "@@screen"; screen -ls 2>/dev/null | cap 500
 echo "@@end"
 """#
+
+    /// Session discovery never reads an agent transcript.
+    public static let remoteSessions = remoteSessionsTemplate
 }

@@ -222,6 +222,24 @@ import TetherCore
         #expect(a?.agentKind == .claude)
     }
 
+    @Test func codexSpinnerOnlyMarksWorking() {
+        let text = """
+        @@tmux
+        work|1700000000|0|1
+        @@tmuxpanes
+        work|0|main|1|1|%1|/dev/pts/1|codex|/srv/app
+        @@tmuxtitles
+        %1|host.example.com|⠂ Codex
+        @@fg
+        101 pts/1 Sl+ codex
+        @@agents
+        101|codex|found|
+        @@end
+        """
+        let agent = ProbeParser.remoteSessions(text)[0].activePane?.agent
+        #expect(agent?.isWorking == true)
+    }
+
     @Test func remoteSessionsWithoutPaneSections() {
         let all = ProbeParser.remoteSessions("@@tmux\nwork|1700000000|0|1\n@@end\n")
         #expect(all.count == 1)

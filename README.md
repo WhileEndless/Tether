@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.4 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.10.5 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.4): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.5): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -34,7 +34,7 @@ Search across every terminal, the archive and recordings.
   - **Neither** → a plain login shell, with automatic reconnects (a new shell in the same tab) and a local transcript. Such a server says so once — and how to install tmux there.
 - **Clear states.** *Online*, *Waiting* (connection lost: history stays visible, what you type waits and is sent when the session is back — asked about first when another program is in front by then) and *Dead* (the remote session is confirmed gone: read-only and archived). A session detached on the server (`tmux detach`, screen's detach key) waits for Reconnect instead of ending. A lost network is detected immediately, and a stalled server within seconds. Tabs reattach when the network returns, and also after the app is quit or crashes.
 - **Background sessions.** Close a tab and keep its session running in the background. Sessions a closed tab left running on a server are listed under the host by the tab's name, ready to open again with a click — so are your own tmux sessions. Tabs whose session ended on the server while they were away close by themselves.
-- **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex and opencode show the name of their session — the one you gave it or the one the agent chose — on server sessions and on open tabs, and whether Claude Code is working. Tabs you have not renamed take the agent session's name. Names come from the agents' own files on the server (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
+- **See what runs in them without attaching.** Each server session shows the command and folder of its active window (the tooltip and the host panel list every window). Coding agents are recognised: Claude Code, Codex, opencode, Cursor Agent, Gemini CLI and Aider. Tabs you have not renamed take the agent session's name when the tool exposes one. Claude Code can report its exact waiting/working state; for agents without a passive lifecycle record, Tether shows *working* only while the terminal itself is producing output, and otherwise truthfully shows the agent as active. This reads no terminal text. Names come from the agents' own files on the server when available (Codex and opencode need `sqlite3` there unless you named the Codex thread yourself; otherwise the terminal title is used). The lists refresh on their own while a tab to the host is open; the sidebar's Refresh button (↻) reloads them and the SSH config at once.
 - **Save a session** with ⌘S (*File ▸ Save Session…*): the whole session — everything it has shown, including output no longer in memory (read from its recording) — what the terminal holds now, or just the last command and its output (say the `ls` you just ran), as plain text or as the raw output with colors. It opens in your Downloads folder; what it starts with and where are set in Settings ▸ Terminal ▸ Saving a Session.
 
 **Passwords, Touch ID and sudo**

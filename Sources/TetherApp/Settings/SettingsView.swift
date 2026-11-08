@@ -7,23 +7,94 @@ import TerminalUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @State private var selectedTab: SettingsTab = .general
+    @State private var search = ""
 
     var body: some View {
-        TabView {
-            GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
-            AppearanceSettings().tabItem { Label("Appearance", systemImage: "paintpalette") }
-            TerminalSettings().tabItem { Label("Terminal", systemImage: "terminal") }
-            KeyboardSettings().tabItem { Label("Keyboard", systemImage: "keyboard") }
-            SessionSettings().tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }
-            RecordingSettings().tabItem { Label("Recordings", systemImage: "record.circle") }
-            TransferSettings().tabItem { Label("Transfers", systemImage: "arrow.up.arrow.down.circle") }
-            MonitoringSettings().tabItem { Label("Monitoring", systemImage: "gauge.with.dots.needle.33percent") }
-            SecuritySettingsPane().tabItem { Label("Security", systemImage: "lock") }
-            PasswordSettings().tabItem { Label("Passwords", systemImage: "key") }
-            SSHSettings().tabItem { Label("SSH", systemImage: "lock.shield") }
+        VStack(spacing: 0) {
+            HStack {
+                TextField("Search settings", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Search all settings")
+                if !search.isEmpty { Button("Clear") { search = "" } }
+            }
+            .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 6)
+            if search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                tabs
+            } else {
+                SettingsSearchResults(query: search) { target in
+                    search = ""
+                    // The TabView is recreated when search results disappear. Selecting after
+                    // that transition keeps the chosen tab instead of falling back to General.
+                    DispatchQueue.main.async { selectedTab = target.tab }
+                }
+            }
         }
         .frame(width: 660, height: 600)
         .onChange(of: model.settings) { _, _ in model.settingsChanged() }
+    }
+
+    private var tabs: some View {
+        TabView(selection: $selectedTab) {
+            GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }.tag(SettingsTab.general)
+            AppearanceSettings().tabItem { Label("Appearance", systemImage: "paintpalette") }.tag(SettingsTab.appearance)
+            TerminalSettings().tabItem { Label("Terminal", systemImage: "terminal") }.tag(SettingsTab.terminal)
+            KeyboardSettings().tabItem { Label("Keyboard", systemImage: "keyboard") }.tag(SettingsTab.keyboard)
+            SessionSettings().tabItem { Label("Sessions", systemImage: "arrow.triangle.2.circlepath") }.tag(SettingsTab.sessions)
+            RecordingSettings().tabItem { Label("Recordings", systemImage: "record.circle") }.tag(SettingsTab.recordings)
+            TransferSettings().tabItem { Label("Transfers", systemImage: "arrow.up.arrow.down.circle") }.tag(SettingsTab.transfers)
+            MonitoringSettings().tabItem { Label("Monitoring", systemImage: "gauge.with.dots.needle.33percent") }.tag(SettingsTab.monitoring)
+            SecuritySettingsPane().tabItem { Label("Security", systemImage: "lock") }.tag(SettingsTab.security)
+            PasswordSettings().tabItem { Label("Passwords", systemImage: "key") }.tag(SettingsTab.passwords)
+            SSHSettings().tabItem { Label("SSH", systemImage: "lock.shield") }.tag(SettingsTab.ssh)
+        }
+    }
+}
+
+private enum SettingsTab: String, CaseIterable { case general, appearance, terminal, keyboard, sessions, recordings, transfers, monitoring, security, passwords, ssh }
+
+private enum SettingsSearchTarget: Hashable { case tab(SettingsTab)
+    var tab: SettingsTab {
+        switch self { case .tab(let tab): tab }
+    }
+}
+
+private struct SettingsSearchResults: View {
+    struct Entry: Identifiable { let target: SettingsSearchTarget; let title: String; let detail: String; var id: String { target.tab.rawValue + title } }
+    let query: String
+    let choose: (SettingsSearchTarget) -> Void
+    private let entries: [Entry] = [
+        .init(target: .tab(.general), title: "Startup and updates", detail: "restore sessions, menu bar, update checks and downloads"),
+        .init(target: .tab(.general), title: "Tabs and windows", detail: "new tab placement, closing, naming and Finder browsing"),
+        .init(target: .tab(.appearance), title: "Appearance and sidebar", detail: "theme, accent color, text size, sidebar details, counts and archive"),
+        .init(target: .tab(.terminal), title: "Terminal font and cursor", detail: "font, size, cursor shape and blinking"),
+        .init(target: .tab(.terminal), title: "Terminal behavior", detail: "scrollback, bell, mouse reporting, selection copy and notifications"),
+        .init(target: .tab(.terminal), title: "Terminal find", detail: "highlight, match colors, scroller marks and search delay"),
+        .init(target: .tab(.keyboard), title: "Keyboard mappings", detail: "Option as Meta and custom terminal key bindings"),
+        .init(target: .tab(.sessions), title: "Session persistence and reconnect", detail: "tmux, screen, history, retries, keep-alives and timeouts"),
+        .init(target: .tab(.recordings), title: "Recordings", detail: "record terminal output, storage limit, compression, retention and free space"),
+        .init(target: .tab(.transfers), title: "Transfers", detail: "upload destination, download location, archive mode, compression and parallelism"),
+        .init(target: .tab(.monitoring), title: "Host monitoring", detail: "host panel, background monitoring, status bar, processes, history, traffic and logs"),
+        .init(target: .tab(.security), title: "Security and app lock", detail: "encryption, lock, privacy and protected app access"),
+        .init(target: .tab(.passwords), title: "Passwords and sign-in memory", detail: "Keychain, password prompts, remembered sign-ins and lock behavior"),
+        .init(target: .tab(.ssh), title: "SSH configuration", detail: "ssh config, host keys, connection sharing, keys and control master"),
+    ]
+    var body: some View {
+        let words = query.lowercased().split(whereSeparator: { $0.isWhitespace })
+        let matches = entries.filter { entry in
+            let haystack = (entry.title + " " + entry.detail + " " + entry.target.tab.rawValue).lowercased()
+            return words.allSatisfy { haystack.contains($0) }
+        }
+        List(matches) { entry in
+            Button { choose(entry.target) } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.title)
+                    Text("\(entry.target.tab.rawValue.capitalized) · \(entry.detail)").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+        }
+        .overlay { if matches.isEmpty { ContentUnavailableView("No settings found", systemImage: "magnifyingglass", description: Text("Try a different term.")) } }
     }
 }
 
@@ -185,15 +256,6 @@ private struct TerminalSettings: View {
                 Toggle("Notify when the bell rings in a tab you are not looking at", isOn: $store.settings.notifyOnBell)
                 Text("Programs can ask for attention — `printf '\\e]9;Done\\a'` after a long job. Tether understands the common sequences (OSC 9, OSC 777, OSC 99, the bell, also passed through tmux), marks the tab with a bell and, when you are not looking at it, shows a macOS notification.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("Notify when a coding agent waits for you", isOn: $store.settings.notifyAgentWaiting)
-                Toggle("Notify when a coding agent is done", isOn: $store.settings.notifyAgentDone)
-                Picker("Look at coding agents every", selection: $store.settings.agentPollInterval) {
-                    Text("2 s").tag(2.0)
-                    Text("4 s").tag(4.0)
-                    Text("10 s").tag(10.0)
-                }
-                Text("Claude Code waiting for plan approval, a question or a permission marks its tab with a raised hand. Nothing needs to be set up in Claude Code: Tether reads the status Claude Code keeps for each session on the host (only on hosts where an agent runs in a tab), and understands the Program Status Protocol (OSC 7501) that Claude Code speaks outside tmux. Setting Claude Code's notifications to the terminal bell (`/config` ▸ Notifications) works too.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Allow programs to use the mouse (vim, htop, tmux…)", isOn: $store.settings.allowMouseReporting)
                 Text("Hold ⌥ while selecting to select text even when a program captures the mouse.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -279,6 +341,7 @@ private struct TerminalSettings: View {
         }
         .formStyle(.grouped)
     }
+
 }
 
 private extension AppSettings {
@@ -695,6 +758,7 @@ private struct MonitoringSettings: View {
                 }
             }
             .disabled(!store.settings.monitorAutoLoad)
+            CodingAgentSettings()
             Section("Status Bar") {
                 Toggle("Show host status above each terminal", isOn: $store.settings.showStatusStrip)
                 Text("CPU, memory, disk, load, GPU and latency, streamed over the existing connection.")
@@ -784,6 +848,20 @@ private struct MonitoringSettings: View {
             Button("Clear History", role: .destructive) { model.commandHistory.clear() }
         } message: {
             Text("Commands still running are kept. This cannot be undone.")
+        }
+    }
+}
+
+private struct CodingAgentSettings: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var store = model.settingsStore
+        Section("Coding Agents") {
+            Toggle("Notify when a coding agent waits for you", isOn: $store.settings.notifyAgentWaiting)
+            Toggle("Notify when a coding agent is done", isOn: $store.settings.notifyAgentDone)
+            Picker("Look at coding agents every", selection: $store.settings.agentPollInterval) {
+                Text("2 s").tag(2.0); Text("4 s").tag(4.0); Text("10 s").tag(10.0)
+            }
         }
     }
 }

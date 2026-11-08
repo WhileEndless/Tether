@@ -76,7 +76,9 @@ uninstall: ## Remove Tether.app from /Applications (settings and recordings are 
 zip: ## Package dist/Tether-<version>.zip for a GitHub release (Apple silicon and Intel)
 	UNIVERSAL=1 scripts/build-app.sh release
 	rm -f $(ZIP)
-	ditto -c -k --keepParent $(APP) $(ZIP)
+	# Resource-fork sidecars (`._*`) are not part of the signed app bundle. Excluding them keeps
+	# a downloaded archive's code signature valid after it is unpacked.
+	ditto -c -k --keepParent --norsrc $(APP) $(ZIP)
 	@echo "Created $(ZIP)"
 
 notes: ## Check that release notes exist for the current version

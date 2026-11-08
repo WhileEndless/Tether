@@ -48,8 +48,13 @@ struct TabStatusIcon: View {
             // Claude provides an exact idle/busy state. Codex does not currently expose an
             // equivalent live status record, so retain its identity while deriving its motion
             // from the foreground command's actual output, CPU and I/O activity.
-            let working = session.agent.map { $0.activity == .working || ($0.activity == .idle && activity.isWorking) }
-                ?? activity.isWorking
+            // Terminal output is already observed by the session itself. It remains a valid,
+            // zero-cost live signal even when the optional CPU/I/O command sampler is disabled.
+            // This matters for Codex and other CLIs that have no passive lifecycle record.
+            let liveTerminalActivity = session.outputActive || activity.isWorking
+            let working = session.agent.map {
+                $0.activity == .working || (($0.activity == .idle || $0.activity == .active) && liveTerminalActivity)
+            } ?? liveTerminalActivity
             return .agent(kind, working: working)
         }
         if let tool = model.containerTool(of: session) {
@@ -87,9 +92,17 @@ struct TabStatusIcon: View {
                 if kind == .codex {
                     // Keep the coding-agent marks product-specific. The six-loop glyph is clearer
                     // than a generic hexagon and deliberately quiet beside Tether's own controls.
-                    CodexMark(size: size, tint: Color(red: 0.16, green: 0.55, blue: 0.45))
-                        .opacity(working ? 1 : 0.72)
-                        .help(working ? "Codex is working" : "Codex")
+                    ZStack {
+                        if working && animates {
+                            // Core Animation keeps this inexpensive; unlike a SwiftUI timer it
+                            // does not redraw the complete tab strip every frame.
+                            AnimatedSymbol(systemName: "circle.dotted", size: size + 4, weight: .regular,
+                                           color: NSColor(red: 0.16, green: 0.55, blue: 0.45, alpha: 0.75), motion: .spin)
+                        }
+                        CodexMark(size: size, tint: Color(red: 0.16, green: 0.55, blue: 0.45))
+                            .opacity(working ? 1 : 0.72)
+                    }
+                    .help(working ? "Codex is working" : "Codex")
                 } else if working && animates {
                     AnimatedSymbol(systemName: kind.symbol, size: size, weight: .semibold,
                                    color: NSColor(red: kind.tint.red, green: kind.tint.green, blue: kind.tint.blue, alpha: 1), motion: .pulse)

@@ -203,12 +203,15 @@ public struct RemoteSessionPane: Hashable, Sendable {
 /// A coding agent running in a pane and the name of its session.
 public struct CodingAgent: Hashable, Sendable {
     public enum Kind: String, Sendable {
-        case claude, codex, opencode
+        case claude, codex, opencode, cursor, gemini, aider
         public var title: String {
             switch self {
             case .claude: "Claude Code"
             case .codex: "Codex"
             case .opencode: "opencode"
+            case .cursor: "Cursor Agent"
+            case .gemini: "Gemini CLI"
+            case .aider: "Aider"
             }
         }
     }
@@ -240,7 +243,8 @@ public struct CodingAgent: Hashable, Sendable {
         switch status {
         case "busy": .working
         case "waiting": .waiting(waitingFor.map { "is waiting: \(DisplayText.clean($0, limit: 100))" } ?? "is waiting for you")
-        default: .idle
+        case "idle": .idle
+        default: .active
         }
     }
 
@@ -250,6 +254,9 @@ public struct CodingAgent: Hashable, Sendable {
         case .claude: .claude
         case .codex: .codex
         case .opencode: .opencode
+        case .cursor: .cursor
+        case .gemini: .gemini
+        case .aider: .aider
         }
     }
 
@@ -269,7 +276,7 @@ public struct CodingAgent: Hashable, Sendable {
 }
 
 extension CodingAgent.Kind {
-    static let allTitles: Set<String> = ["claude code", "claude", "codex", "opencode"]
+    static let allTitles: Set<String> = ["claude code", "claude", "codex", "opencode", "cursor agent", "gemini cli", "aider"]
 }
 
 public enum LogSource: Hashable, Sendable, CaseIterable, Identifiable {

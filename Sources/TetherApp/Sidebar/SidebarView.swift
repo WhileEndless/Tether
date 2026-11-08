@@ -642,14 +642,18 @@ struct PaneSummary: View {
     var showPath = true
     /// The tab's title already names the agent session: only whether it is working is shown.
     var stateOnly = false
+    /// Existing terminal output is a local, zero-cost signal for agents without a structured
+    /// lifecycle feed (notably Codex). It is never terminal-text inspection.
+    var liveOutputActive = false
+    private var isWorking: Bool { pane.agent?.isWorking == true || (pane.agent?.status == nil && liveOutputActive) }
 
     var body: some View {
         HStack(spacing: 3) {
             if let agent = pane.agent {
-                Image(systemName: agent.isWorking ? "sparkles" : "sparkle")
+                Image(systemName: isWorking ? "sparkles" : "sparkle")
                     .uiFont(.caption2)
-                    .foregroundStyle(agent.isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                    .help(agent.isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
+                    .foregroundStyle(isWorking ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .help(isWorking ? "\(agent.kind.title) is working" : agent.kind.title)
             }
             Text(stateOnly ? agentState : showPath ? pane.summary : pane.displayCommand)
                 .uiFont(.caption)
@@ -661,7 +665,11 @@ struct PaneSummary: View {
 
     private var agentState: String {
         guard let agent = pane.agent else { return "" }
+        // Codex has no passive busy record. Reuse the terminal's existing output signal instead
+        // of adding another host probe.
+        if agent.status == nil { return liveOutputActive ? "working" : "active" }
         return switch agent.activity {
+        case .active: "active"
         case .working: "working"
         case .waiting(let why): why
         case .done: "done"
@@ -1107,7 +1115,8 @@ struct SessionRow: View {
                 }
                 // A coding agent in the tab: its session name, under the title.
                 if look.extras, let pane = agentPane {
-                    PaneSummary(pane: pane, showPath: false, stateOnly: session.agentTitle != nil)
+                    PaneSummary(pane: pane, showPath: false, stateOnly: session.agentTitle != nil,
+                                liveOutputActive: session.outputActive)
                 }
             }
             Spacer(minLength: 4)

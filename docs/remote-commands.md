@@ -190,13 +190,13 @@ could run in, and their command line could take a script's lines as its own comm
 
 ### Server sessions
 - **When:** when terminals to the host connect, then every 15 s while a window is visible. A host
-  with a tab running a coding agent is looked at every 4 s (Settings ▸ Monitoring), also with no
-  window visible, so a question or a plan approval is noticed in any tab.
+  with a tab running a coding agent is looked at at the interval selected in Settings ▸ Monitoring,
+  also with no window visible, so a question or a plan approval is noticed in any tab.
 - **Reads:**
   - tmux and screen sessions and the program in front in each pane (`ps` is asked about the panes'
     terminals only, not every process on the host),
-  - the names of coding-agent sessions (Claude Code, Codex, opencode), read from those tools' own
-    files.
+  - the names of coding-agent sessions (Claude Code, Codex, opencode, Cursor Agent, Gemini CLI
+    and Aider), read from those tools' own files where available. No terminal transcript is read.
 - **Changes:** nothing.
 
 ### Logs

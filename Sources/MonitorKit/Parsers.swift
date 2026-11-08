@@ -501,6 +501,9 @@ public enum ProbeParser {
             let found = candidates.compactMap { agentsByPID[$0.pid] }
             pane.agent = agentsByPID.values.first { $0.paneID == f[5] }
                 ?? found.first { $0.sessionName != nil } ?? found.first
+            if pane.agent?.kind == .codex, pane.agent?.status == nil, Self.hasActiveSpinner(titleByPane[f[5]] ?? "") {
+                pane.agent?.status = "busy"
+            }
             if pane.isShell && pane.agent == nil { pane.commandLine = nil }
             out[f[0], default: []].append(pane)
         }
@@ -542,6 +545,13 @@ public enum ProbeParser {
             out[f[0]] = agent
         }
         return out
+    }
+
+    /// Codex's title spinner is a presentational signal, not a transcript scrape. It only upgrades
+    /// an otherwise unknown state to working; absence remains unknown and falls back to activity.
+    static func hasActiveSpinner(_ title: String) -> Bool {
+        guard let first = title.trimmingCharacters(in: .whitespaces).first else { return false }
+        return "◐◓◑◒◴◷◶◵⠁⠂⠄⡀⢀⠠⠐".contains(first)
     }
 
     /// `/dev/pts/3`, `pts/3` → `pts/3`; `/dev/ttys003`, `s003` → `s003` (macOS `ps` drops "tty").

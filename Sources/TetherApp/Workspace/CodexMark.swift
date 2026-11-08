@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// A compact, six-loop mark for Codex. SF Symbols has no OpenAI/Codex mark; this remains legible
-/// at tab-icon size while making Codex distinct from the generic hexagon used before.
+/// An original, interlocking six-stroke mark for Codex. It is intentionally logo-like without
+/// copying a vendor trademark, and keeps a clean silhouette at tab-icon size.
 struct CodexMark: View {
     let size: CGFloat
     let tint: Color
@@ -9,11 +9,13 @@ struct CodexMark: View {
     var body: some View {
         ZStack {
             ForEach(0..<6, id: \.self) { index in
-                RoundedRectangle(cornerRadius: size * 0.12, style: .continuous)
-                    .stroke(tint, style: StrokeStyle(lineWidth: max(size * 0.15, 1), lineCap: .round, lineJoin: .round))
-                    .frame(width: size * 0.42, height: size * 0.78)
+                Capsule(style: .continuous)
+                    .fill(tint)
+                    .frame(width: max(size * 0.19, 1.5), height: size * 0.72)
+                    .offset(y: -size * 0.11)
                     .rotationEffect(.degrees(Double(index) * 60))
             }
+            Circle().fill(Color(nsColor: .windowBackgroundColor)).frame(width: size * 0.22, height: size * 0.22)
         }
         .frame(width: size + 2, height: size + 2)
         .accessibilityLabel("Codex")

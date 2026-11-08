@@ -61,6 +61,9 @@ public enum AgentKind: String, CaseIterable, Codable, Sendable {
 
 /// Where a coding agent in a terminal stands, from whichever signal said so last.
 public enum AgentActivity: Equatable, Sendable {
+    /// The provider is present, but has not published a stronger lifecycle state. This must not
+    /// be represented as idle: interactive CLIs often have no public status API.
+    case active
     case working
     /// Waiting for the user: a permission, a question, plan approval, a login (what the agent said).
     case waiting(String)
