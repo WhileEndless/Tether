@@ -60,12 +60,15 @@ struct HostStatusStrip: View {
             // Learn about other tmux sessions on the server once we are connected, then keep the
             // list (and what runs in each session) fresh while the window is visible.
             if session.phase.isOnline {
-                await monitor.refreshRemoteSessions()
+                // Several restored tabs can become online together.  The host inventory is shared
+                // by them, so one recent look is enough; opening the Sessions panel still asks for
+                // a fresh list explicitly.
+                await monitor.refreshRemoteSessions(maxAge: 10)
                 model.checkKeyLogin(session.descriptor.target)
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(15))
                     guard !Task.isCancelled else { break }
-                    if !monitor.paused { await monitor.refreshRemoteSessions(maxAge: 10) }
+                    if !monitor.paused { await monitor.refreshRemoteSessions(maxAge: 15) }
                 }
             }
         }

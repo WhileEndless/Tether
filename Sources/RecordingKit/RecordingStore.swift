@@ -304,6 +304,41 @@ public enum RecordingStore {
         for item in all(in: directory) where !item.isActive { remove(item) }
     }
 
+    /// Removes only inactive recordings whose canonical (uncompressed) path was selected by the
+    /// archive.  Call this from `perform` so it cannot race compression or encryption.
+    @discardableResult
+    public static func delete(paths: Set<String>, in directory: URL = AppPaths.recordingsDirectory) -> Int {
+        guard !paths.isEmpty else { return 0 }
+        let selected = Set(paths.map(canonicalPath))
+        var removed = 0
+        for item in all(in: directory) where !item.isActive {
+            if selected.contains(canonicalPath(of: item)), remove(item) { removed += 1 }
+        }
+        return removed
+    }
+
+    /// Removes inactive recordings no archive entry refers to.  This intentionally leaves active
+    /// sessions and every transcript still visible in Archive alone.
+    @discardableResult
+    public static func deleteUnlisted(referencedPaths: Set<String>, in directory: URL = AppPaths.recordingsDirectory) -> Int {
+        let referenced = Set(referencedPaths.map(canonicalPath))
+        var removed = 0
+        for item in all(in: directory) where !item.isActive {
+            if !referenced.contains(canonicalPath(of: item)), remove(item) { removed += 1 }
+        }
+        return removed
+    }
+
+    /// Stored archive paths and `FileManager` enumeration can spell the same temporary volume as
+    /// `/var` and `/private/var`. Compare resolved, uncompressed paths so cleanup cannot miss one.
+    private static func canonicalPath(of item: RecordingInfo) -> String {
+        canonicalPath(item.isCompressed ? item.url.deletingPathExtension().path : item.url.path)
+    }
+
+    private static func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
     /// Removes a recording with its parts. True if the recording itself is gone.
     @discardableResult
     static func remove(_ item: RecordingInfo) -> Bool {

@@ -101,6 +101,14 @@ struct SearchView: View {
                       help: "Older recordings that are no longer in the archive list")
             ScopeChip(title: "Compressed", symbol: "doc.zipper", isOn: $search.filters.includeCompressed,
                       help: "Recordings older than a few days are compressed. Searching them is slower.")
+            if !search.filters.archive && !search.filters.otherRecordings {
+                Button("Full History") {
+                    search.filters.archive = true
+                    search.filters.otherRecordings = true
+                }
+                .buttonStyle(.borderless)
+                .help("Include archived sessions and recordings")
+            }
             Divider().frame(height: 16)
             Picker("Host", selection: $search.filters.host) {
                 Text("All hosts").tag(String?.none)

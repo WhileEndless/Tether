@@ -34,7 +34,9 @@ struct SearchFilters: Equatable {
     }
 
     var openSessions = true
-    var archive = true
+    /// Archive scans can be very expensive with long coding-agent transcripts. They are opt-in;
+    /// the search window still exposes a one-click Full History scope.
+    var archive = false
     var otherRecordings = false
     /// Recordings compressed after a few days are skipped unless asked for (they are slower to search).
     var includeCompressed = false
@@ -100,6 +102,9 @@ final class SearchModel {
     var selection = Set<SearchMatch.ID>()
 
     private var task: Task<Void, Never>?
+    /// Only the newest search may publish progress or results. Cancellation of filesystem work is
+    /// cooperative, so this also prevents a late detached reader from repainting stale results.
+    private var generation = 0
 
     var totalMatches: Int { groups.reduce(0) { $0 + $1.matches.count } }
 
@@ -114,12 +119,15 @@ final class SearchModel {
     /// count, and nothing says "no matches" before the new search has looked.
     func willRun() {
         task?.cancel()
+        generation &+= 1
         phase = query.pattern.isEmpty ? .idle : .waiting
     }
 
     /// Starts (or restarts) the search.
     func run() {
         task?.cancel()
+        generation &+= 1
+        let run = generation
         groups = []
         error = nil
         selection = []
@@ -143,16 +151,19 @@ final class SearchModel {
                 // is written early for a search.
                 var sources = collected.sources
                 for session in collected.flush {
+                    guard run == generation else { return }
                     guard let snap = await session.currentRecording() else { continue }
                     for i in sources.indices where sources[i].id == "earlier-\(session.id)" { sources[i].pendingOutput = snap.pending }
                 }
                 try Task.checkCancellation()
                 let (more, skipped) = await Task.detached(priority: .userInitiated) { collected.recordings() }.value
                 try Task.checkCancellation()
+                guard run == generation else { return }
                 skippedCompressed += skipped
                 sources += more
                 searchedSources = sources.count
                 for try await event in SearchEngine.events(q, in: sources) {
+                    guard run == generation else { return }
                     switch event {
                     case .searching(let index, _, let source):
                         progressIndex = index
@@ -165,10 +176,11 @@ final class SearchModel {
                     }
                 }
                 progressIndex = searchedSources
-                phase = .finished
+                if run == generation { phase = .finished }
             } catch is CancellationError {
                 // Restarted (the new run set the phase) or stopped (cancel did).
             } catch {
+                guard run == generation else { return }
                 self.error = error.localizedDescription
                 phase = .finished
             }
@@ -177,6 +189,7 @@ final class SearchModel {
 
     func cancel() {
         task?.cancel()
+        generation &+= 1
         if busy { phase = .stopped }
     }
 
@@ -240,7 +253,29 @@ final class SearchModel {
                 let status = statusLabel(s)
                 if !statusMatches(status) { continue }
                 if let path = s.recordingURL?.path { c.usedRecordings.insert(path) }
-                guard let view = TerminalRegistry.shared.existingView(for: s.id) else { continue }
+                let view = TerminalRegistry.shared.existingView(for: s.id)
+                // Restored background tabs deliberately have no AppKit terminal view until they
+                // are shown. Their recording is still the complete source of truth; omitting it
+                // here would make Full History miss an otherwise searchable live session.
+                if view == nil, let url = s.recordingURL {
+                    c.flush.append(s)
+                    c.sources.append(SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
+                                                  title: s.displayTitle, host: s.descriptor.target.displayName,
+                                                  date: s.startedAt, status: status))
+                    continue
+                }
+                guard let view else { continue }
+                // A background tab can have a deliberately paced output queue.  Draining every
+                // one of those queues just to open Search would put terminal parsing ahead of the
+                // user's input.  Its recorder already has the complete stream (including pending
+                // bytes added below), so search that source directly instead.
+                if view.window == nil, let url = s.recordingURL {
+                    c.flush.append(s)
+                    c.sources.append(SearchSource(id: "earlier-\(s.id)", kind: .recording(url: url, archiveID: nil),
+                                                  title: s.displayTitle, host: s.descriptor.target.displayName,
+                                                  date: s.startedAt, status: status))
+                    continue
+                }
                 // A full-screen program (vim, less) is up: memory holds only its screen, so the
                 // session's text all comes from the recording (without the program's screens).
                 if view.showsAlternateScreen, let url = s.recordingURL {

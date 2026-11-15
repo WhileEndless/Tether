@@ -49,7 +49,10 @@ struct SessionPane: View {
         // A tab that was working here and lost its connection gets the small banner while it
         // re-attaches (the terminal stays readable and scrollable); the card is for failures and for
         // tabs coming back after a relaunch.
-        case .waiting: return p.failure != nil || !session.wasOnline || (p.includesRestore && session.restoredFromDisk)
+        // A restored tab already has a usable terminal and history behind it. Keep that terminal
+        // visible while it re-attaches; a compact banner says what is happening without dimming
+        // the whole work area or competing with keyboard focus.
+        case .waiting: return p.failure != nil || !session.wasOnline
         case .dead: return (!session.wasOnline && p.failure != nil) || p.hostKeyChange != nil
         default: return false
         }

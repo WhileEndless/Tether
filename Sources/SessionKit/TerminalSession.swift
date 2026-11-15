@@ -63,6 +63,13 @@ public final class TerminalSession: Identifiable {
     /// Recordings holding more output than this are not continued after a relaunch (a new one
     /// starts): continuing reads the whole recording once, to index it.
     static let continuedRecordingLimit = 128 * 1024 * 1024
+    /// The recording still holds all history, but replaying an unbounded tail into a terminal at
+    /// launch can make input appear frozen.  This is deliberately a display limit only: older
+    /// output remains available through the recording-backed history and search.
+    /// This tail is replayed synchronously when a restored terminal view first exists. Keep it no
+    /// larger than one normal live-output batch: a coding agent's rich redraw must never leave a
+    /// blinking cursor while keyboard events wait behind hundreds of kilobytes of terminal parsing.
+    nonisolated static let continuedRecordingDisplayLimit = 16 * 1024
 
     /// A tab restored after a relaunch goes on with the recording it wrote before, instead of
     /// starting a new one: its history (scrolling back, ⌘↑, find) reaches back past the relaunch,
@@ -97,10 +104,11 @@ public final class TerminalSession: Identifiable {
                 continuedRecording = true
                 applyRecordingInterval()
                 if let tail, !tail.isEmpty {
-                    showEarlierOutput(tail)
+                    let displayedTail = Self.displayTail(tail)
+                    showEarlierOutput(displayedTail)
                     // Less than the recording holds: more before it. (Not judged by its line breaks:
                     // a program redrawing in place, such as a coding agent, writes many per line.)
-                    if Self.tailIsPartial(tailBytes: tail.count, recordingLength: length) { sink?.earlierOutputIsPartial() }
+                    if Self.tailIsPartial(tailBytes: displayedTail.count, recordingLength: length) { earlierOutputIsPartial() }
                 }
             } else {
                 opened?.0.close()
@@ -115,10 +123,30 @@ public final class TerminalSession: Identifiable {
         tailBytes < recordingLength
     }
 
+    /// Keeps the newest complete lines when the recording tail is too expensive to replay during
+    /// startup.  Escape sequences may span chunks, so this trims only once before terminal parsing.
+    nonisolated static func displayTail(_ tail: [UInt8]) -> [UInt8] {
+        guard tail.count > continuedRecordingDisplayLimit else { return tail }
+        let suffix = tail.suffix(continuedRecordingDisplayLimit)
+        if let newline = suffix.firstIndex(of: 0x0a), newline < suffix.endIndex {
+            return Array(suffix[suffix.index(after: newline)...])
+        }
+        return Array(suffix)
+    }
+
     /// Output from an earlier run, shown again: not recorded, and a full-screen program that was
     /// open then is left (the server says what is there now).
     func showEarlierOutput(_ bytes: [UInt8]) {
-        guard let sink else { return }
+        guard let sink else {
+            // Restored sessions are created before their SwiftUI tab is necessarily laid out.  Keep
+            // the small startup tail until that view exists rather than making every terminal view
+            // synchronously just to receive it.
+            appendEarlierOutput(Array("\u{1b}[0m".utf8) + bytes
+                + Array(("\u{1b}[0m\u{1b}7\u{1b}[r\u{1b}8\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l"
+                    + "\u{1b}[?1006l\u{1b}[?1015l\u{1b}[?2004l\u{1b}[?1l\u{1b}>\u{1b}[?25h\u{1b}[?7h\u{1b}(B\u{1b})B\u{0f}").utf8))
+            fedAnything = true
+            return
+        }
         sink.showEarlierOutput(Array("\u{1b}[0m".utf8)[...] + bytes[...])
         if sink.screenTail(maxRows: 1) == nil { sink.showEarlierOutput(Array("\u{1b}[?1049l".utf8)[...]) }
         // Modes a program had set then are not in force now (the server says what is, on re-attach):
@@ -127,6 +155,11 @@ public final class TerminalSession: Identifiable {
         sink.showEarlierOutput(Array(("\u{1b}[0m\u{1b}7\u{1b}[r\u{1b}8\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l"
             + "\u{1b}[?1006l\u{1b}[?1015l\u{1b}[?2004l\u{1b}[?1l\u{1b}>\u{1b}[?25h\u{1b}[?7h\u{1b}(B\u{1b})B\u{0f}").utf8)[...])
         fedAnything = true
+    }
+
+    private func earlierOutputIsPartial() {
+        if let sink { sink.earlierOutputIsPartial() }
+        else { deferredEarlierOutputIsPartial = true }
     }
     /// Title reported by the remote program (OSC 0/2 or a screen/tmux name sequence).
     public var remoteTitle: String = ""
@@ -754,6 +787,17 @@ exit 1
     @ObservationIgnored public var configurationProvider: () -> SessionConfiguration
 
     @ObservationIgnored public private(set) var sink: TerminalSink?
+    /// A restored tab does not need an AppKit terminal view until it is shown.  Bytes received in
+    /// the meantime are retained briefly, so deferring those views never delays connecting or
+    /// loses the first prompt of a local shell.  Full history remains in the recorder.
+    @ObservationIgnored private var deferredOutput: [UInt8] = []
+    @ObservationIgnored private var deferredOutputStart = 0
+    @ObservationIgnored private var deferredEarlierOutput: [UInt8] = []
+    @ObservationIgnored private var deferredEarlierOutputIsPartial = false
+    /// A tab that has not been shown yet needs enough context for a useful first frame, but its
+    /// recorder already holds the complete stream. Keeping a larger tail makes the first selected
+    /// tab spend too long catching up before it can accept input.
+    private static let deferredOutputLimit = 256 * 1024
     @ObservationIgnored private var process: LocalProcess?
     @ObservationIgnored private var bridge: ProcessBridge?
     @ObservationIgnored private var tmux: TmuxDriver?
@@ -917,6 +961,23 @@ exit 1
 
     public func attach(sink: TerminalSink) {
         self.sink = sink
+        if !deferredEarlierOutput.isEmpty {
+            sink.showEarlierOutput(deferredEarlierOutput[...])
+            deferredEarlierOutput.removeAll(keepingCapacity: true)
+        }
+        if deferredEarlierOutputIsPartial {
+            sink.earlierOutputIsPartial()
+            deferredEarlierOutputIsPartial = false
+        }
+        guard deferredOutputStart < deferredOutput.count else {
+            deferredOutput.removeAll(keepingCapacity: true)
+            deferredOutputStart = 0
+            return
+        }
+        let pending = Array(deferredOutput[deferredOutputStart...])
+        deferredOutput.removeAll(keepingCapacity: true)
+        deferredOutputStart = 0
+        sink.feed(pending[...])
     }
 
     /// Starts a brand-new session (creates the remote tmux/screen session if needed).
@@ -1934,7 +1995,7 @@ exit 1
                                     ownSession: descriptor.remoteSessionName.hasPrefix("tether-"))
             driver.write = { [weak self] text in self?.process?.send(data: Array(text.utf8)[...]) }
             driver.display = { [weak self] bytes in self?.display(bytes) }
-            driver.refresh = { [weak self] bytes in self?.sink?.feed(bytes[...]) }
+            driver.refresh = { [weak self] bytes in self?.deliverOutput(bytes) }
             driver.size = { [weak self] in self?.realSize }
             driver.screenTail = { [weak self] in
                 guard let sink = self?.sink, let tail = sink.screenTail(maxRows: 16) else { return nil }
@@ -2479,12 +2540,44 @@ exit 1
         display(Array(notice.utf8))
     }
 
+    /// Sends live bytes to the terminal view, or keeps a bounded tail while a restored background
+    /// tab has not created its view yet.  The recorder receives the complete stream separately.
+    private func deliverOutput(_ bytes: [UInt8]) {
+        if let sink {
+            sink.feed(bytes[...])
+            return
+        }
+        deferredOutput.append(contentsOf: bytes)
+        let retained = deferredOutput.count - deferredOutputStart
+        guard retained > Self.deferredOutputLimit else { return }
+        deferredOutputStart += retained - Self.deferredOutputLimit
+        // Avoid retaining an ever-growing prefix for an agent that writes for a long time before
+        // its tab is shown.  A terminal parser tolerates a partial leading sequence by ignoring it.
+        if deferredOutputStart >= Self.deferredOutputLimit {
+            deferredOutput.removeFirst(deferredOutputStart)
+            deferredOutputStart = 0
+        }
+    }
+
+    /// The recording tail is already bounded before this is called; keep the same bound until its
+    /// terminal view is attached.
+    private func appendEarlierOutput(_ bytes: [UInt8]) {
+        deferredEarlierOutput.append(contentsOf: bytes)
+        guard deferredEarlierOutput.count > Self.continuedRecordingDisplayLimit else { return }
+        let suffix = deferredEarlierOutput.suffix(Self.continuedRecordingDisplayLimit)
+        if let newline = suffix.firstIndex(of: 0x0a), newline < suffix.endIndex {
+            deferredEarlierOutput = Array(suffix[suffix.index(after: newline)...])
+        } else {
+            deferredEarlierOutput = Array(suffix)
+        }
+    }
+
     private func display(_ raw: [UInt8]) {
         let (bytes, title) = titleFilter.filter(passthrough.filter(raw))
         if let title, title != remoteTitle { remoteTitle = title }
         guard !bytes.isEmpty else { return }
         fedAnything = true
-        sink?.feed(bytes[...])
+        deliverOutput(bytes)
         noteOutput()
         if let recorder {
             // The recording notes the terminal's size before output laid out for it, so replays

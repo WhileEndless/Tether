@@ -23,6 +23,23 @@ import Testing
         #expect(RecordingStore.sanitize("user@host:22") == "user@host_22")
         #expect(RecordingStore.sanitize("../../etc") == ".._.._etc")
     }
+
+    @Test func bulkDeletionRespectsArchiveReferences() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tether-test-\(UUID())")
+        let host = dir.appendingPathComponent("host")
+        try FileManager.default.createDirectory(at: host, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let archived = host.appendingPathComponent("archived.\(RecordingStore.fileExtension)")
+        let unlisted = host.appendingPathComponent("unlisted.\(RecordingStore.fileExtension)")
+        try Data("archive\n".utf8).write(to: archived)
+        try Data("left behind\n".utf8).write(to: unlisted)
+
+        #expect(RecordingStore.delete(paths: [archived.path], in: dir) == 1)
+        #expect(!FileManager.default.fileExists(atPath: archived.path))
+        #expect(FileManager.default.fileExists(atPath: unlisted.path))
+        #expect(RecordingStore.deleteUnlisted(referencedPaths: [], in: dir) == 1)
+        #expect(!FileManager.default.fileExists(atPath: unlisted.path))
+    }
 }
 
 /// Recordings never fill the disk: short of the free space kept, the oldest closed ones go even

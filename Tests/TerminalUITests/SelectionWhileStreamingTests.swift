@@ -31,6 +31,60 @@ import TetherCore
         #expect(view.allowMouseReporting == false)                  // no program asked for the mouse
     }
 
+    @Test func coalescedVisibleOutputDrainsBeforeTheScreenIsRead() {
+        let view = makeView()
+        // Registry-backed terminals have a window as soon as they are placed in a tab, even if
+        // AppKit has not displayed it yet. Keep the window alive to exercise that output path.
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 400, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = view
+        view.batchesWhileHidden = true
+
+        view.feed(Array("coalesced line\r\n".utf8)[...])
+        let terminal = view.getTerminal()
+        let firstLine = terminal.getScrollInvariantLine(row: terminal.buffer.totalLinesTrimmed)?.translateToString(trimRight: true)
+        #expect(firstLine != "coalesced line")
+
+        // Operations that need the terminal's current state drain the queued bytes in order.
+        view.flushHiddenOutput()
+        #expect(view.scrollbackText().lines.contains("coalesced line"))
+        _ = window
+    }
+
+    @Test func coalescedOutputCanOpenAnAlternateScreen() {
+        let view = makeView()
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 400, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = view
+        view.batchesWhileHidden = true
+
+        // This enters a full-screen TUI while queued output is drained. It must not re-enter the
+        // drain through the reflow bookkeeping used to preserve the normal screen.
+        view.feed(Array("\u{1b}[?1049h".utf8)[...])
+        view.flushHiddenOutput()
+        #expect(view.getTerminal().isCurrentBufferAlternate)
+        _ = window
+    }
+
+    @Test func terminalGetsFocusAfterAnInitiallySmallHostIsLaidOut() async throws {
+        _ = NSApplication.shared
+        let session = TerminalSession(descriptor: SessionDescriptor(target: .local, persistence: .off)) { SessionConfiguration(settings: AppSettings()) }
+        let terminal = TerminalRegistry.shared.view(for: session)
+        defer { TerminalRegistry.shared.remove(session.id) }
+
+        // SwiftUI can attach a representable before its final size is known. The terminal is
+        // claimed only on the later layout pass and must then receive the keyboard.
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 1, height: 1),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let host = TerminalHost.Container(frame: .zero)
+        host.session = session
+        window.contentView = host
+        host.setFrameSize(.init(width: 500, height: 300))
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(window.firstResponder === terminal)
+    }
+
     @Test func mouseTrackingProgramsStillGetTheMouse() {
         let view = makeView()
         view.feed(Array("\u{1b}[?1000h".utf8)[...])                // e.g. htop, vim with mouse=a

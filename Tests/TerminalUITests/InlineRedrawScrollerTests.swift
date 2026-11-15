@@ -79,6 +79,17 @@ import TetherCore
         #expect(!TerminalSession.tailIsPartial(tailBytes: 0, recordingLength: 0))
     }
 
+    @Test func aLargeRestoredTailIsBoundedBeforeTerminalReplay() {
+        let limit = TerminalSession.continuedRecordingDisplayLimit
+        let prefix = Array(repeating: UInt8(ascii: "x"), count: 128)
+        let newest = Array("\nnewest output\n".utf8)
+        let tail = prefix + Array(repeating: UInt8(ascii: "z"), count: limit) + newest
+        let displayed = TerminalSession.displayTail(tail)
+        #expect(displayed.count <= limit)
+        #expect(String(decoding: displayed, as: UTF8.self).hasSuffix("newest output\n"))
+        #expect(displayed.first != UInt8(ascii: "z"), "starts at a complete line when one is available")
+    }
+
     @Test func aRestoredTabWhoseTailIsTheWholeRecordingHasNothingOlder() async throws {
         let f = try HistoryBrowsingTests.Fixture(lines: [], scrollback: 2000)
         var bytes = Array((1...50).map { "\($0) output" }.joined(separator: "\r\n").utf8) + [0x0d, 0x0a]

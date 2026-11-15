@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.5 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.10.6 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.5): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.6): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -121,6 +121,7 @@ Search across every terminal, the archive and recordings.
 
 **Search**
 - Search every open terminal, the archive and old recordings, with plain text or regex, case sensitivity and whole words.
+- Search opens with live sessions only; *Full History* adds archived and old recordings without interrupting background terminal output.
 - Filter by host, session, status and time (presets such as *Last 15 minutes* or an exact from/to range).
 - Results show highlighted context. Double-click a result to open the terminal (or transcript) at that line; the terminal keeps the search, so ⌘G / ⇧⌘G step through the other matches there.
 - Copy lines, matches or ranges. Export results as text, CSV or JSON, or export full transcripts.
@@ -142,6 +143,7 @@ Search across every terminal, the archive and recordings.
 - Programs cannot erase the history on screen (`clear`, Claude Code's redraws) unless you allow it (Settings ▸ Terminal); the recording keeps everything either way.
 - What is kept where, for how long and what goes first: [docs/data-storage.md](docs/data-storage.md).
 - Only a configurable number of lines stays in memory. Older output is opened from disk with "Open Full History", which loads large recordings in slices.
+- The Archive is temporary: it hides after a short idle period. Right-click its heading or the sidebar's archive icon to clear the list, delete archived transcripts, or clean recordings no longer listed there.
 
 ## Keyboard shortcuts
 

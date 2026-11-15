@@ -709,9 +709,21 @@ public final class SessionManager {
         archiveStore.saveSoon(archive)
     }
 
-    public func clearArchive() {
+    /// Clears Archive metadata and, when explicitly requested, the inactive recordings those
+    /// entries reference.  Open recordings are never selected for deletion.
+    public func clearArchive(deleteRecordings: Bool = false) {
+        let paths = Set(archive.compactMap(\.recordingPath))
         archive.removeAll()
         archiveStore.saveSoon(archive)
+        guard deleteRecordings, !paths.isEmpty else { return }
+        Task { _ = await RecordingStore.perform { RecordingStore.delete(paths: paths) } }
+    }
+
+    /// Deletes recordings not shown in Archive (for example from an interrupted restore), without
+    /// touching active sessions or any transcript a current archive entry owns.
+    public func cleanUnlistedRecordings() {
+        let referenced = Set(archive.compactMap(\.recordingPath))
+        Task { _ = await RecordingStore.perform { RecordingStore.deleteUnlisted(referencedPaths: referenced) } }
     }
 
     // MARK: Persistence across launches
@@ -746,7 +758,6 @@ public final class SessionManager {
     private var savedIDs: Set<UUID> = []
     /// What kept the tabs brought back in the last run, until they say again.
     private var restoringPersistence: [UUID: ActivePersistence] = [:]
-
     /// Re-attaches to tmux/screen sessions that were open when the app quit.
     public func restoreOpenSessions() {
         restoreRan = true
@@ -765,8 +776,8 @@ public final class SessionManager {
             sessions.append(session)
             if item.background == true { background.insert(session.id) }
             session.closedWhileOffline = item.closedWhileOffline == true || item.endWhenConnected == true
-            let start = { [weak session] in
-                guard let session else { return }
+            let start = { [weak self, weak session] in
+                guard let self, let session else { return }
                 if item.suspended == true {
                     session.restoreSuspended(previous: item.persistence)
                     self.restoringPaused.remove(session.id)

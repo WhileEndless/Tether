@@ -22,6 +22,7 @@ public struct TerminalHost: NSViewRepresentable {
         var session: TerminalSession?
         var isCurrent: () -> Bool = { true }
         var wantsFocus = true
+        fileprivate var focusRetriesRemaining = 0
 
         public override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -59,7 +60,14 @@ public struct TerminalHost: NSViewRepresentable {
         public override func setFrameSize(_ newSize: NSSize) {
             super.setFrameSize(newSize)
             if newSize.width >= 40, newSize.height >= 20, window != nil { TerminalRegistry.lastHostSize = newSize }
-            if claimWhenSized { claim() }
+            if claimWhenSized {
+                // At launch SwiftUI can put this host in its window before it has a usable size.
+                // `viewDidMoveToWindow` then cannot focus the terminal because it is not attached
+                // yet; once this layout pass claims it, retry focus without taking it from a field
+                // the user may already have clicked.
+                claim()
+                focusTerminal(takeBack: false)
+            }
         }
 
         /// Gives the terminal the keyboard once it is really in a window (after a move, the first
@@ -69,7 +77,7 @@ public struct TerminalHost: NSViewRepresentable {
         func focusTerminal(takeBack: Bool = true) {
             guard wantsFocus else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.window != nil else { return }
+                guard let self, self.window != nil, self.isCurrent() else { return }
                 self.claim()   // in case a stale host held it a moment ago
                 guard let window = self.window, let terminal = self.subviews.first,
                       window.firstResponder !== terminal else { return }
@@ -77,7 +85,14 @@ public struct TerminalHost: NSViewRepresentable {
                 // SwiftUI updates this host as the text changes, and must not take the keyboard away.
                 if window.firstResponder is NSText { return }
                 if !takeBack, let current = window.firstResponder, TerminalHost.keepsFocus?(current) == true { return }
-                window.makeFirstResponder(terminal)
+                if window.makeFirstResponder(terminal) {
+                    self.focusRetriesRemaining = 0
+                } else if self.focusRetriesRemaining > 0 {
+                    self.focusRetriesRemaining -= 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                        self?.focusTerminal(takeBack: false)
+                    }
+                }
             }
         }
     }
@@ -95,8 +110,18 @@ public struct TerminalHost: NSViewRepresentable {
         container.session = session
         container.isCurrent = isCurrent
         container.wantsFocus = focused
+        if changed { container.focusRetriesRemaining = 2 }
         container.claim()
         container.focusTerminal(takeBack: changed)
+        if changed {
+            // The first focus request may race the connection card and SwiftUI's final layout at
+            // launch.  Retry after that transaction commits so a selected terminal is actually
+            // writable; `takeBack: false` still leaves text fields and explicitly focused side
+            // views alone.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak container] in
+                container?.focusTerminal(takeBack: false)
+            }
+        }
     }
 
     /// Views beside a terminal that keep the keyboard once the user gave it to them (set by the app:

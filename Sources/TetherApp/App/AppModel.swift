@@ -207,7 +207,9 @@ final class AppModel {
         library = libraryStore.load() ?? HostLibrary()
 
         sessions.prepare = { session in
-            _ = TerminalRegistry.shared.view(for: session)
+            // A launch can restore many tabs.  Constructing every AppKit terminal here makes
+            // connection startup wait behind layout/scrollback allocation.  `TerminalSession`
+            // keeps a bounded output tail until the tab is actually shown.
             session.onPasswordPrompt = { s, prompt in AppModel.shared.passwordPromptAppeared(prompt, in: s) }
             session.onAttention = { s, attention in Notifier.shared.attention(attention, in: s) }
             session.onStateChange = { s in AppModel.shared.commandStateChanged(s) }

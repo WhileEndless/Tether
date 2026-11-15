@@ -39,6 +39,12 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
 | Passwords, key passphrases and the recording key | the macOS keychain (service "Tether SSH Password"; a key's passphrase is the item `passphrase:<key file>`) | Removed with the host, the password or the passphrase |
 | Sign-in passwords remembered for this run (Settings ▸ Passwords ▸ Signing In Again) | Tether's memory only, encrypted by a Secure Enclave key that is never saved — nothing on disk (see [connections-and-passwords.md](connections-and-passwords.md)) | Gone when Tether quits, when the server refuses one, when its saved password is changed or removed, with *Forget*, when the setting is turned off, after the time chosen, on screen lock if chosen; kept but unused while Tether is locked (App Lock); a saved password, once read with Touch ID, is kept the same way. A typed password is also handed to the same connection's other sign-ins for one minute (also with the setting off) |
 
+The Archive is only its sidebar list. **Clear Archive List** removes entries but preserves their
+recordings for full-history search. **Delete Archived Transcripts** removes those entries and their
+inactive recording files. **Clean Unlisted Recordings** removes only inactive recording files that
+are no longer represented by an Archive entry. The latter two actions are permanent and require a
+confirmation.
+
 Temporary files outside this folder:
 - Connection sockets and askpass: `/tmp/tether-<uid>/`, private to you. ssh removes its own sockets.
 - ssh logs of a connection attempt: also there. The name is removed when the sign-in ends; a connection's log is emptied every few minutes while it runs.

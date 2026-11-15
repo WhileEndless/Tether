@@ -397,16 +397,30 @@ final class WindowState {
             model.sessions.close(session.id, killRemote: false)
             return
         }
-        guard let window else { return }
-        CloseConfirmation.ask(for: session, in: window) { [model] choice in
-            switch choice {
-            case .background?:
-                model.workspaces.detach(session.id)
-                model.sessions.setBackground(session.id, true)
-            case .terminate?:
-                model.sessions.close(session.id, killRemote: true)
-            case nil:
-                break
+        // A close request can originate in a sidebar, a tab menu, a keyboard shortcut or another
+        // window. Select its target first, then wait one main-loop turn so SwiftUI paints that tab
+        // before its confirmation sheet appears.
+        let targetWindow: NSWindow?
+        if model.workspaces.focus(session.id) {
+            targetWindow = model.workspaces.workspace(containing: session.id).flatMap(model.workspaces.window(of:))
+        } else {
+            show(session)
+            targetWindow = window
+        }
+        guard let targetWindow else { return }
+        DispatchQueue.main.async { [weak session, weak targetWindow, model] in
+            guard let session, let targetWindow, model.sessions.session(session.id) === session,
+                  session.phase.isOnline else { return }
+            CloseConfirmation.ask(for: session, in: targetWindow) { [model] choice in
+                switch choice {
+                case .background?:
+                    model.workspaces.detach(session.id)
+                    model.sessions.setBackground(session.id, true)
+                case .terminate?:
+                    model.sessions.close(session.id, killRemote: true)
+                case nil:
+                    break
+                }
             }
         }
     }

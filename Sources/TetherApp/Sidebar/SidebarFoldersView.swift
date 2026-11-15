@@ -12,6 +12,7 @@ struct SidebarFolderTree: View {
     let search: String
     let adhocKeys: [String]
     let onRename: (HostGroup) -> Void
+    @State private var pendingArchiveAction: ArchiveBulkAction?
 
     var body: some View {
         let searching = !search.isEmpty
@@ -76,6 +77,24 @@ struct SidebarFolderTree: View {
                     ArchiveRow(item: item).tag(SidebarItem.archived(item.id))
                 }
             }
+            .contextMenu { ArchiveContextMenu(action: $pendingArchiveAction) }
+            .confirmationDialog(pendingArchiveAction?.title ?? "Archive", isPresented: Binding(get: { pendingArchiveAction != nil }, set: { if !$0 { pendingArchiveAction = nil } })) {
+                Button(pendingArchiveAction?.title ?? "Delete", role: .destructive) { performPendingArchiveAction() }
+                Button("Cancel", role: .cancel) { pendingArchiveAction = nil }
+            } message: {
+                Text(pendingArchiveAction?.message ?? "")
+            }
+            .archiveAutoHide(pendingAction: $pendingArchiveAction)
+        }
+    }
+
+    private func performPendingArchiveAction() {
+        defer { pendingArchiveAction = nil }
+        switch pendingArchiveAction {
+        case .clearList: model.sessions.clearArchive()
+        case .deleteTranscripts: model.sessions.clearArchive(deleteRecordings: true)
+        case .cleanUnlisted: model.sessions.cleanUnlistedRecordings()
+        case nil: break
         }
     }
 

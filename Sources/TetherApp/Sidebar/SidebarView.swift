@@ -793,11 +793,79 @@ struct LocalRow: View {
     }
 }
 
+enum ArchiveBulkAction: Identifiable {
+    case clearList, deleteTranscripts, cleanUnlisted
+
+    var id: String { title }
+    var title: String {
+        switch self {
+        case .clearList: "Clear Archive List"
+        case .deleteTranscripts: "Delete Archived Transcripts"
+        case .cleanUnlisted: "Clean Unlisted Recordings"
+        }
+    }
+    var message: String {
+        switch self {
+        case .clearList: "This removes archived sessions from the sidebar. Their transcript files stay available to full-history search."
+        case .deleteTranscripts: "This permanently deletes the archived sessions and their inactive transcript files. This cannot be undone."
+        case .cleanUnlisted: "This permanently deletes inactive recordings that are not shown in Archive. This cannot be undone."
+        }
+    }
+}
+
+struct ArchiveContextMenu: View {
+    @Binding var action: ArchiveBulkAction?
+
+    var body: some View {
+        Button("Clear Archive List…", role: .destructive) { action = .clearList }
+        Button("Delete Archived Transcripts…", role: .destructive) { action = .deleteTranscripts }
+        Divider()
+        Button("Clean Unlisted Recordings…", role: .destructive) { action = .cleanUnlisted }
+    }
+}
+
+/// Archive is a temporary workspace, not a permanent sidebar expansion.  Any interaction keeps
+/// it open for another short interval; leaving it alone returns the sidebar to its compact state.
+struct ArchiveAutoHide: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Binding var pendingAction: ArchiveBulkAction?
+    @State private var hideTask: Task<Void, Never>?
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { scheduleHide() }
+            .onDisappear { hideTask?.cancel() }
+            .onHover { _ in scheduleHide() }
+            .simultaneousGesture(TapGesture().onEnded { scheduleHide() })
+            .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in scheduleHide() })
+            .onChange(of: pendingAction) { _, action in
+                if action == nil { scheduleHide() } else { hideTask?.cancel() }
+            }
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(15))
+            guard !Task.isCancelled else { return }
+            guard pendingAction == nil else { return }
+            model.settings.showSidebarArchive = false
+        }
+    }
+}
+
+extension View {
+    func archiveAutoHide(pendingAction: Binding<ArchiveBulkAction?>) -> some View {
+        modifier(ArchiveAutoHide(pendingAction: pendingAction))
+    }
+}
+
 private struct ArchiveSection: View {
     @Environment(AppModel.self) private var model
     @Environment(\.sidebarLook) private var look
     @Environment(WindowState.self) private var state
     @Environment(\.openWindow) private var openWindow
+    @State private var pendingAction: ArchiveBulkAction?
 
     var body: some View {
         if model.settings.showSidebarArchive && !model.sessions.archive.isEmpty {
@@ -814,7 +882,25 @@ private struct ArchiveSection: View {
                         Text("\(model.sessions.archive.count)").monospacedDigit().foregroundStyle(.tertiary)
                     }
                 }
+                .contextMenu { ArchiveContextMenu(action: $pendingAction) }
             }
+            .confirmationDialog(pendingAction?.title ?? "Archive", isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } })) {
+                Button(pendingAction?.title ?? "Delete", role: .destructive) { performPendingAction() }
+                Button("Cancel", role: .cancel) { pendingAction = nil }
+            } message: {
+                Text(pendingAction?.message ?? "")
+            }
+            .archiveAutoHide(pendingAction: $pendingAction)
+        }
+    }
+
+    private func performPendingAction() {
+        defer { pendingAction = nil }
+        switch pendingAction {
+        case .clearList: model.sessions.clearArchive()
+        case .deleteTranscripts: model.sessions.clearArchive(deleteRecordings: true)
+        case .cleanUnlisted: model.sessions.cleanUnlistedRecordings()
+        case nil: break
         }
     }
 }
@@ -825,6 +911,7 @@ private struct SidebarBottomBar: View {
     @Environment(\.openWindow) private var openWindow
     @Binding var showNewGroup: Bool
     @State private var refreshing = false
+    @State private var pendingArchiveAction: ArchiveBulkAction?
 
     var body: some View {
         let sessions = model.sessions.sessions
@@ -864,6 +951,7 @@ private struct SidebarBottomBar: View {
                                                               : "Show the archive (\(archived) ended sessions)") {
                 model.settings.showSidebarArchive.toggle()
             }
+            .contextMenu { ArchiveContextMenu(action: $pendingArchiveAction) }
 
             Spacer(minLength: 4)
 
@@ -908,6 +996,22 @@ private struct SidebarBottomBar: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+        .confirmationDialog(pendingArchiveAction?.title ?? "Archive", isPresented: Binding(get: { pendingArchiveAction != nil }, set: { if !$0 { pendingArchiveAction = nil } })) {
+            Button(pendingArchiveAction?.title ?? "Delete", role: .destructive) { performPendingArchiveAction() }
+            Button("Cancel", role: .cancel) { pendingArchiveAction = nil }
+        } message: {
+            Text(pendingArchiveAction?.message ?? "")
+        }
+    }
+
+    private func performPendingArchiveAction() {
+        defer { pendingArchiveAction = nil }
+        switch pendingArchiveAction {
+        case .clearList: model.sessions.clearArchive()
+        case .deleteTranscripts: model.sessions.clearArchive(deleteRecordings: true)
+        case .cleanUnlisted: model.sessions.cleanUnlistedRecordings()
+        case nil: break
+        }
     }
 }
 

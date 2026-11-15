@@ -46,6 +46,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private(set) var lastSentSize: (cols: Int, rows: Int)?
     /// The display scale the cell size was worked out for (see `viewDidChangeBackingProperties`).
     private var metricsScale: CGFloat = 1
+    /// AppKit calls `setFrameSize` for every intermediate pixel while the user drags a window
+    /// edge.  A terminal width change is not a cheap view resize: SwiftTerm reflows all of the
+    /// normal-screen scrollback synchronously.  Keep the old, usable grid while that gesture is
+    /// in progress and perform one reflow for its final size afterwards.
+    private var deferringLiveResize = false
     /// Called with files dropped onto (or pasted into) the terminal.
     public var onFiles: (([URL]) -> Void)?
     /// Files copied in Tether's file manager are on the clipboard: true when they were handled
@@ -140,7 +145,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         optionAsMetaKey = settings.optionAsMeta
         syncMouseReporting()
         getTerminal().setCursorStyle(settings.swiftTermCursor)
-        resizeScrollback(scrollbackLimit)
+        resizeScrollback(scrollbackLimit, flushPending: window != nil)
         history?.applyLook()
         KeyboardRouter.shared.mappings = settings.keyMappings
         drawFind()
@@ -250,17 +255,13 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         let bytes = images.filter(bytes)
         lastOutputAt = ProcessInfo.processInfo.systemUptime
         defer { if pendingTypedAhead != nil { resolveTypedAhead() } }
-        // A tab off screen draws nothing: its output is fed in batches (a few times a second), so a
-        // busy hidden terminal costs one pass through the emulator per batch instead of per read.
-        if batchesWhileHidden, window == nil {
-            hiddenOutput.append(contentsOf: bytes)
-            if hiddenOutput.count >= 256 << 10 { flushHiddenOutput() } else if !hiddenFlushQueued {
-                hiddenFlushQueued = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.flushHiddenOutput() }
-            }
+        // Registry-backed terminals keep every pipe read in one ordered queue. A tab may be moved
+        // between hosts while output is arriving; separate hidden and visible queues can otherwise
+        // overtake each other. Bounded pieces also keep showing a busy coding-agent tab responsive.
+        if batchesWhileHidden {
+            enqueueOutput(bytes)
             return
         }
-        flushHiddenOutput()
         feedNow(bytes)
     }
 
@@ -415,16 +416,120 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     /// Set for the app's tab views (`TerminalRegistry`); a view used on its own feeds at once.
     var batchesWhileHidden = false
-    private var hiddenOutput: [UInt8] = []
-    private var hiddenFlushQueued = false
+    /// All output waiting for a registry-backed terminal. One queue preserves byte order as a tab
+    /// moves on or off screen; processing it in pieces keeps a tab switch from monopolising the
+    /// main run loop when an agent was busy in the background.
+    private var pendingOutput: [UInt8] = []
+    private var pendingOutputStart = 0
+    private var pendingOutputFlushQueued = false
+    /// Feeding terminal bytes can synchronously invoke view/delegate callbacks. Some of those
+    /// need a current terminal and call `flushHiddenOutput` themselves. Never let such a callback
+    /// feed the same queued range recursively (that used to overflow the main-thread stack).
+    private var outputFlushInProgress = false
+    /// A width change reflows the full terminal buffer.  Do not make the first view of a restored,
+    /// busy tab synchronously drain its queued output solely to do that reflow; the final size is
+    /// applied after bounded output passes have caught up.
+    private var deferredFrameSize: NSSize?
+    /// Applying a deferred frame can itself ask for terminal state. Keep it out of the synchronous
+    /// output-feed callback stack and coalesce repeated size changes into one main-loop turn.
+    private var deferredFrameApplyQueued = false
+    private static let visibleOutputHold: TimeInterval = 1.0 / 30.0
+    /// An unseen tab needs a correct eventual terminal state, not live animation.  One bounded
+    /// pass per second prevents a roomful of busy agents from competing with the active terminal.
+    private static let hiddenOutputHold: TimeInterval = 1
+    /// A coding agent can write richly styled frames faster than they can be parsed and drawn.
+    /// Keep one visible pass below a frame budget; queued bytes remain ordered and catch up over
+    /// subsequent passes instead of delaying keyboard events.
+    private static let visibleOutputChunkBytes = 8 << 10
+    private static let resizeDeferralBytes = 64 << 10
 
-    /// Feeds what a hidden tab has waiting (also before anything reads the screen).
-    public func flushHiddenOutput() {
-        hiddenFlushQueued = false
-        guard !hiddenOutput.isEmpty else { return }
-        let bytes = hiddenOutput
-        hiddenOutput = []
+    private var queuedOutputBytes: Int { pendingOutput.count - pendingOutputStart }
+
+    private func enqueueOutput(_ bytes: ArraySlice<UInt8>) {
+        pendingOutput.append(contentsOf: bytes)
+        queueOutputFlush()
+    }
+
+    private func queueOutputFlush() {
+        guard !pendingOutputFlushQueued else { return }
+        pendingOutputFlushQueued = true
+        let hold = window == nil ? Self.hiddenOutputHold : Self.visibleOutputHold
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+            self?.flushOutputChunk()
+        }
+    }
+
+    /// One bounded pass keeps the main run loop responsive even after a busy agent filled a hidden
+    /// tab's queue. The next pass chooses its delay from the tab's then-current visibility.
+    private func flushOutputChunk() {
+        pendingOutputFlushQueued = false
+        guard !outputFlushInProgress, pendingOutputStart < pendingOutput.count else { return }
+        let end = min(pendingOutputStart + Self.visibleOutputChunkBytes, pendingOutput.count)
+        let bytes = Array(pendingOutput[pendingOutputStart..<end])
+        outputFlushInProgress = true
+        // Advance before feeding: callbacks during `feedNow` must never observe this piece as
+        // still pending. New remote bytes append after `end` and remain ordered for the next pass.
+        pendingOutputStart = end
         feedNow(bytes[...])
+        outputFlushInProgress = false
+        if pendingOutputStart == pendingOutput.count {
+            pendingOutput.removeAll(keepingCapacity: true)
+            pendingOutputStart = 0
+            applyDeferredFrameSizeIfReady()
+        } else {
+            // Do not copy the backing storage for every 64 KB piece. Compact only after a useful
+            // amount was consumed, so a long-running agent cannot retain an ever-growing prefix.
+            if pendingOutputStart >= 256 << 10 {
+                pendingOutput.removeFirst(pendingOutputStart)
+                pendingOutputStart = 0
+            }
+            queueOutputFlush()
+        }
+    }
+
+    /// The tab just became visible. Start catching up now, but never make the host transition parse
+    /// an unbounded backlog. Reads and resize paths that require an exact buffer use the full drain.
+    private func startVisibleOutputCatchUp() {
+        guard pendingOutputStart < pendingOutput.count else { return }
+        flushOutputChunk()
+    }
+
+    private func applyDeferredFrameSizeIfReady() {
+        guard !outputFlushInProgress, queuedOutputBytes == 0, let size = deferredFrameSize,
+              !deferredFrameApplyQueued else { return }
+        deferredFrameSize = nil
+        deferredFrameApplyQueued = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.deferredFrameApplyQueued = false
+            // A later layout pass may have supplied a newer final size while this work waited.
+            let finalSize = self.deferredFrameSize ?? size
+            self.deferredFrameSize = nil
+            // Bytes may have arrived between scheduling and this turn. Let the paced drain finish
+            // first rather than recursively flushing them from a resize callback.
+            guard self.queuedOutputBytes == 0 else {
+                self.deferredFrameSize = finalSize
+                self.startVisibleOutputCatchUp()
+                return
+            }
+            self.setFrameSize(finalSize)
+        }
+    }
+
+    /// Feeds every pending piece before anything reads the screen or changes terminal state.
+    public func flushHiddenOutput() {
+        pendingOutputFlushQueued = false
+        guard !outputFlushInProgress, pendingOutputStart < pendingOutput.count else { return }
+        // Copy and remove this drain before invoking SwiftTerm. Its synchronous callbacks may ask
+        // for a flush; they see an empty current batch instead of recursively feeding it again.
+        let bytes = Array(pendingOutput[pendingOutputStart...])
+        pendingOutput.removeAll(keepingCapacity: true)
+        pendingOutputStart = 0
+        outputFlushInProgress = true
+        feedNow(bytes[...])
+        outputFlushInProgress = false
+        applyDeferredFrameSizeIfReady()
+        if pendingOutputStart < pendingOutput.count { queueOutputFlush() }
     }
 
     private func feedNow(_ bytes: ArraySlice<UInt8>) {
@@ -623,10 +728,14 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     // MARK: Memory of tabs not on screen
 
-    /// Lines a tab keeps in memory after a minute off screen, when its recording holds the rest
+    /// Lines a tab keeps in memory shortly after it goes off screen, when its recording holds the rest
     /// (scrolling up reads them back, as for any older output). Every line of the scrollback costs
     /// about 24 bytes per column: 10,000 lines of a wide terminal are 30–50 MB, times every tab.
-    static let hiddenScrollbackLines = 2_000
+    static let hiddenScrollbackLines = 1_000
+    /// A brief tab hop should keep its in-memory context. With dozens of busy agents, though,
+    /// holding every 10,000-line scrollback for long creates a large avoidable memory
+    /// peak; the recording remains the complete history once this expires.
+    private static let hiddenMemoryHold: TimeInterval = 5
     private var shrunkWhileHidden = false
     private var shrinkWhileHidden: DispatchWorkItem?
 
@@ -638,7 +747,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         shrinkWhileHidden?.cancel()
         shrinkWhileHidden = nil
         if shown {
-            flushHiddenOutput()
+            // A busy background agent may have accumulated a large queue. Show the tab and begin
+            // catching up immediately, but leave the rest for bounded passes instead of freezing
+            // the host transition.
+            startVisibleOutputCatchUp()
             session?.terminalShown()
             // Output that came while hidden, and the scrollback made smaller meanwhile: all of it again.
             if let findSession {
@@ -647,22 +759,25 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             }
             guard shrunkWhileHidden else { return }
             shrunkWhileHidden = false
-            resizeScrollback(scrollbackLimit)     // room again; older lines come back from disk
+            // Capacity can grow before the paced queue catches up; forcing that queue through
+            // here would make a tab switch wait behind a busy agent.
+            resizeScrollback(scrollbackLimit, flushPending: false)
             return
         }
         let work = DispatchWorkItem { [weak self] in self?.shrinkHidden() }
         shrinkWhileHidden = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hiddenMemoryHold, execute: work)
     }
 
     func shrinkHidden() {
-        flushHiddenOutput()
-        // Off screen for a minute while scrolled back: back to the live end (then kept small).
+        // Off screen for a short while while scrolled back: back to the live end (then kept small).
+        // Pending output remains ordered in its queue and is applied under the smaller limit; it
+        // does not need a potentially expensive synchronous catch-up before this memory release.
         if isBrowsingHistory { returnToLive() }
         guard window == nil, hasHistoryOnDisk, !selection.active,
               settings.scrollbackLines > Self.hiddenScrollbackLines else { return }
         shrunkWhileHidden = true
-        resizeScrollback(scrollbackLimit)
+        resizeScrollback(scrollbackLimit, flushPending: false)
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -735,6 +850,28 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             drawFind()
             return
         }
+        // Most live-resize callbacks change only points inside the same terminal cell. SwiftTerm
+        // has no work to reflow in that case, so do not first scan the complete scrollback merely
+        // to preserve places that cannot have moved.
+        guard widthMayChangeColumnCount(for: newSize) else {
+            super.setFrameSize(newSize)
+            keepClearedScreenUp()
+            reportSizeIfNeeded()
+            drawFind()
+            return
+        }
+        // Do not run a full scrollback reflow for every intermediate frame in a live resize.
+        // Keeping the prior frame briefly is intentional: it leaves the active terminal and its
+        // first responder usable, instead of making keystrokes wait behind repeated reflows.
+        if deferringLiveResize {
+            deferredFrameSize = newSize
+            return
+        }
+        if queuedOutputBytes > Self.resizeDeferralBytes {
+            deferredFrameSize = newSize
+            startVisibleOutputCatchUp()
+            return
+        }
         flushHiddenOutput()
         let held = holdPlaces()
         super.setFrameSize(newSize)
@@ -742,6 +879,33 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         keepClearedScreenUp()
         reportSizeIfNeeded()
         drawFind()
+    }
+
+    /// A grid cannot gain or lose a column until the usable width moved by roughly one current
+    /// cell.  This intentionally errs toward the full path at the boundary: a false positive is
+    /// cheap, whereas a false negative would leave a terminal one column out of sync.
+    private func widthMayChangeColumnCount(for size: NSSize) -> Bool {
+        let current = getTerminal().cols
+        guard current > 0 else { return true }
+        let scroller = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        let usable = frame.width - scroller
+        guard usable > 0 else { return true }
+        return abs(size.width - frame.width) >= usable / CGFloat(current)
+    }
+
+    public override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        deferringLiveResize = true
+    }
+
+    public override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        deferringLiveResize = false
+        // AppKit has settled the host's bounds now.  There is at most one expensive reflow, and
+        // `setFrameSize` retains the existing output-queue safeguard for a busy terminal.
+        guard let size = deferredFrameSize else { return }
+        deferredFrameSize = nil
+        setFrameSize(size)
     }
 
     /// The command marks, the command jumped to, the line at the top and the last clear's place,
@@ -763,7 +927,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         let places = ReflowPlaces(self, rows: markRows + [jump?.line.map { $0 - trimmed } ?? -1, t.buffer.yDisp,
                                                           clearTop.map { $0 - trimmed } ?? -1])
         return HeldPlaces(places: places, marks: markRows.count, cols: t.cols,
-                          atBottom: t.buffer.yDisp >= bufferLineCount - t.rows, jump: jump)
+                          // `holdPlaces` also runs while queued visible output is being fed. Do
+                          // not call `bufferLineCount` here: it intentionally drains queued output
+                          // for outside readers, which would re-enter this feed while an alternate
+                          // screen is opening.
+                          atBottom: t.buffer.yDisp >= unflushedBufferLineCount() - t.rows, jump: jump)
     }
 
     /// After the normal screen's lines were wrapped again for another width: the places held go
@@ -839,6 +1007,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     func sendMapped(_ bytes: [UInt8]) {
+        lastUserInputAt = ProcessInfo.processInfo.systemUptime
         returnToLive()
         session?.send(bytes[...])
     }
@@ -846,11 +1015,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// Every screen update: the cursor view is shown or hidden here (`SteadyCaret`), never taken out.
     ///
     /// A program that redraws all the time (a coding agent's spinner and status, `top`) is drawn
-    /// about 15 times a second while nobody types here, about 5 while Tether or this window is not
-    /// in front — instead of up to 60: drawing is most of what a terminal costs. Right after a key,
-    /// a click or a scroll, and while the window is resized, every update is drawn at once.
+    /// about 10 times a second while nobody types here, about 5 while Tether or this window is not
+    /// in front — instead of up to 60: drawing is most of what a terminal costs. Input raises that
+    /// one terminal to at most 30 drawings a second; it never removes the limit.
     public override func setNeedsDisplay(_ invalidRect: NSRect) {
-        let hold = Self.drawHold(for: window, lastInput: Self.lastInput)
+        let hold = Self.drawHold(for: window, lastInput: lastUserInputAt)
         guard hold > 0 else {
             // What was held goes with it, not after it.
             let rect = heldDirty.map { $0.union(invalidRect) } ?? invalidRect
@@ -876,8 +1045,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         syncCaret()
     }
 
-    /// When the user last typed, clicked or scrolled in Tether (system uptime).
-    nonisolated(unsafe) static var lastInput: TimeInterval = 0
+    /// When the user last typed into this terminal (system uptime). This is deliberately local:
+    /// a busy agent in another tab must not redraw without a limit while this tab is being used.
+    private var lastUserInputAt: TimeInterval = 0
     /// Tests: the hold to use instead of the one worked out.
     nonisolated(unsafe) static var drawHoldOverride: TimeInterval?
 
@@ -885,27 +1055,27 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     static func drawHold(for window: NSWindow?, lastInput: TimeInterval) -> TimeInterval {
         if let drawHoldOverride { return drawHoldOverride }
         guard let window, window.isVisible, !window.inLiveResize else { return 0 }
-        if ProcessInfo.processInfo.systemUptime - lastInput < 0.6 { return 0 }
+        if ProcessInfo.processInfo.systemUptime - lastInput < 0.6 { return interactiveHold }
         if NSApp?.isActive == true && window.isKeyWindow { return foregroundHold }
         return backgroundHold
     }
 
-    /// Holds for about 15 and 5 drawings a second (SwiftTerm's own 60th of a second comes on top).
-    /// Measured with `RenderCostProbe` (a coding agent's redraws): 35% CPU at 0.032 s, 31% at
-    /// 0.066 s, 22% in the background; spinners still move smoothly at 15.
-    static let foregroundHold: TimeInterval = 0.05
+    /// Holds for at most 30, 10 and 5 drawings a second (SwiftTerm's own 60th of a second comes on top).
+    /// Live sampling showed attributed-text drawing remains the foreground main-thread cost even
+    /// after output coalescing. Ten FPS is still responsive for agent spinners while leaving room
+    /// for tab changes, typing and SwiftUI layout.
+    static let interactiveHold: TimeInterval = 1.0 / 30.0
+    static let foregroundHold: TimeInterval = 0.1
     static let backgroundHold: TimeInterval = 0.18
 
     private static var inputMonitor: Any?
 
-    /// Notes the user's keys, clicks and scrolls (one watcher for every terminal).
+    /// Installs the common event monitor once. Input priority is recorded by the terminal that
+    /// receives the input, not globally.
     static func watchInput() {
         guard inputMonitor == nil else { return }
         inputMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .leftMouseDragged,
-                                                                   .rightMouseDown, .scrollWheel, .flagsChanged]) { event in
-            lastInput = ProcessInfo.processInfo.systemUptime
-            return event
-        }
+                                                                   .rightMouseDown, .scrollWheel, .flagsChanged]) { $0 }
     }
 
     /// The program shows the cursor (SwiftTerm says so through these).
@@ -1723,28 +1893,29 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     /// Programs that animate their title (coding agents' spinners) change it many times a second,
-    /// and every tab strip, sidebar and menu listing titles follows: a tab not on screen passes on
-    /// its title at most once a second (the latest one).
+    /// and every tab strip, sidebar and menu listing titles follows. Publish the latest title at a
+    /// bounded rate for every tab: an on-screen agent must not invalidate all those views per frame.
     private var pendingTitle: String?
     private var lastTitleAt: TimeInterval = 0
+    private static let titleUpdateHold: TimeInterval = 0.25
 
     public func setTerminalTitle(source: TerminalView, title: String) {
         guard let session, !replayingEarlier else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if session.isOnScreen || now - lastTitleAt >= 1 {
+        if now - lastTitleAt >= Self.titleUpdateHold {
             pendingTitle = nil
             lastTitleAt = now
-            session.remoteTitle = title
+            if session.remoteTitle != title { session.remoteTitle = title }
             return
         }
         let queued = pendingTitle != nil
         pendingTitle = title
         guard !queued else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.05, 1 - (now - lastTitleAt))) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.05, Self.titleUpdateHold - (now - lastTitleAt))) { [weak self] in
             guard let self, let title = self.pendingTitle else { return }
             self.pendingTitle = nil
             self.lastTitleAt = ProcessInfo.processInfo.systemUptime
-            self.session?.remoteTitle = title
+            if self.session?.remoteTitle != title { self.session?.remoteTitle = title }
         }
     }
 
@@ -1774,6 +1945,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // brings the live terminal back and counts as a command.
         guard !replayingEarlier else { return }       // answers to queries in earlier output
         guard isUserInput else { session?.sendAutomatic(data); return }
+        lastUserInputAt = ProcessInfo.processInfo.systemUptime
         returnToLive()          // typing while scrolled back into the recording: the live end again
         clearCommandSelection()
         historyJump = nil
@@ -1854,6 +2026,12 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// Rows in the buffer (scrollback and screen).
     var bufferLineCount: Int {
         flushHiddenOutput()
+        return unflushedBufferLineCount()
+    }
+
+    /// Counts the current terminal buffer only. Internal feed/reflow paths use this rather than
+    /// `bufferLineCount`, whose public contract is to first make queued output observable.
+    private func unflushedBufferLineCount() -> Int {
         let t = getTerminal()
         var lo = t.buffer.totalLinesTrimmed, hi = lo + 4_000_000
         while lo < hi {   // first invariant row without a line
@@ -1888,10 +2066,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     /// Sets the scrollback size, noting the lines a smaller size drops (and moving the command
     /// marks with the lines they belong to, since SwiftTerm does not count those lines as trimmed).
-    private func resizeScrollback(_ lines: Int) {
-        let before = bufferLineCount
+    private func resizeScrollback(_ lines: Int, flushPending: Bool = true) {
+        let before = flushPending ? bufferLineCount : unflushedBufferLineCount()
         getTerminal().changeScrollback(lines)
-        let dropped = before - bufferLineCount
+        let dropped = before - (flushPending ? bufferLineCount : unflushedBufferLineCount())
         guard dropped > 0 else { return }
         textVersion &+= 1           // the text kept for search is no longer what is here
         droppedByResize += dropped
@@ -2287,7 +2465,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // A full-screen program's screen, nothing older than memory, or no index: the scroller
         // stands for what is in memory.
         guard !isAlternateScreen || isBrowsingHistory, let index = sessionScaleIndex else {
-            historyScroller.set(total: bufferLineCount, top: t.buffer.yDisp, visible: t.rows)
+            // The scroller may briefly trail a paced output queue.  It must never synchronously
+            // drain that queue just to update its thumb while a coding agent is streaming.
+            historyScroller.set(total: unflushedBufferLineCount(), top: t.buffer.yDisp, visible: t.rows)
             return
         }
         let total = index.lines + 1
