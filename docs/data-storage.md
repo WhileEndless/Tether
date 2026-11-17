@@ -20,9 +20,12 @@ hosts to look at them are listed in [remote-commands.md](remote-commands.md).
    are kept, and only unlocking opens them. (The public half is saved the first time Tether is
    unlocked with encryption on; before that, nothing is recorded while locked.) Nothing is ever
    written in plain text.
-5. **Nothing is left behind.** Temporary files are removed when done, or at the next launch.
-6. **Private tabs** keep nothing: no recording, no archive entry, no command history, and their own
-   tmux or screen session on the server is ended when the tab closes or Tether quits.
+5. **Temporary files are cleaned up.** They are removed when done, or during later cleanup as
+   described below.
+6. **Private tabs** keep no recording, archive entry or command history, and their own tmux or
+   screen session on the server is ended when the tab closes or Tether quits. Like other tabs,
+   they can use an encrypted temporary output buffer during heavy output (see below); this is
+   not persistent session history.
 7. **One Tether at a time.** A second copy started with the same data folder brings the first one to
    the front and quits, before it touches anything.
 
@@ -57,6 +60,23 @@ Temporary files outside this folder:
 - An update being prepared (Settings ▸ General ▸ Updates): the release's source, the app built from it and `update.log` in `tether-update-work` in your temporary folder (private to you). It waits there until you choose Restart to Update (nothing is installed before) and is removed once the update is installed.
 - Updates' build folder: `~/Library/Caches/<Tether's bundle id>/tether-update-build` (private to you), kept between updates so the next one compiles only what changed (a few hundred MB). macOS may clear it; the next update then builds from scratch. Deleting it is safe.
 - The signing certificate "Tether Local Signing" in your login keychain, made once by the first build from source (also by an update), so macOS recognises every later build as the same app and keeps the keychain's *Always Allow* and folder permissions. It never leaves your Mac; removing it in Keychain Access makes builds ad-hoc signed again until the next build makes a new one.
+
+## Temporary terminal output
+
+Busy terminals queue output in memory before displaying it. The queue uses up to 2 MiB per
+terminal and 32 MiB across terminals; excess output can use an encrypted buffer in the system's
+temporary folder, with a shared disk limit of 2 GiB. These limits cover pending output, not the
+terminal's scrollback or recordings. If the buffer cannot accept more, that terminal's reader
+waits in the background until space is available; the app stays responsive and output stays ordered.
+
+This buffer always uses AES-256-GCM, including for private tabs and when recording encryption is
+off. Each buffer has a fresh key held only in memory, and its directory is readable only by your
+account. Files are removed as their output is consumed, and closing the buffer removes its
+remaining files. After a crash, the keys are lost; leftover directories from ended processes are
+removed the next time Tether needs a temporary output buffer.
+
+Buffer files are not recordings: they cannot be reopened after relaunch and are not used for
+history search, export or the Archive. Recording and private-tab rules still apply independently.
 
 ## Recordings in detail
 

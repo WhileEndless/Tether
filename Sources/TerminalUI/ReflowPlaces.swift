@@ -25,16 +25,22 @@ struct ReflowPlaces {
 
     /// The rows the places are at now (nil: that text is no longer in the buffer).
     func rows(in view: TerminalView) -> [Int?] {
+        positions(in: view, columns: Array(repeating: 0, count: places.count)).map { $0?.row }
+    }
+
+    /// Selection endpoints include a column within their old wrapped row.
+    func positions(in view: TerminalView, columns: [Int]) -> [Position?] {
         let starts = Self.lineStarts(view)
         let cursor = Self.line(of: Self.cursorRow(view), starts: starts) ?? 0
         let newCols = max(view.getTerminal().cols, 1)
         let total = Self.rowCount(view)
-        return places.map { place in
+        return places.enumerated().map { index, place in
             guard let place else { return nil }
             let i = cursor - place.fromCursor
             guard starts.indices.contains(i) else { return nil }
             let lineRows = (i + 1 < starts.count ? starts[i + 1] : total) - starts[i]
-            return starts[i] + min(place.column / newCols, max(lineRows - 1, 0))
+            let offset = place.column + (columns.indices.contains(index) ? columns[index] : 0)
+            return Position(col: offset % newCols, row: starts[i] + min(offset / newCols, max(lineRows - 1, 0)))
         }
     }
 

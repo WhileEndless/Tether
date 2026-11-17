@@ -90,6 +90,8 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         for last in "$@"; do :; done
         export TMUX_TMPDIR="\(dir.path)"
         unset TMUX
+        export HOME="\(dir.path)" ZDOTDIR="\(dir.path)" ENV=/dev/null BASH_ENV=/dev/null
+        export PS1='$ '
         export SHELL=/bin/sh
         export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
         exec /bin/sh -c "$last"
@@ -288,6 +290,28 @@ final class ScreenSink: TerminalSink, TerminalDelegate {
         session.send(Array("exit 3\r".utf8)[...])
         try await wait("dead") { session.phase.isDead }
         #expect(!sink.text.contains("7770;"), "bootstrap marker must not reach the terminal")
+    }
+
+    @Test func aBurstIsDeliveredCompletelyBeforeTheProcessExit() async throws {
+        let cfg = config()
+        let session = TerminalSession(descriptor: SessionDescriptor(target: host, persistence: .off)) { cfg }
+        let sink = RecordingSink()
+        session.attach(sink: sink)
+        defer { session.close(killRemote: true) }
+        session.start()
+        try await wait("burst shell online") { session.phase.isOnline }
+        let padding = String(repeating: "x", count: 240)
+        // More than the per-session memory budget, followed immediately by process exit.
+        // The literal command echo cannot match a generated row's complete contents.
+        let command = "awk 'BEGIN {for (i=0;i<20000;i++) printf \"raw%05d:\(padding)\\n\", i}'; exit\r"
+        session.send(Array(command.utf8)[...])
+        try await wait("burst drained before exit", timeout: 30) { session.phase.isDead }
+        let lines = sink.text.components(separatedBy: .newlines)
+            .filter { $0.hasPrefix("raw") }
+        #expect(lines.count == 20_000)
+        #expect(lines.enumerated().allSatisfy { index, line in
+            line == String(format: "raw%05d:", index) + padding
+        }, "Every byte arrives in order before the session ends")
     }
 
     @Test(.enabled(if: LocalSessionTests.hasTmux)) func tmuxControlModePersistsAcrossReattach() async throws {

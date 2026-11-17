@@ -41,6 +41,7 @@ public final class CommandHub {
     private var samplers: [UUID: CommandSampler] = [:]
     private var loop: Task<Void, Never>?
     private var nap: Task<Void, Never>?
+    private var generation = 0
 
     /// Settings (Settings ▸ Monitoring): the watcher, how often it checks, how often to look.
     public var watchEnabled = true { didSet { if watchEnabled != oldValue { restartWatcher() } } }
@@ -48,7 +49,7 @@ public final class CommandHub {
 
     /// No Tether window is visible: the watcher goes on (it costs nothing while commands are idle,
     /// and keeps the history's starts and ends right), looks at running commands only every 15 s.
-    public var backgrounded = false
+    public var backgrounded = false { didSet { if backgrounded != oldValue { wake() } } }
     private var lastLook: Date?
 
     private var watcher: RemoteStream?
@@ -91,38 +92,51 @@ public final class CommandHub {
 
     /// Ends the loop and the watcher (no terminals left online, the Mac goes to sleep, the app quits).
     public func stop() {
+        generation += 1
         loop?.cancel()
         loop = nil
         nap?.cancel()
+        nap = nil
         stopWatcher()
     }
 
     private func start() {
         guard loop == nil else { return }
+        generation += 1
+        let generation = generation
         loop = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
+                guard let self, self.generation == generation else { return }
                 await self.round()
-                await self.pause()
+                guard !Task.isCancelled, self.generation == generation else { return }
+                await self.pause(generation: generation)
             }
         }
     }
 
     /// Waits until the next terminal is due (at most a second, so changes are noticed), or a wake.
-    private func pause() async {
-        let now = Date()
-        let online = samplers.values.filter(\.isOnline)
-        guard !online.isEmpty else { stop(); return }
-        let t = Task<Void, Never> { try? await Task.sleep(for: .seconds(1)) }
+    private func pause(generation: Int) async {
+        guard self.generation == generation, !Task.isCancelled else { return }
+        guard samplers.values.contains(where: \.isOnline) else { stop(); return }
+        // Every pass must suspend, even when a sampler is due but the background throttle
+        // prevents a look. An async function that returns immediately does not yield the actor.
+        let delay = Self.pauseInterval(backgrounded: backgrounded, lastLook: lastLook, now: Date())
+        let t = Task<Void, Never> { try? await Task.sleep(for: .seconds(delay)) }
         nap = t
-        if !online.contains(where: { $0.isDue(at: now) }) { await t.value }
-        nap = nil
+        await withTaskCancellationHandler { await t.value } onCancel: { t.cancel() }
+        if self.generation == generation { nap = nil }
+    }
+
+    static func pauseInterval(backgrounded: Bool, lastLook: Date?, now: Date) -> TimeInterval {
+        guard backgrounded, let lastLook else { return 1 }
+        return min(1, max(0.05, 15 - now.timeIntervalSince(lastLook)))
     }
 
     // MARK: Looking
 
     private func round() async {
         await keepWatcherCurrent()
+        guard !Task.isCancelled else { return }
         let now = Date()
         if backgrounded, let lastLook, now.timeIntervalSince(lastLook) < 15 { return }
         let due = samplers.values.filter { $0.isOnline && $0.isDue(at: now) }
@@ -131,6 +145,7 @@ public final class CommandHub {
         var anchors: [ShellAnchor] = []
         var asked: [(CommandSampler, CommandSampler.LookToken)] = []
         for s in due {
+            guard !Task.isCancelled else { return }
             guard let a = await s.anchorForLook() else { s.noAnchor(); continue }
             anchors.append(a)
             asked.append((s, s.lookToken))
@@ -138,6 +153,7 @@ public final class CommandHub {
         guard !anchors.isEmpty else { return }
         let r = await executor.run(RemoteScript(ProbeScripts.command, windows: WindowsProbeScripts.command),
                                    arguments: anchors.flatMap(\.probeArguments), timeout: 20, purpose: "monitor")
+        guard !Task.isCancelled else { return }
         guard r.succeeded else {
             let errors = DiagnosticLog.tail(r.errorOutput)
             let why = r.timedOut ? "The host did not answer within 20 s." : r.status == 255
@@ -159,12 +175,17 @@ public final class CommandHub {
         if let retry = watcherRetryAt, Date() < retry { return }
         // Anchors of idle terminals too (tmux is asked; plain shells know theirs): every 30 s or after a change.
         if anchorsRefreshedAt == nil || Date().timeIntervalSince(anchorsRefreshedAt!) > 30 {
-            for s in online { _ = await s.resolveAnchor() }
+            for s in online {
+                guard !Task.isCancelled else { return }
+                _ = await s.resolveAnchor()
+            }
+            guard !Task.isCancelled else { return }
             anchorsRefreshedAt = Date()
         }
         let covered = online.filter { $0.knownAnchor != nil }
         let anchors = covered.compactMap(\.knownAnchor)
         if watcher != nil && anchors == watchedAnchors && covered.map(\.id) == watched { return }
+        guard !Task.isCancelled else { return }
         stopWatcher()
         guard !anchors.isEmpty else { return }
         guard await executor.backgroundWorkAllowed() else { return }

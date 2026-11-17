@@ -995,13 +995,73 @@ final class HistoryTerminalView: TerminalView, TerminalViewDelegate {
 
     // MARK: Width
 
+    private var pendingFrame: NSSize?
+    private var pendingFrameWork: DispatchWorkItem?
+    private var applyingFrame = false
+    private var liveResizing = false
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        liveResizing = true
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        liveResizing = false
+        applyPendingFrame()
+    }
+
+    private func applyPendingFrame() {
+        pendingFrameWork?.cancel()
+        pendingFrameWork = nil
+        guard let size = pendingFrame else { return }
+        pendingFrame = nil
+        applyingFrame = true
+        setFrameSize(size)
+        applyingFrame = false
+    }
+
+    /// Measure on the new display without SwiftTerm soft-resetting the replay or losing the
+    /// reading position. Reflow places are captured while the old grid is still intact.
+    func remeasure(font newFont: NSFont) {
+        pendingFrameWork?.cancel()
+        let size = pendingFrame ?? frame.size
+        pendingFrame = nil
+        resizePreservingPlaces(size, font: newFont)
+    }
+
     /// Another width wraps long lines differently: the line at the top, the commands and the seam
     /// with the live terminal stay on their text.
     override func setFrameSize(_ newSize: NSSize) {
+        if !applyingFrame, window != nil, shown != nil, !feeding, newSize.width != frame.width,
+           newSize.width >= 40, newSize.height >= 20 {
+            pendingFrame = newSize
+            pendingFrameWork?.cancel()
+            if !liveResizing {
+                let work = DispatchWorkItem { [weak self] in self?.applyPendingFrame() }
+                pendingFrameWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+            }
+            return
+        }
+        if !applyingFrame {
+            // A newer immediate size (including one received while replaying) supersedes a
+            // previously coalesced size. Never replay an old display's bounds afterwards.
+            pendingFrameWork?.cancel()
+            pendingFrameWork = nil
+            pendingFrame = nil
+        }
         // While a part is drawn the buffer is being replaced: `apply` makes it again for the new size.
         if feeding, newSize.width != frame.width { resizedWhileFeeding = true }
         guard newSize.width != frame.width, shown != nil, !feeding else { super.setFrameSize(newSize); return }
+        resizePreservingPlaces(newSize)
+    }
+
+    private func resizePreservingPlaces(_ newSize: NSSize, font newFont: NSFont? = nil) {
+        notePlaced()
         let t = getTerminal()
+        let endpoints = selection.active ? (selection.start, selection.end) : nil
+        let selectionPlaces = endpoints.map { ReflowPlaces(self, rows: [$0.0.row, $0.1.row]) }
         let trimmed = t.buffer.totalLinesTrimmed
         let rows = offsetRows.map { $0.row - trimmed } + commands.map { $0.row - trimmed }
             + [liveTop.map { $0.row - trimmed } ?? -1, anchorRow - trimmed, t.buffer.yDisp]
@@ -1011,7 +1071,15 @@ final class HistoryTerminalView: TerminalView, TerminalViewDelegate {
         // (the line looked at with them). The text takes no more memory, only more rows.
         let room = (bufferRows + 1) * max(oldCols, 1) / 10 + t.rows
         if room > t.options.scrollback { t.changeScrollback(room) }
+        if let newFont {
+            super.setFrameSize(.zero)
+            font = newFont
+        }
         super.setFrameSize(newSize)
+        if let endpoints, let selectionPlaces {
+            let positions = selectionPlaces.positions(in: self, columns: [endpoints.0.col, endpoints.1.col])
+            if let start = positions[0], let end = positions[1] { selection.setSelection(start: start, end: end) }
+        }
         guard getTerminal().cols != oldCols else { return }
         let now = places.rows(in: self)
         let newTrimmed = getTerminal().buffer.totalLinesTrimmed

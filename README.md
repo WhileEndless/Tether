@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.6 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.10.7 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.6): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.7): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -133,6 +133,8 @@ Search across every terminal, the archive and recordings.
 - No limit on how long a session runs: memory keeps a set number of lines, and scrolling further reads earlier output back from disk without a visible break (view and selection stay in place).
 - Closing the window keeps Tether and every session running in the menu bar; the icon brings the window back with its tabs.
 - After quitting — or a crash — every window comes back with its tabs, selected tab, size, position and full-screen state.
+- Display changes keep windows within the available screens. Resizing and moving between displays preserve terminal modes, history reading positions and selections.
+- Busy terminals share time for displaying output so typing and window interaction stay responsive. Excess pending output uses an encrypted temporary buffer, including in private tabs; see [data storage](docs/data-storage.md#temporary-terminal-output).
 - Dozens of tabs to one host: one sign-in, and terminals are spread over several shared connections (servers allow 10 sessions per connection by default).
 - Monitoring pauses while no Tether window is visible, and recordings are written in large batches to spare the SSD.
 

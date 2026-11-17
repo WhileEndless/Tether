@@ -128,8 +128,9 @@ enum WindowLayout {
         window.isRestorable = false
         guard let i = pending.firstIndex(where: { $0.workspaceID == id }) else { return }
         let e = pending.remove(at: i)
-        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(e.frame) }), e.frame.width > 300 {
-            window.setFrame(e.frame, display: true)
+        if e.frame.width > 300, e.frame.height > 0,
+           [e.frame.minX, e.frame.minY, e.frame.width, e.frame.height].allSatisfy(\.isFinite) {
+            window.setFrame(WindowPlacement.fitted(e.frame, to: NSScreen.screens.map(\.visibleFrame)), display: true)
         }
         if e.fullScreen && !window.styleMask.contains(.fullScreen) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { window.toggleFullScreen(nil) }
@@ -170,6 +171,7 @@ enum WindowLayout {
     /// Keeps the saved layout current as windows move, resize and enter or leave full screen,
     /// so it is right even after a crash. Normal frames are kept for full-screen windows.
     static func watch(_ window: NSWindow, workspace id: UUID) {
+        watchDisplays()
         let key = ObjectIdentifier(window)
         guard watched.insert(key).inserted else { return }
         let center = NotificationCenter.default
@@ -178,14 +180,25 @@ enum WindowLayout {
         observers[key, default: []].append(center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { _ in
             MainActor.assumeIsolated {
                 watched.remove(key)
+                transitioning.remove(key)
+                transitionGenerations[key] = nil
                 for t in observers.removeValue(forKey: key) ?? [] { center.removeObserver(t) }
             }
         })
         observers[key, default: []].append(center.addObserver(forName: NSWindow.willEnterFullScreenNotification, object: window, queue: .main) { n in
             MainActor.assumeIsolated {
                 if let w = n.object as? NSWindow { lastNormalFrame[id] = w.frame }
+                beginTransition(key)
             }
         })
+        observers[key, default: []].append(center.addObserver(forName: NSWindow.willExitFullScreenNotification, object: window, queue: .main) { _ in
+            MainActor.assumeIsolated { beginTransition(key) }
+        })
+        for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
+            observers[key, default: []].append(center.addObserver(forName: name, object: window, queue: .main) { _ in
+                MainActor.assumeIsolated { transitioning.remove(key); transitionGenerations[key] = nil; scheduleDisplayRepair() }
+            })
+        }
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification,
                      NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
             observers[key, default: []].append(center.addObserver(forName: name, object: window, queue: .main) { _ in
@@ -193,6 +206,51 @@ enum WindowLayout {
             })
         }
         scheduleSave()
+    }
+
+    private static var transitioning: Set<ObjectIdentifier> = []
+    private static var transitionGenerations: [ObjectIdentifier: UUID] = [:]
+    private static var displayObserver: NSObjectProtocol?
+    private static var displayRepair: DispatchWorkItem?
+    private static var displayRepairNeeded = false
+
+    private static func beginTransition(_ key: ObjectIdentifier) {
+        transitioning.insert(key)
+        let generation = UUID()
+        transitionGenerations[key] = generation
+        // AppKit does not post a completion notification for a failed full-screen transition.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard transitionGenerations[key] == generation else { return }
+            transitionGenerations[key] = nil
+            if transitioning.remove(key) != nil { scheduleDisplayRepair() }
+        }
+    }
+
+    private static func watchDisplays() {
+        guard displayObserver == nil else { return }
+        displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                  object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { displayRepairNeeded = true; scheduleDisplayRepair() }
+        }
+    }
+
+    private static func scheduleDisplayRepair() {
+        guard displayRepairNeeded else { return }
+        displayRepair?.cancel()
+        let work = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let screens = NSScreen.screens.map(\.visibleFrame)
+                guard !screens.isEmpty else { return }
+                for window in NSApp.windows where (window.isVisible || window.isMiniaturized) && !(window is NSPanel) {
+                    guard !window.styleMask.contains(.fullScreen), !transitioning.contains(ObjectIdentifier(window)) else { continue }
+                    let fitted = WindowPlacement.fitted(window.frame, to: screens)
+                    if fitted != window.frame { window.setFrame(fitted, display: true) }
+                }
+                displayRepairNeeded = !transitioning.isEmpty
+            }
+        }
+        displayRepair = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     private static var saveWork: DispatchWorkItem?

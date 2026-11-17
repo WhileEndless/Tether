@@ -1,5 +1,6 @@
 import AppKit
 import os
+import TetherCore
 
 /// Notices when Tether stops answering (the main thread busy for seconds) and keeps a record of
 /// where it was: macOS's own `sample` of this process, saved under ~/Library/Logs/Tether (on this
@@ -15,7 +16,10 @@ final class HangWatch: @unchecked Sendable {
     private let log = Logger(subsystem: "io.github.whileendless.tether", category: "app")
 
     static var folder: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Tether", isDirectory: true)
+        if AppPaths.debugOverride("TETHER_SUPPORT_DIR") != nil {
+            return AppPaths.supportDirectory.appendingPathComponent("Logs", isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Tether", isDirectory: true)
     }
 
     func start() {

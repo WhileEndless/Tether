@@ -15,6 +15,28 @@ import FileTransferKit
 /// TETHER_SUPPORT_DIR and TETHER_DEFAULTS_SUITE so real user data is never touched.
 @MainActor
 enum SelfTest {
+    /// SwiftUI can launch with no workspace when its previous scene state was closed. Start
+    /// automation through the same menu action as the user, without changing normal launch.
+    static func openWindowIfRequested() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["TETHER_SELFTEST"] != nil, env["TETHER_SUPPORT_DIR"] != nil,
+              env["TETHER_DEFAULTS_SUITE"] != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard !started else { return }
+            func action(in menu: NSMenu) -> (NSMenu, Int)? {
+                for (index, item) in menu.items.enumerated() {
+                    if item.title == Shortcut.newWindow.title, item.isEnabled { return (menu, index) }
+                    if let submenu = item.submenu, let found = action(in: submenu) { return found }
+                }
+                return nil
+            }
+            if let menu = NSApp.mainMenu, let (owner, index) = action(in: menu) {
+                NSApp.activate()
+                owner.performActionForItem(at: index)
+            }
+        }
+    }
+
     private static var started = false
 
     /// A terminal's row in the sidebar and where it is (window coordinates, top-left origin).
@@ -1054,6 +1076,24 @@ enum SelfTest {
                     state.window?.setFrame(NSRect(x: 120, y: 140, width: 1100, height: 700), display: true)
                     try? await Task.sleep(for: .seconds(1))
                     say("resized")
+                    if env["TETHER_SELFTEST_DISPLAYCHANGE"] != nil, let window = state.window {
+                        for screen in NSScreen.screens {
+                            let rect = WindowPlacement.fitted(CGRect(origin: screen.visibleFrame.origin,
+                                                                      size: window.frame.size), to: [screen.visibleFrame])
+                            window.setFrame(rect, display: true)
+                            try? await Task.sleep(for: .milliseconds(300))
+                            let grid = state.session.flatMap { TerminalRegistry.shared.existingView(for: $0.id)?.cellSize }
+                            say("display scale=\(window.backingScaleFactor) grid=\(String(describing: grid))")
+                        }
+                        window.setFrame(CGRect(x: -50000, y: 50000, width: 2000, height: 1200), display: true)
+                        for _ in 0..<6 {
+                            NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: NSApp)
+                            try? await Task.sleep(for: .milliseconds(20))
+                        }
+                        try? await Task.sleep(for: .milliseconds(500))
+                        let fitted = NSScreen.screens.contains { $0.visibleFrame.contains(window.frame) }
+                        say(fitted ? "PASS display change keeps window reachable" : "FAIL display change left window outside displays")
+                    }
                     if let first = state.tabs.first { state.select(first) }
                     if let last = state.tabs.last { state.present(last.id, mode: .window) }
                     try? await Task.sleep(for: .seconds(2))

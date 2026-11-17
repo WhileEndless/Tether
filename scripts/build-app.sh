@@ -31,6 +31,15 @@ MAP=(-Xswiftc -file-prefix-map -Xswiftc "$ROOT=." -Xswiftc -debug-prefix-map -Xs
 # native system whenever the toolchain offers it.
 SWIFTPM=(-c "$CONFIG" "${MAP[@]}")
 SWIFT_HELP="$(swift build --help 2>/dev/null || true)"
+# Distribution builds have no use for compiler debug records. Avoid creating them in the
+# first place: mapped Clang module paths can otherwise leak into debug metadata and produce
+# missing-PCM warnings while SwiftPM links its build tools. Source-path mapping still protects
+# runtime file names, and the final strip below remains a second check.
+if [ "$CONFIG" = release ]; then
+    case $SWIFT_HELP in
+        *-debug-info-format*) SWIFTPM+=(-debug-info-format none) ;;
+    esac
+fi
 case $SWIFT_HELP in
     *native*) SWIFTPM+=(--build-system native) ;;
     *)

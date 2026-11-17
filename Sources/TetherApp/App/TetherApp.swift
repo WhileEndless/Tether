@@ -161,6 +161,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Self.reportTamperedSettings()
             TabBarCenter.shared.start()
             installCloseTabShortcut()
+            #if DEBUG
+            SelfTest.openWindowIfRequested()
+            #endif
             // After the first window is up, so the notice never blocks starting.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { Updater.shared.checkAtLaunch() }
         }

@@ -798,7 +798,11 @@ exit 1
     /// recorder already holds the complete stream. Keeping a larger tail makes the first selected
     /// tab spend too long catching up before it can accept input.
     private static let deferredOutputLimit = 256 * 1024
-    @ObservationIgnored private var process: LocalProcess?
+    @ObservationIgnored private var process: LocalProcess? {
+        didSet {
+            if process == nil { bridge?.cancel(); bridge = nil }
+        }
+    }
     @ObservationIgnored private var bridge: ProcessBridge?
     @ObservationIgnored private var tmux: TmuxDriver?
     /// The tmux pane's history as last seen (see `TmuxDriver.lastPosition`).
@@ -1070,6 +1074,7 @@ exit 1
     public func terminalDidResize(cols: Int, rows: Int) {
         guard let process, process.running else { return }
         var size = winsize(ws_row: UInt16(clamping: max(rows, 1)), ws_col: UInt16(clamping: max(cols, 1)), ws_xpixel: 0, ws_ypixel: 0)
+        bridge?.updateSize(size)
         _ = PseudoTerminalHelpers.setWinSize(masterPtyDescriptor: process.childfd, windowSize: &size)
         tmux?.resize(cols: cols, rows: rows)
     }
@@ -1720,7 +1725,7 @@ exit 1
 
         let bridge = ProcessBridge(owner: self)
         self.bridge = bridge
-        let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
+        let process = LocalProcess(delegate: bridge, dispatchQueue: bridge.deliveryQueue)
         bridge.process = process
         self.process = process
         if local { env["PATH"] = ChildEnvironment.local["PATH"] }
@@ -1863,7 +1868,7 @@ exit 1
         for (k, v) in askPassEnv { env[k] = v }
         let bridge = ProcessBridge(owner: self)
         self.bridge = bridge
-        let process = LocalProcess(delegate: bridge, dispatchQueue: .main)
+        let process = LocalProcess(delegate: bridge, dispatchQueue: bridge.deliveryQueue)
         bridge.process = process
         self.process = process
         ChildDescriptors.closeOnExecAboveStdio()
@@ -1899,9 +1904,9 @@ exit 1
     @ObservationIgnored private var lastReceivedUptime = ProcessInfo.processInfo.systemUptime
 
     /// Whether `p` is the process the tab runs now.
-    fileprivate func isCurrent(_ p: LocalProcess?) -> Bool { p != nil && p === process }
+    func isCurrent(_ p: LocalProcess?) -> Bool { p != nil && p === process }
 
-    fileprivate func processOutput(_ slice: ArraySlice<UInt8>) {
+    func processOutput(_ slice: ArraySlice<UInt8>) {
         attemptProgressed()
         lastReceivedAt = Date()
         lastReceivedUptime = ProcessInfo.processInfo.systemUptime
@@ -2112,7 +2117,7 @@ exit 1
         processTerminated(exitCode: nil)
     }
 
-    fileprivate func processTerminated(exitCode: Int32?) {
+    func processTerminated(exitCode: Int32?) {
         process = nil
         releaseGate()
         // A login of this tab's own (no connection sharing) that never got online: told so, and
@@ -2647,39 +2652,9 @@ exit 1
         return sink.cellSize
     }
 
-    fileprivate var windowSize: winsize {
+    var windowSize: winsize {
         let s: (cols: Int, rows: Int) = sink?.cellSize ?? (80, 24)
         return winsize(ws_row: UInt16(max(s.rows, 1)), ws_col: UInt16(max(s.cols, 1)), ws_xpixel: 0, ws_ypixel: 0)
-    }
-}
-
-/// Non-isolated adapter between SwiftTerm's `LocalProcessDelegate` and the main-actor session.
-/// The process is created with `dispatchQueue: .main`, so callbacks already run on the main thread.
-final class ProcessBridge: LocalProcessDelegate {
-    weak var owner: TerminalSession?
-    /// The process this bridge belongs to: what a process the tab already let go of still sends
-    /// (tmux's `%exit` as it detaches, ssh's last words) is not shown in the terminal.
-    weak var process: LocalProcess?
-    init(owner: TerminalSession) { self.owner = owner }
-
-    func processTerminated(_ source: LocalProcess, exitCode: Int32?) {
-        let code = TerminalSession.exitStatus(fromWaitStatus: exitCode)
-        MainActor.assumeIsolated {
-            // A process the tab already let go of (and replaced) ending later changes nothing.
-            guard let owner, owner.isCurrent(source) else { return }
-            owner.processTerminated(exitCode: code)
-        }
-    }
-
-    func dataReceived(slice: ArraySlice<UInt8>) {
-        MainActor.assumeIsolated {
-            guard let owner, owner.isCurrent(process) else { return }
-            owner.processOutput(slice)
-        }
-    }
-
-    func getWindowSize() -> winsize {
-        MainActor.assumeIsolated { owner?.windowSize ?? winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0) }
     }
 }
 

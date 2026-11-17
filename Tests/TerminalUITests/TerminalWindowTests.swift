@@ -35,6 +35,7 @@ import TetherCore
         for last in "$@"; do :; done
         export TMUX_TMPDIR="\(dir.path)"
         unset TMUX
+        export HOME="\(dir.path)" ZDOTDIR="\(dir.path)" ENV=/dev/null BASH_ENV=/dev/null
         export SHELL=/bin/sh PS1='$ '
         export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
         exec /bin/sh -c "$last"

@@ -131,7 +131,10 @@ import SwiftTerm
         try await CommandJumpTests.settle(f)
         #expect(f.view.beeps == 1, "none before the first")
         seen = []
-        for _ in 0..<13 {
+        for step in 0..<13 {
+            // Let the previous placement's wheel guard expire near the live/history seam.
+            // A command jump must establish its own guard instead of starting a prefetch.
+            if step >= 9 { try await Task.sleep(for: .milliseconds(550)) }
             f.view.jumpToMark(up: false)
             try await CommandJumpTests.settle(f)
             seen.append(Self.selected(f.shown))

@@ -118,6 +118,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     /// Lets go of everything set from outside (the tab closed: see `TerminalRegistry.remove`).
     func releaseCallbacks() {
+        OutputScheduler.shared.cancel(id: outputJobID)
+        pendingScaleUpdate?.cancel()
         discardHistory(force: true)
         onFiles = nil
         onRemoteFiles = nil
@@ -422,6 +424,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private var pendingOutput: [UInt8] = []
     private var pendingOutputStart = 0
     private var pendingOutputFlushQueued = false
+    private let outputJobID = UUID()
+    private var outputConsumed = 0
+    private var deferredFrameThrough: Int?
+    private var applyingDeferredFrame = false
     /// Feeding terminal bytes can synchronously invoke view/delegate callbacks. Some of those
     /// need a current terminal and call `flushHiddenOutput` themselves. Never let such a callback
     /// feed the same queued range recursively (that used to overflow the main-thread stack).
@@ -433,14 +439,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// Applying a deferred frame can itself ask for terminal state. Keep it out of the synchronous
     /// output-feed callback stack and coalesce repeated size changes into one main-loop turn.
     private var deferredFrameApplyQueued = false
-    private static let visibleOutputHold: TimeInterval = 1.0 / 30.0
-    /// An unseen tab needs a correct eventual terminal state, not live animation.  One bounded
-    /// pass per second prevents a roomful of busy agents from competing with the active terminal.
-    private static let hiddenOutputHold: TimeInterval = 1
     /// A coding agent can write richly styled frames faster than they can be parsed and drawn.
     /// Keep one visible pass below a frame budget; queued bytes remain ordered and catch up over
     /// subsequent passes instead of delaying keyboard events.
-    private static let visibleOutputChunkBytes = 8 << 10
+    private static let visibleOutputChunkBytes = 2 << 10
     private static let resizeDeferralBytes = 64 << 10
 
     private var queuedOutputBytes: Int { pendingOutput.count - pendingOutputStart }
@@ -453,9 +455,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     private func queueOutputFlush() {
         guard !pendingOutputFlushQueued else { return }
         pendingOutputFlushQueued = true
-        let hold = window == nil ? Self.hiddenOutputHold : Self.visibleOutputHold
-        DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+        OutputScheduler.shared.enqueue(id: outputJobID, visible: { [weak self] in self?.window != nil }) { [weak self] in
             self?.flushOutputChunk()
+            return false
         }
     }
 
@@ -470,8 +472,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // Advance before feeding: callbacks during `feedNow` must never observe this piece as
         // still pending. New remote bytes append after `end` and remain ordered for the next pass.
         pendingOutputStart = end
+        outputConsumed += bytes.count
         feedNow(bytes[...])
         outputFlushInProgress = false
+        applyDeferredFrameSizeIfReady()
         if pendingOutputStart == pendingOutput.count {
             pendingOutput.removeAll(keepingCapacity: true)
             pendingOutputStart = 0
@@ -495,7 +499,8 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     }
 
     private func applyDeferredFrameSizeIfReady() {
-        guard !outputFlushInProgress, queuedOutputBytes == 0, let size = deferredFrameSize,
+        guard !outputFlushInProgress, let size = deferredFrameSize,
+              deferredFrameThrough.map({ outputConsumed >= $0 }) ?? (queuedOutputBytes == 0),
               !deferredFrameApplyQueued else { return }
         deferredFrameSize = nil
         deferredFrameApplyQueued = true
@@ -505,24 +510,24 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             // A later layout pass may have supplied a newer final size while this work waited.
             let finalSize = self.deferredFrameSize ?? size
             self.deferredFrameSize = nil
-            // Bytes may have arrived between scheduling and this turn. Let the paced drain finish
-            // first rather than recursively flushing them from a resize callback.
-            guard self.queuedOutputBytes == 0 else {
-                self.deferredFrameSize = finalSize
-                self.startVisibleOutputCatchUp()
-                return
-            }
+            // This is a barrier in the byte stream, not a wait for a busy producer to go idle.
+            self.deferredFrameThrough = nil
+            self.applyingDeferredFrame = true
             self.setFrameSize(finalSize)
+            self.applyingDeferredFrame = false
         }
     }
 
     /// Feeds every pending piece before anything reads the screen or changes terminal state.
     public func flushHiddenOutput() {
+        guard !applyingDeferredFrame else { return }
         pendingOutputFlushQueued = false
+        OutputScheduler.shared.cancel(id: outputJobID)
         guard !outputFlushInProgress, pendingOutputStart < pendingOutput.count else { return }
         // Copy and remove this drain before invoking SwiftTerm. Its synchronous callbacks may ask
         // for a flush; they see an empty current batch instead of recursively feeding it again.
         let bytes = Array(pendingOutput[pendingOutputStart...])
+        outputConsumed += bytes.count
         pendingOutput.removeAll(keepingCapacity: true)
         pendingOutputStart = 0
         outputFlushInProgress = true
@@ -782,8 +787,13 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
 
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        updateMetricsForScale()
+        pendingScaleUpdate?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.updateMetricsForScale() }
+        pendingScaleUpdate = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
+
+    private var pendingScaleUpdate: DispatchWorkItem?
 
     /// SwiftTerm snaps the cell width to the pixels of the screen it measured on and never measures
     /// again. Box-drawing characters (─ │ ╭ …, Claude Code's tables, rules and input box) are drawn
@@ -793,8 +803,6 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// so measure again for the window's screen.
     private func updateMetricsForScale() {
         guard let scale = window?.backingScaleFactor, scale != metricsScale else { return }
-        // The history view is measured with it (its lines wrap as these do): back to live first.
-        if isBrowsingHistory { returnToLive() }
         setFont(font)
     }
 
@@ -803,14 +811,20 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// With no size, it only measures; the size given back then resizes the terminal as usual.
     private func setFont(_ newFont: NSFont) {
         let size = frame.size
+        let endpoints = selection.active ? (selection.start, selection.end) : nil
+        let places = endpoints.map { ReflowPlaces(self, rows: [$0.0.row, $0.1.row]) }
         setFrameSize(.zero)
         font = newFont
         setFrameSize(size)
+        if let endpoints, let places {
+            let positions = places.positions(in: self, columns: [endpoints.0.col, endpoints.1.col])
+            if let start = positions[0], let end = positions[1] { selection.setSelection(start: start, end: end) }
+        }
         metricsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
         // A history view kept for going back has its places at the old cells: let go of. One still
         // reading is measured again too (the same font, other cells on another screen).
-        discardHistory()
-        history?.font = newFont
+        if isBrowsingHistory { history?.remeasure(font: newFont) }
+        else { discardHistory(); history?.remeasure(font: newFont) }
         reportFontResize()
     }
 
@@ -840,6 +854,10 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         // `setFont`'s: SwiftTerm only measures then.)
         if frame.width >= 40, newSize != .zero, newSize.width < 40 || newSize.height < 20 { return }
         if frameWidthsSeen.count < 64, newSize.width != frame.width { frameWidthsSeen.append(newSize.width) }
+        if deferredFrameApplyQueued, !applyingDeferredFrame, newSize != .zero, frame.size != .zero {
+            deferredFrameSize = newSize
+            return
+        }
         // Another width wraps long lines differently: the command marks, the command jumped to and
         // the line at the top of the view stay on their text.
         // `setFont`'s measuring (to no size and back) changes no columns: nothing is looked through.
@@ -867,8 +885,13 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
             deferredFrameSize = newSize
             return
         }
-        if queuedOutputBytes > Self.resizeDeferralBytes {
+        if !applyingDeferredFrame, queuedOutputBytes > Self.resizeDeferralBytes {
             deferredFrameSize = newSize
+            if deferredFrameThrough == nil {
+                // A resize is a barrier after the next bounded piece, not after the entire
+                // backlog: restoring a busy tab must not leave its grid at a stale host size.
+                deferredFrameThrough = outputConsumed + min(queuedOutputBytes, Self.visibleOutputChunkBytes)
+            }
             startVisibleOutputCatchUp()
             return
         }
@@ -1529,6 +1552,9 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// highlighted.
     private func placeHistory(atRow row: Int, position: Int) {
         guard let h = history else { return }
+        // This scroll is navigation, not a wheel gesture. Otherwise an older part can
+        // prefetch or leave for the live screen halfway through placing the next command.
+        h.notePlaced()
         let trimmed = h.getTerminal().buffer.totalLinesTrimmed
         h.scrollTo(row: max(row - trimmed - Self.jumpContext, 0))
         h.selectCommand(line: row, column: exactIndex.flatMap { $0.marks.indices.contains(position) ? $0.marks[position].column : nil })

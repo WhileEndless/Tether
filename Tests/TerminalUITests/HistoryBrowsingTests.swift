@@ -307,6 +307,7 @@ import TerminalText
         for _ in 0..<300 where !f.view.isBrowsingHistory || f.view.history?.loading == true { try await Task.sleep(for: .milliseconds(10)) }
         #expect(f.view.isBrowsingHistory)
         var previous = place()
+        let initial = previous
         var went = 0
         func screen() -> String {
             let t = f.shown.getTerminal()
@@ -327,7 +328,10 @@ import TerminalText
             if now > previous { went += 1 }
             previous = now
         }
-        #expect(went > 20, "it moved on (\(went) steps, at \(previous))")
+        // Redrawn status frames may consume wheel steps without reaching another numbered
+        // line. The contract is forward distance and monotonicity, not the count of steps
+        // that happened to reveal a new number (which also varied on the unmodified app).
+        #expect(went > 0 && previous > initial + 20, "it moved on from \(initial) to \(previous) (\(went) steps)")
     }
 
     /// The Mac short of memory: a tab off screen keeps only its last lines at once (the rest is in
