@@ -1118,10 +1118,6 @@ final class HistoryTerminalView: TerminalView, TerminalViewDelegate {
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         if window?.firstResponder === self { window?.makeFirstResponder(live) }
-        // Copy on select (Settings ▸ Terminal), as in the live terminal.
-        if live.copiesOnSelect, selection.active, let text = getSelection(), !text.isEmpty {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-        }
+        live.copyOnMouseUp(from: self)
     }
 }

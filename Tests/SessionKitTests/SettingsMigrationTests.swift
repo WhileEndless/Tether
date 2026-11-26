@@ -61,4 +61,20 @@ import TetherCore
         let now = try decode(#"{"version":7,"transferArchiveThreshold":20,"transferCompression":"xz"}"#)
         #expect(now.transferArchiveThreshold == 20 && now.transferCompression == .xz)
     }
+
+    @Test func terminalCopyPreferencesDefaultToPlainAndRoundTrip() throws {
+        var settings = try decode(#"{"version":9}"#)
+        #expect(settings.terminalCopyFormat == .plain)
+        #expect(!settings.copyTerminalBackground)
+        #expect(settings.ansiCopyEncoding == .visible)
+        settings.terminalCopyFormat = .styled
+        settings.copyTerminalBackground = true
+        settings.ansiCopyEncoding = .raw
+
+        let data = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
+        #expect(decoded.terminalCopyFormat == .styled)
+        #expect(decoded.copyTerminalBackground)
+        #expect(decoded.ansiCopyEncoding == .raw)
+    }
 }

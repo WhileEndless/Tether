@@ -68,7 +68,8 @@ private struct SettingsSearchResults: View {
         .init(target: .tab(.general), title: "Tabs and windows", detail: "new tab placement, closing, naming and Finder browsing"),
         .init(target: .tab(.appearance), title: "Appearance and sidebar", detail: "theme, accent color, text size, sidebar details, counts and archive"),
         .init(target: .tab(.terminal), title: "Terminal font and cursor", detail: "font, size, cursor shape and blinking"),
-        .init(target: .tab(.terminal), title: "Terminal behavior", detail: "scrollback, bell, mouse reporting, selection copy and notifications"),
+        .init(target: .tab(.terminal), title: "Terminal behavior", detail: "scrollback, bell, mouse reporting and notifications"),
+        .init(target: .tab(.terminal), title: "Terminal copying", detail: "copy format, plain text, styled text, ANSI escape codes, terminal background and copy on selection"),
         .init(target: .tab(.terminal), title: "Terminal find", detail: "highlight, match colors, scroller marks and search delay"),
         .init(target: .tab(.keyboard), title: "Keyboard mappings", detail: "Option as Meta and custom terminal key bindings"),
         .init(target: .tab(.sessions), title: "Session persistence and reconnect", detail: "tmux, screen, history, retries, keep-alives and timeouts"),
@@ -259,6 +260,15 @@ private struct TerminalSettings: View {
                 Toggle("Allow programs to use the mouse (vim, htop, tmux…)", isOn: $store.settings.allowMouseReporting)
                 Text("Hold ⌥ while selecting to select text even when a program captures the mouse.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Copying") {
+                Picker("Default copy format", selection: $store.settings.terminalCopyFormat) {
+                    ForEach(TerminalCopyFormat.allCases) { Text($0.title).tag($0) }
+                }
+                Toggle("Include terminal background", isOn: $store.settings.copyTerminalBackground)
+                Picker("ANSI copy encoding", selection: $store.settings.ansiCopyEncoding) {
+                    ForEach(TerminalANSICopyEncoding.allCases) { Text($0.title).tag($0) }
+                }
                 Toggle("Copy text on selection", isOn: $store.settings.copyOnSelect)
             }
             Section("Tabs") {

@@ -182,10 +182,7 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     public override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         blockSelection = nil
-        if settings.copyOnSelect, selectionActive, let text = getSelection(), !text.isEmpty {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-        }
+        copyOnMouseUp(from: self)
     }
 
     // MARK: Files (drag & drop, paste)
@@ -1132,8 +1129,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     /// Copy is offered for what is selected where the user sees it: here, in the recording shown
     /// over this terminal, or whole commands selected there (SwiftTerm looks at this view only).
     public override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(copy(_:)) {
-            return commandSelection != nil || (isBrowsingHistory ? history?.selection.active == true : selection.active)
+        if item.action == #selector(copy(_:)) || item.action == #selector(copyPlainText(_:)) {
+            return commandSelection != nil || copySource != nil
+        }
+        if item.action == #selector(copyWithStyles(_:)) || item.action == #selector(copyAsANSI(_:)) {
+            return copySource != nil
         }
         if item.action == #selector(selectAllShown(_:)) { return true }
         return super.validateUserInterfaceItem(item)
@@ -1146,7 +1146,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     func editMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = true
-        for (title, action, key) in [("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"),
+        let preferredFormat = commandSelection == nil ? settings.terminalCopyFormat : .plain
+        StyledTerminalCopy.menuItems(target: self, preferredFormat: preferredFormat,
+                                     plain: #selector(copyPlainText(_:)), styled: #selector(copyWithStyles(_:)),
+                                     ansi: #selector(copyAsANSI(_:))).forEach(menu.addItem)
+        for (title, action, key) in [("Paste", #selector(paste(_:)), "v"),
                                      ("Select All", #selector(selectAllShown(_:)), "a")] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.target = self
@@ -1155,16 +1159,52 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         return menu
     }
 
+    private var copySource: TerminalView? {
+        guard commandSelection == nil, !isBrowsingHistory || history?.feeding == false else { return nil }
+        let source = displayedTerminal
+        return StyledTerminalCopy.hasSelection(in: source) ? source : nil
+    }
+
+    @objc private func copyPlainText(_ sender: Any?) {
+        if commandSelection != nil { copyCommandSelection(); return }
+        if !copySelectedText(to: .general, format: .plain) { beep() }
+    }
+
+    @objc private func copyWithStyles(_ sender: Any?) {
+        if !copySelectedText(to: .general, format: .styled) { beep() }
+    }
+
+    @objc private func copyAsANSI(_ sender: Any?) {
+        if !copySelectedANSI(to: .general) { beep() }
+    }
+
+    func copySelectedANSI(to pasteboard: NSPasteboard) -> Bool {
+        guard let source = copySource else { return false }
+        return StyledTerminalCopy.writeANSI(from: source, theme: theme, encoding: settings.ansiCopyEncoding,
+                                           to: pasteboard)
+    }
+
+    @discardableResult
+    func copySelectedText(to pasteboard: NSPasteboard, format: TerminalCopyFormat? = nil) -> Bool {
+        guard let source = copySource else { return false }
+        return StyledTerminalCopy.writeSelection(from: source, theme: theme, settings: settings,
+                                                 format: format, to: pasteboard)
+    }
+
+    func copyOnMouseUp(from source: TerminalView) {
+        guard settings.copyOnSelect, copySource === source else { return }
+        copySelectedText(to: .general)
+    }
+
     /// Select All from the menu: the recording's rows while it is shown, else this terminal's.
     @objc func selectAllShown(_ sender: Any?) {
         if isBrowsingHistory, let history { history.selectAll(sender); history.needsDisplay = true } else { selectAll(sender) }
     }
 
-    /// ⌘C while browsing the recording copies what is selected there.
+    /// ⌘C copies the displayed selection using the preferred format.
     public override func copy(_ sender: Any) {
         if commandSelection != nil { copyCommandSelection(); return }
-        if isBrowsingHistory, let history, history.selection.active { history.copy(sender); return }
-        super.copy(sender)
+        if copySource != nil, !copySelectedText(to: .general) { beep() }
     }
 
     /// Clears the scrollback and screen locally (⌘K).
@@ -1638,11 +1678,11 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
         onCommandSelection?(nil)
     }
 
-    /// ⌘C with a selection in the recording: its text, read from the recording in the background
-    /// (as the terminal showed it), however long.
     /// Receives copied text instead of the pasteboard (tests).
     var copiedTextSink: ((String) -> Void)?
 
+    /// ⌘C with a selection in the recording: its text, read from the recording in the background
+    /// (as the terminal showed it), however long.
     public func copyCommandSelection() {
         guard let sel = commandSelection, let index = exactIndex, let reader = historyReader else { return }
         guard isValid(sel, in: index) else { clearCommandSelection(); beep(); return }
@@ -2166,7 +2206,6 @@ public final class TetherTerminalView: TerminalView, TerminalViewDelegate, Termi
     var keepsRedrawnFrames: Bool { settings.keepRedrawnFrames }
     /// What the scrollback rule remembers of this terminal's output and typing (see `ScrollbackRule.Context`).
     var ruleContext = ScrollbackRule.Context(keepRedraws: false, knowsTyping: true)
-    var copiesOnSelect: Bool { settings.copyOnSelect }
 
     // MARK: Browsing the recording
 

@@ -10,9 +10,11 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
     /// to `fraction` of the transcript (used to open search results).
     var revealText: String?
     var revealFraction: Double = 0
+    private var theme: TerminalTheme
 
     public override init(frame: CGRect) {
         let settings = SettingsStore.shared.settings
+        theme = TerminalTheme.resolve(settings, appearance: NSApp.effectiveAppearance)
         var options = TerminalOptions.default
         options.scrollback = 100_000     // grown to what a replay holds (`replay`)
         super.init(frame: frame, font: settings.terminalFont, options: options)
@@ -28,11 +30,53 @@ public final class ReadOnlyTerminalView: TerminalView, TerminalViewDelegate {
     public required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     private func applyTheme() {
-        let theme = TerminalTheme.resolve(SettingsStore.shared.settings, appearance: effectiveAppearance)
+        theme = TerminalTheme.resolve(SettingsStore.shared.settings, appearance: effectiveAppearance)
         installColors(theme.ansi)
         nativeForegroundColor = theme.foreground
         nativeBackgroundColor = theme.background
         selectedTextBackgroundColor = theme.selection
+    }
+
+    public override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu()
+        StyledTerminalCopy.menuItems(target: self, preferredFormat: SettingsStore.shared.settings.terminalCopyFormat,
+                                     plain: #selector(copyPlainText(_:)), styled: #selector(copyWithStyles(_:)),
+                                     ansi: #selector(copyAsANSI(_:))).forEach(menu.addItem)
+        let selectAll = NSMenuItem(title: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "a")
+        selectAll.target = self
+        menu.addItem(selectAll)
+        return menu
+    }
+
+    public override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:)) || item.action == #selector(copyPlainText(_:)) ||
+            item.action == #selector(copyWithStyles(_:)) || item.action == #selector(copyAsANSI(_:)) {
+            return StyledTerminalCopy.hasSelection(in: self)
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    public override func copy(_ sender: Any) {
+        guard StyledTerminalCopy.hasSelection(in: self) else { return }
+        copySelectedText()
+    }
+
+    @objc private func copyPlainText(_ sender: Any?) { copySelectedText(format: .plain) }
+
+    @objc private func copyWithStyles(_ sender: Any?) { copySelectedText(format: .styled) }
+
+    private func copySelectedText(format: TerminalCopyFormat? = nil) {
+        if !StyledTerminalCopy.writeSelection(from: self, theme: theme, settings: SettingsStore.shared.settings,
+                                             format: format, to: .general) {
+            NSSound.beep()
+        }
+    }
+
+    @objc private func copyAsANSI(_ sender: Any?) {
+        let encoding = SettingsStore.shared.settings.ansiCopyEncoding
+        if !StyledTerminalCopy.writeANSI(from: self, theme: theme, encoding: encoding, to: .general) {
+            NSSound.beep()
+        }
     }
 
     public override func viewDidChangeEffectiveAppearance() {

@@ -2,13 +2,13 @@
 
 **SSH sessions that survive the network.** A native macOS SSH client built with SwiftUI.
 
-Version 0.10.7 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
+Version 0.11.0 · [github.com/WhileEndless/tether](https://github.com/WhileEndless/tether) · [Release notes](release-notes/)
 
 Tether keeps your remote work alive when Wi‑Fi drops or your Mac sleeps, without installing anything on the server. It also manages your `~/.ssh/config`, transfers files with drag and drop, and shows live system information for every host — Linux, macOS, BSD and Windows.
 
 ![Terminal with the host panel](docs/screenshots/terminal.png)
 
-> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.10.7): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
+> Requires macOS 14.4 (Sonoma) or later, on Apple silicon or Intel. Tether is an early release (0.11.0): expect rough edges, and please [report issues](https://github.com/WhileEndless/tether/issues).
 
 ## Screenshots
 
@@ -59,6 +59,7 @@ Search across every terminal, the archive and recordings.
 - xterm-256color and true color, mouse reporting, alternate screen, Option as Meta (off by default, so Option types your layout's characters such as @), and key mappings. vim, htop, fzf and emacs work as expected.
 - Uses this Mac's Terminal.app profile (colors, font, translucency) by default.
 - Terminal.app navigation: ⌘↑/⌘↓ jump to the command above or below what is on screen (into the recording too), ⇧⌘↑/⇧⌘↓ select whole commands, and PageUp/PageDown/Home/End scroll.
+- Copy selections as plain text, styled text for rich-text editors, or ANSI with foreground color codes. Set the default for ⌘C and choose whether to include the terminal background in styled copies in Settings ▸ Terminal ▸ Copying. See [Copying terminal output](docs/terminal-copying.md).
 - Tab names follow the running command (or the current directory), and you can rename any tab.
 - Local terminals on this Mac. These are persistent too when tmux is installed locally.
 

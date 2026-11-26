@@ -19,6 +19,28 @@ public enum BellMode: String, Codable, CaseIterable, Identifiable, Sendable {
     public var title: String { rawValue.capitalized }
 }
 
+public enum TerminalCopyFormat: String, Codable, CaseIterable, Identifiable, Sendable {
+    case plain, styled
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .plain: "Plain Text"
+        case .styled: "Styled Text"
+        }
+    }
+}
+
+public enum TerminalANSICopyEncoding: String, Codable, CaseIterable, Identifiable, Sendable {
+    case visible, raw
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .visible: "Visible Escape Codes"
+        case .raw: "Raw ANSI"
+        }
+    }
+}
+
 public enum HostKeyPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
     /// Use whatever ssh config says (prompts for unknown keys).
     case ask
@@ -337,6 +359,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var notifyOnBell = true
     public var allowMouseReporting = true
     public var copyOnSelect = false
+    public var terminalCopyFormat: TerminalCopyFormat = .plain
+    public var copyTerminalBackground = false
+    public var ansiCopyEncoding: TerminalANSICopyEncoding = .visible
     public var findHighlight = FindHighlightStyle()
     /// System-wide switches of host features not covered by a setting of their own (see
     /// `HostFeature`); only the ones switched off are stored.
@@ -644,6 +669,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
         d(.notifyOnBell, &notifyOnBell)
         d(.allowMouseReporting, &allowMouseReporting)
         d(.copyOnSelect, &copyOnSelect)
+        d(.terminalCopyFormat, &terminalCopyFormat)
+        d(.copyTerminalBackground, &copyTerminalBackground)
+        d(.ansiCopyEncoding, &ansiCopyEncoding)
         d(.findHighlight, &findHighlight)
         d(.hostFeatures, &hostFeatures)
         d(.hideAbsentToolPanels, &hideAbsentToolPanels)

@@ -219,12 +219,29 @@ import SwiftTerm
         #expect(f.view.isBrowsingHistory && Self.selected(f.shown) == "run 7")
         #expect(f.view.validateUserInterfaceItem(copy), "the recording's selection")
         let menu = try #require(f.view.history?.menu(for: NSEvent()))
-        #expect(menu.items.map(\.title) == ["Copy", "Paste", "Select All"])
+        #expect(menu.items.map(\.title) == ["Copy Plain Text", "Copy with Styles", "Copy as ANSI", "Paste", "Select All"])
         #expect(menu.items.allSatisfy { ($0.target as? TetherTerminalView) === f.view })
-        let pasteboard = NSPasteboard.general
-        let saved = pasteboard.string(forType: .string)
-        defer { pasteboard.clearContents(); if let saved { pasteboard.setString(saved, forType: .string) } }
-        f.view.copy(copy)
+        let ansi = try #require(menu.item(withTitle: "Copy as ANSI"))
+        #expect(f.view.validateUserInterfaceItem(ansi))
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        #expect(f.view.copySelectedText(to: pasteboard))
+        #expect(pasteboard.string(forType: .string) == "run 7")
+        #expect(pasteboard.data(forType: .rtf) == nil)
+
+        var settings = AppSettings()
+        settings.terminalCopyFormat = .styled
+        f.view.apply(settings: settings)
+        #expect(f.view.copySelectedText(to: pasteboard))
+        #expect(pasteboard.string(forType: .string) == "run 7")
+        #expect(pasteboard.data(forType: .rtf) != nil)
+        #expect(f.view.copySelectedText(to: pasteboard, format: .plain))
+        #expect(pasteboard.data(forType: .rtf) == nil)
+
+        f.view.selectToMark(up: true)
+        #expect(f.view.commandSelection != nil)
+        #expect(!f.view.validateUserInterfaceItem(ansi))
+        #expect(!f.view.copySelectedText(to: pasteboard))
         #expect(pasteboard.string(forType: .string) == "run 7")
     }
 
